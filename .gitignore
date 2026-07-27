@@ -1,0 +1,25 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Local tools
+.vscode/
+.agents/
+
+# Generated data and outputs
+/data/cache/
+!data/cache/.gitkeep
+/outputs_run/
+/tmp/
+
+# Local development notes
+/DEVELOPMENT.md

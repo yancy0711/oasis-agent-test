@@ -1,0 +1,31 @@
+# ============ Value weight profiles (the core HITL knob) ============
+# Each profile encodes one stance on "who most deserves service".
+# Weights enter the MCLP objective as:
+#   weight_i = population_i * sum_k( w_k * normalized_indicator_ik )
+# Weights per profile must sum to 1.0 (validated on load).
+
+profiles:
+  efficiency_first:
+    label: "Efficiency first: maximize total covered population"
+    description: "No vulnerability weighting; pure headcount. Serves as baseline."
+    weights: {population_density: 1.0, elderly_ratio: 0.0, poverty_rate: 0.0, heat_exposure: 0.0}
+
+  equity_first:
+    label: "Equity first: prioritize underserved, exposed communities"
+    description: "Emphasizes poverty x age x heat overlap; may reduce total coverage."
+    weights: {population_density: 0.1, elderly_ratio: 0.3, poverty_rate: 0.3, heat_exposure: 0.3}
+
+  cooling_first:
+    label: "Cooling first: prioritize heat-exposed communities"
+    description: "Emphasizes heat exposure; may reduce total coverage."
+    weights: {population_density: 0.1, elderly_ratio: 0.2, poverty_rate: 0.2, heat_exposure: 0.5}
+
+  balanced:
+    label: "Balanced"
+    description: "Default starting point for decision-makers to adjust from."
+    weights: {population_density: 0.4, elderly_ratio: 0.2, poverty_rate: 0.2, heat_exposure: 0.2}
+
+# Pareto sweep: direct scalarization of the two reported coverage objectives
+pareto_sweep:
+  objectives: [population_coverage, vulnerable_population_coverage]
+  steps: 11

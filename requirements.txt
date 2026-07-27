@@ -1,0 +1,30 @@
+# --- geospatial core ---
+geopandas>=0.14
+shapely>=2.0
+pyproj>=3.6
+# --- data acquisition ---
+requests>=2.31
+osmnx>=1.9             # OSM amenities/boundaries (pulls in networkx)
+pystac-client>=0.8
+pygris>=0.1.6           # Census TIGER/Line tract polygons
+planetary-computer>=1.0
+rioxarray>=0.15
+odc-stac>=0.3
+rasterstats>=0.19
+# --- optimization ---
+pulp>=2.8,<4.0          # ships with CBC solver, nothing extra to install
+numpy>=1.26
+pandas>=2.1
+# --- agent / LLM ---
+anthropic>=0.39        # or google-generativeai / openai -- pick one
+openai>=1.0
+pydantic>=2.6
+pyyaml>=6.0
+# --- output ---
+folium>=0.15
+matplotlib>=3.8
+# --- optional, last stage only ---
+streamlit>=1.32
+# --- dev ---
+pytest>=8.0
+python-dotenv>=1.0
