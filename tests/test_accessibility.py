@@ -94,12 +94,15 @@ def test_sparse_matrix_uses_pair_cache_on_second_run(monkeypatch, tmp_path):
         return np.full((len(demand_coords), len(supply_coords)), 7.0)
 
     monkeypatch.setattr(accessibility, "_ors_block", fake_block)
+    progress = []
     first, report = accessibility.sparse_network_matrix(
         demand, supply, mask, api_key="test", request_interval_s=0,
         source_chunk_size=2, max_routes_per_request=4,
+        progress_callback=lambda label, done, total: progress.append((label, done, total)),
     )
     assert report["router"] == "ors_sparse" and report["live_pairs"] == 2
     assert first[0, 0] == first[1, 1] == 7 and np.isinf(first[0, 1])
+    assert ("ORS cache scan", 2, 2) in progress and progress[-1] == ("ORS requests", 1, 1)
 
     monkeypatch.setattr(accessibility, "_ors_block", lambda *a, **k: pytest.fail("API called"))
     second, report = accessibility.sparse_network_matrix(demand, supply, mask, request_interval_s=0)

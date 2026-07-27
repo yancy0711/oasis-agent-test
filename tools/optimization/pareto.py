@@ -4,39 +4,14 @@ centerpiece and the live demo's money shot.
 """
 from __future__ import annotations
 import numpy as np
-from agent.schemas import ParetoPoint, ValueWeights
-from tools.optimization.models import build_demand_weights, solve_mclp
-
-
-def interpolate(a: ValueWeights, b: ValueWeights, alpha: float) -> ValueWeights:
-    da, db = a.normalized().model_dump(), b.normalized().model_dump()
-    return ValueWeights(**{k: (1 - alpha) * da[k] + alpha * db[k] for k in da})
-
-
-def pareto_sweep(travel_matrix, indicators, population, vulnerable_mask,
-                 candidate_ids, w_efficiency: ValueWeights, w_equity: ValueWeights,
-                 n_facilities: int, threshold_minutes: float,
-                 steps: int = 11) -> list[ParetoPoint]:
-    """Re-solve MCLP along the efficiency<->equity interpolation line.
-    This chart is the paper's centerpiece and the live demo's money shot."""
-    points = []
-    for alpha in np.linspace(0, 1, steps):
-        w = interpolate(w_efficiency, w_equity, float(alpha))
-        dw = build_demand_weights(indicators, population, w)
-        sol = solve_mclp(travel_matrix, dw, population, vulnerable_mask,
-                         n_facilities, threshold_minutes, candidate_ids,
-                         profile_name=f"alpha={alpha:.2f}", weights=w)
-        points.append(ParetoPoint(alpha=float(alpha),
-                                  efficiency_metric=sol.covered_ratio,
-                                  equity_metric=sol.vulnerable_covered_ratio,
-                                  solution=sol))
-    return points
+from agent.schemas import ParetoPoint
+from tools.optimization.models import solve_mclp
 
 
 def coverage_pareto_sweep(travel_matrix, population, vulnerable_mask,
                           candidate_ids, n_facilities: int,
                           threshold_minutes: float,
-                          steps: int = 11) -> list[ParetoPoint]:
+                          steps: int = 11, progress_callback=None) -> list[ParetoPoint]:
     '''Sweep total versus vulnerable population coverage directly.'''
     population = np.asarray(population, dtype=float)
     vulnerable_mask = np.asarray(vulnerable_mask, dtype=bool)
@@ -65,6 +40,7 @@ def coverage_pareto_sweep(travel_matrix, population, vulnerable_mask,
             alpha=alpha, efficiency_metric=solution.covered_ratio,
             equity_metric=solution.vulnerable_covered_ratio, solution=solution,
         ))
+        if progress_callback: progress_callback("Pareto sweep", len(points), steps)
     return points
 
 

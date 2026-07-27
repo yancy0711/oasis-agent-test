@@ -56,9 +56,9 @@ print(result["solution"].selected_ids)
 print(result["outputs"])
 ```
 
-## 3. Six registered tools
+## 3. Baseline and diagnostic tools
 
-Large GeoDataFrames and NumPy arrays never enter an LLM prompt. Each tool
+The deterministic pipeline keeps its fixed six-tool baseline. The agent can additionally select generic diagnostic tools. Large GeoDataFrames and NumPy arrays never enter an LLM prompt. Each tool
 stores them in `Context` under a stable handle and returns a lightweight
 `ToolResult`.
 
@@ -70,6 +70,16 @@ stores them in `Context` under a stable handle and returns a lightweight
 | 4 | `build_travel_matrix` | `demand`, `candidates` | `travel` | ORS or declared Haversine travel minutes plus diagnostics |
 | 5 | `optimize_sites` | `demand`, `candidates`, `travel` | `analysis` | Requested MCLP solution and coverage Pareto sweep |
 | 6 | `generate_outputs` | `study`, `demand`, `candidates`, `analysis` | `outputs` | HTML map, PNG chart, Markdown report |
+
+The additional agent-selectable tools are:
+
+| Tool | Question answered |
+|---|---|
+| `validate_constraints` | Are global and regional count requirements arithmetically consistent? |
+| `find_minimum_facilities` | At a fixed threshold, what is the LSCP facility lower bound? |
+| `find_minimum_threshold` | At a fixed budget, what is the smallest matrix-supported feasible threshold? |
+| `analyze_reachability` | Which tracts are hardest, unserved, or structurally unreachable? |
+| `compare_scenarios` | How do the last two successful optimization scenarios differ? |
 
 ### Step 1: resolve the study area
 
@@ -212,75 +222,36 @@ data and compares the complete serialized `SiteSolution` objects.
 
 ## 5. Agent entry
 
-`main.run_agent()` executes this order:
+`main.run_agent()` validates the task through HITL and then runs a bounded observation-action loop:
 
 ```text
 user prompt
-  -> Orchestrator.parse_task()
-  -> hitl.clarify_place()  # deterministic candidate validation + ambiguity HITL
-  -> hitl.clarify()
-  -> Context.put("task", task)
-  -> Orchestrator.plan()
-  -> Orchestrator.execute(step) for every PlanStep
-  -> registered workflow tools
-  -> outputs and provenance
+  -> parse typed TaskSpec
+  -> confirm place and value judgments
+  -> model selects one registered action
+  -> deterministic tool returns a compact ToolResult
+  -> model observes the result and selects the next action
+  -> finish, bounded repair, or HITL
 ```
 
-The LLM only returns `TaskSpec`, `AgentPlan`, or a repaired `PlanStep`. It does
-not receive or mutate DataFrames, geometry, travel matrices, or solver values.
+`max_agent_steps` bounds total decisions, and `max_self_correction_rounds` bounds local retries. Repeating an identical failed call is blocked. Large data objects stay in `Context`; the model receives only handle names and compact summaries.
 
-Live example:
+For an infeasible fixed-budget request, the model can select LSCP, minimum-threshold search, or reachability analysis instead of silently changing a confirmed constraint.
 
 ```powershell
-python main.py --mode agent --prompt "Site 6 cooling centers in Bakersfield, California, prioritize elderly residents"
+python main.py --mode agent --prompt "At a strict 15-minute threshold, how many Phoenix cooling centers are required for full tract coverage?"
 ```
 
-Programmatic non-interactive example:
+## 6. Offline and live agent tests
 
-```python
-from main import load_cfg, run_agent
-
-result = run_agent(
-    load_cfg(),
-    "Site 6 cooling centers in Bakersfield, California",
-    interactive=False,
-)
-print(result["task"])
-print(result["plan"])
-print([item.ok for item in result["results"]])
-```
-
-`interactive=False` applies the documented balanced profile only when the
-parsed task leaves `weights=None`; the assumption is appended to `task.notes`.
-
-## 6. Offline FakeLLM flow
-
-`tests/test_pipeline_agent.py` supplies canned dictionaries through `FakeLLM`:
+Offline `FakeLLM` tests return one action at a time:
 
 ```python
 fake = FakeLLM([
     {"place_name": "Phoenix, Arizona, USA", "weights": None},
-    {"steps": [{"tool": "capture_task_test", "args": {}}]},
+    {"kind": "tool", "tool": "capture_task_test"},
+    {"kind": "finish", "message": "Task complete."},
 ])
-result = run_agent(cfg, "help underserved Phoenix", llm=fake, interactive=False)
 ```
 
-This verifies parse, HITL, planning, execution, and self-correction without an
-OpenRouter call or API cost.
-
-## 7. Files changed and purpose
-
-| File | Purpose |
-|---|---|
-| `pytest.ini` | Make direct `pytest` imports deterministic on Windows/Conda |
-| `tools/data_acquisition/geocoding.py` | Implement cached place-to-FIPS resolution |
-| `tools/workflow.py` | Define and register the shared six-tool production workflow |
-| `robustness/cache.py` | Isolate every data-source cache by normalized place name |
-| `tools/registry.py` | Load the six tools when the registry is imported |
-| `main.py` | Implement deterministic and agent CLI entry points |
-| `agent/memory.py` | Provide one Context object store and multi-record lineage API |
-| `agent/schemas.py` | Remove mutable defaults from cross-layer contracts |
-| `agent/orchestrator.py` | Use the shared Context and execute the bounded repair loop |
-| `tests/test_pipeline_agent.py` | Cover FIPS, provenance, FakeLLM, repair, agent flow, and equivalence |
-| `tests/test_place_cache.py` | Cover place ambiguity, scoped caches, and ORS boundary guards |
-| `requirements.txt` | Declare the existing `pygris` dependency |
+Run all deterministic tests with `pytest tests -q`. Run `python scripts/evaluate_agent_behavior.py` to evaluate live model branching, diagnostic tool selection, and self-correction; this command uses the configured OpenRouter model.

@@ -1,15 +1,11 @@
-"""Single source of truth for all cross-layer data contracts.
-
-Rule: the LLM may only produce/consume structures defined here -- never raw
-DataFrames or untyped dicts. This keeps the LLM/tool boundary verifiable.
-"""
+"""Typed contracts shared by the LLM, orchestrator, tools, and outputs."""
 from __future__ import annotations
 from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
 
-# ---------- 1. Task spec: where natural language lands ----------
 class ValueWeights(BaseModel):
+    """Weights for the four registered siting indicators."""
     population_density: float = 0.4
     elderly_ratio: float = 0.2
     poverty_rate: float = 0.2
@@ -28,28 +24,37 @@ class ValueWeights(BaseModel):
         return ValueWeights(**{k: v / total for k, v in self.model_dump().items()})
 
 
-class TaskSpec(BaseModel):
-    """Structured task extracted by the LLM. Missing values -> HITL clarification.
+class RegionalRequirement(BaseModel):
+    """Represent one user-stated minimum facility count in a named subarea."""
+    region: str
+    minimum_facilities: int = Field(..., ge=0)
 
-    weights=None is meaningful: it signals a value judgment gap that must be
-    resolved by a human, never silently filled by the agent.
-    """
-    place_name: str = Field(..., description="Geocodable place, e.g. 'Los Angeles, California, USA'")
+
+class TaskSpec(BaseModel):
+    """Structured, human-confirmable task extracted from natural language."""
+    place_name: str = Field(..., description="Geocodable US city or county")
     intervention: Literal["cooling_center", "mobile_clinic", "monitoring_station"] = "cooling_center"
+    analysis_goal: Literal["facility_siting", "heat_review", "minimum_facilities",
+                           "minimum_threshold", "reachability_review", "scenario_comparison"] = "facility_siting"
+    candidate_source: Literal["osm", "csv"] = "osm"
+    candidate_file: str | None = None
     n_facilities: int = Field(8, ge=1, le=100)
     threshold_minutes: float = Field(15.0, gt=0)
+    coverage_target: float | None = Field(None, ge=0.0, le=1.0)
+    coverage_group: Literal["all", "vulnerable"] = "all"
     weights: ValueWeights | None = None
     candidate_amenities: list[str] = Field(default_factory=lambda: ["library", "community_centre", "school"])
-    notes: str = ""  # assumptions/ambiguities recorded by the LLM; goes into the report
+    regional_requirements: list[RegionalRequirement] = Field(default_factory=list)
+    preference_question: str = ""
+    notes: str = ""
 
     def is_complete(self) -> bool:
         """Return whether all human value judgments have been supplied."""
-        return self.weights is not None
+        return self.analysis_goal != "facility_siting" or self.weights is not None
 
 
-# ---------- 2. Tool contract: uniform envelope for every tool ----------
 class Provenance(BaseModel):
-    """Where each dataset came from and how fresh it is. Reported transparently."""
+    """Describe the source and processing tier of one dataset."""
     source: str
     tier: Literal["live", "cache", "sample"] = "live"
     record_count: int = 0
@@ -58,18 +63,16 @@ class Provenance(BaseModel):
 
 
 class ToolError(BaseModel):
-    """Structured error. Tools never raise raw exceptions to the agent --
-    a raw traceback gives the LLM nothing actionable to repair."""
-    kind: Literal["ambiguous", "rate_limit", "not_found", "schema_mismatch",
-                  "crs_error", "infeasible", "timeout", "unknown"]
+    """Return an actionable tool failure without exposing raw exceptions."""
+    kind: Literal["ambiguous", "rate_limit", "not_found", "schema_mismatch", "crs_error",
+                  "infeasible", "timeout", "insufficient_candidates", "constraint_conflict", "unknown"]
     message: str
-    hint: str = ""       # repair suggestion for the LLM
+    hint: str = ""
     retryable: bool = True
 
 
 class ToolResult(BaseModel):
-    """Uniform tool return. Large objects stay in Context under `handle`;
-    the LLM only ever sees the lightweight `summary`."""
+    """Return a lightweight result while large objects remain in Context."""
     ok: bool
     tool: str
     handle: str | None = None
@@ -78,32 +81,64 @@ class ToolResult(BaseModel):
     error: ToolError | None = None
 
 
-# ---------- 3. Optimization results ----------
 class SiteSolution(BaseModel):
+    """Store one optimization solution and its reported performance."""
     profile_name: str
     selected_ids: list[str]
     covered_population: float
     covered_ratio: float
-    vulnerable_covered_ratio: float   # core equity metric
+    vulnerable_covered_ratio: float
     mean_travel_minutes: float
     weights_used: ValueWeights | None
     solver_status: str
 
 
 class ParetoPoint(BaseModel):
-    alpha: float                      # 0 = efficiency end, 1 = equity end
+    """Store one efficiency-equity trade-off solution."""
+    alpha: float
     efficiency_metric: float
     equity_metric: float
     solution: SiteSolution
 
 
-# ---------- 4. Agent plan ----------
 class PlanStep(BaseModel):
+    """Describe one registered tool call proposed by the planner."""
     tool: str
     args: dict[str, Any] = Field(default_factory=dict)
-    rationale: str = ""               # one-liner; feeds the methods section of the report
+    rationale: str = ""
 
 
 class AgentPlan(BaseModel):
+    """Store an ordered plan for fixed-baseline evaluation only."""
     steps: list[PlanStep]
     reasoning: str = ""
+
+
+class AgentAction(BaseModel):
+    """Describe one observable action selected from the current state."""
+    kind: Literal["tool", "finish", "hitl"]
+    tool: str | None = None
+    args: dict[str, Any] = Field(default_factory=dict)
+    rationale: str = ""
+    message: str = ""
+    suggested_changes: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentEvent(BaseModel):
+    """Record an auditable action or observation, never hidden reasoning."""
+    stage: Literal["parse", "hitl", "plan", "decision", "tool_call", "tool_result", "observation", "repair", "explanation"]
+    message: str
+    tool: str | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResultNarrative(BaseModel):
+    """Store evidence-grounded decision interpretation and self-reflection."""
+    decision_summary: str
+    self_reflection: str
+
+class RecoveryProposal(BaseModel):
+    """Describe a user-confirmable recovery without silently changing constraints."""
+    diagnosis: str
+    question: str
+    suggested_changes: dict[str, Any] = Field(default_factory=dict)

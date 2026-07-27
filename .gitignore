@@ -2,11 +2,14 @@
 .env
 .env.*
 !.env.example
+.streamlit/secrets.toml
 
 # Python
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.coverage
+htmlcov/
 .venv/
 venv/
 .ipynb_checkpoints/
@@ -15,11 +18,11 @@ venv/
 .vscode/
 .agents/
 
-# Generated data and outputs
-/data/cache/
-!data/cache/.gitkeep
+# Runtime data
+/data/cache/*
+!/data/cache/.gitkeep
 /outputs_run/
 /tmp/
 
-# Local development notes
+# Local notes
 /DEVELOPMENT.md

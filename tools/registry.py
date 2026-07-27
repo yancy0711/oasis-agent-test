@@ -45,14 +45,5 @@ class Registry:
 
 registry = Registry()
 
-# Stage 5: register the deterministic functions from stages 1-4 here, e.g.
-#
-# @registry.register("fetch_demographics",
-#     "Tract-level population/elderly/poverty indicators. Precondition: FIPS "
-#     "resolved. Returns a handle plus a column summary.",
-#     {"state_fips": {"type": "string"}, "county_fips": {"type": "string"},
-#      "groups": {"type": "array", "items": {"type": "string"}}})
-# def _fetch_demographics(ctx, **kw): ...
-
-# Import once so the six high-level workflow tools are always exposed.
+# Import once so baseline and diagnostic workflow tools are always exposed.
 from tools import workflow as _workflow  # noqa: E402,F401

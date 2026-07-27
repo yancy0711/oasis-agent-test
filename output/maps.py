@@ -70,3 +70,28 @@ def coverage_map(tracts: gpd.GeoDataFrame, candidates: gpd.GeoDataFrame,
     m.fit_bounds([[miny, minx], [maxy, maxx]], padding=(20, 20))
     folium.LayerControl(collapsed=False).add_to(m); m.save(out_path)
     return out_path
+
+def heat_exposure_map(tracts: gpd.GeoDataFrame, out_path: str,
+                      boundary: gpd.GeoDataFrame | None = None) -> str:
+    """Render a standalone tract heat-exposure choropleth for heat-only analysis."""
+    tracts = ensure_crs(tracts); minx, miny, maxx, maxy = tracts.total_bounds
+    m = folium.Map(location=[(miny + maxy) / 2, (minx + maxx) / 2], tiles="cartodbpositron")
+    if "heat_exposure" in tracts and tracts["heat_exposure"].notna().any():
+        folium.Choropleth(geo_data=tracts[["GEOID", "geometry"]].to_json(), data=tracts,
+                          columns=["GEOID", "heat_exposure"], key_on="feature.properties.GEOID",
+                          fill_color="YlOrRd", nan_fill_opacity=0, legend_name="Heat exposure (\N{DEGREE SIGN}C)",
+                          name="Heat exposure (\N{DEGREE SIGN}C)").add_to(m)
+    details, fields, aliases = _tract_details(tracts)
+    folium.GeoJson(details.to_json(), name="Census tract details",
+                   style_function=lambda _: {"color": "#333", "weight": .45, "fillOpacity": 0},
+                   highlight_function=lambda _: {"weight": 1.5, "fillOpacity": .12},
+                   tooltip=folium.GeoJsonTooltip(fields=fields, aliases=aliases, sticky=False,
+                                                  labels=True, localize=True)).add_to(m)
+    if boundary is not None and not boundary.empty:
+        admin = ensure_crs(boundary)
+        folium.GeoJson(admin.to_json(), name="OSM administrative boundary (includes water)", show=False,
+                       style_function=lambda _: {"color": "#2455ff", "weight": 2, "dashArray": "6 6",
+                                                 "fillOpacity": 0}).add_to(m)
+    m.fit_bounds([[miny, minx], [maxy, maxx]], padding=(20, 20))
+    folium.LayerControl(collapsed=False).add_to(m); m.save(out_path)
+    return out_path

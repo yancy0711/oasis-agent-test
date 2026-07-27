@@ -316,6 +316,7 @@ def sparse_network_matrix(
     coordinate_precision: int = 5,
     cache_version: str = "v1",
     timeout_s: float = 60,
+    progress_callback=None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Verify eligible pairs with ORS; incomplete runs fall back as a whole."""
     mask = np.asarray(eligible_mask, dtype=bool)
@@ -332,6 +333,11 @@ def sparse_network_matrix(
         "eligible_pairs": int(mask.sum()), "pruned_pairs": int((~mask).sum()),
         "cache_pairs": 0, "live_pairs": 0, "planned_requests": 0,
     }
+
+    def report_progress(label: str, done: int, total: int) -> None:
+        """Report real cache/request counts to terminal and an optional UI callback."""
+        _print_progress(label, done, total)
+        if progress_callback: progress_callback(label, done, total)
 
     def fail(reason: str):
         """Return the complete Haversine fallback with a recorded reason."""
@@ -363,7 +369,7 @@ def sparse_network_matrix(
         cursor = connection.cursor()
         rows, columns = np.nonzero(mask)
         total_pairs, progress_step = len(rows), max(1, len(rows) // 100)
-        _print_progress("ORS cache scan", 0, total_pairs)
+        report_progress("ORS cache scan", 0, total_pairs)
         for number, (i, j) in enumerate(zip(rows, columns), 1):
             row = cursor.execute(
                 "SELECT minutes FROM durations WHERE version=? AND profile=? AND base_url=? "
@@ -374,7 +380,7 @@ def sparse_network_matrix(
                 matrix[i, j], missing[i, j] = float(row[0]), False
 
             if number % progress_step == 0 or number == total_pairs:
-                _print_progress("ORS cache scan", number, total_pairs)
+                report_progress("ORS cache scan", number, total_pairs)
         report["cache_pairs"] = int(mask.sum() - missing.sum())
         print(f"ORS cache hits {report['cache_pairs']}/{int(mask.sum())}; missing {int(missing.sum())}", flush=True)
         if not missing.any():
@@ -390,7 +396,7 @@ def sparse_network_matrix(
         if not key:
             return fail("ORS_API_KEY is not set")
 
-        _print_progress("ORS requests", 0, len(blocks))
+        report_progress("ORS requests", 0, len(blocks))
         for number, (sources, destinations) in enumerate(blocks):
             if number % 10 == 0:
                 log.info("sparse ORS block %d/%d", number + 1, len(blocks))
@@ -409,7 +415,7 @@ def sparse_network_matrix(
                         matrix[i, j], missing[i, j], report["live_pairs"] = minutes, False, report["live_pairs"] + 1
             cursor.executemany("INSERT OR REPLACE INTO durations VALUES (?,?,?,?,?,?,?,?)", records)
             connection.commit()
-            _print_progress("ORS requests", number + 1, len(blocks))
+            report_progress("ORS requests", number + 1, len(blocks))
 
         if missing.any():
             return fail(f"{int(missing.sum())} eligible pairs remain unverified")

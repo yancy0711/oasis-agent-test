@@ -5,7 +5,8 @@ from (live/cache/sample), and which value weights produced it. Numbers come
 from the solver; the LLM may only polish the prose around them.
 """
 from __future__ import annotations
-from agent.schemas import ParetoPoint, Provenance, SiteSolution, TaskSpec
+from pathlib import Path
+from agent.schemas import ParetoPoint, Provenance, ResultNarrative, SiteSolution, TaskSpec
 
 _TEMPLATE = """# Siting Decision Report -- {place}
 
@@ -33,6 +34,7 @@ _TEMPLATE = """# Siting Decision Report -- {place}
 
 def render_report(task: TaskSpec, solution: SiteSolution,
                   frontier: list[ParetoPoint], lineage: list[Provenance]) -> str:
+    """Render the deterministic decision report from typed results."""
     weights = solution.weights_used.model_dump() if solution.weights_used else 'coverage scalarization'
     return _TEMPLATE.format(
         place=task.place_name, intervention=task.intervention,
@@ -48,3 +50,11 @@ def render_report(task: TaskSpec, solution: SiteSolution,
         lineage="\n".join(
             f"- {p.source} ({p.tier} tier, {p.record_count} records, {p.crs}) {p.notes}"
             for p in lineage))
+
+def append_agent_narrative(report_path: str, narrative: ResultNarrative) -> str:
+    """Append the two evidence-grounded LLM paragraphs to a completed report."""
+    section = ("\n\n## 5. Decision-Maker Interpretation\n\n" + narrative.decision_summary.strip() +
+               "\n\n## 6. Agent Self-Reflection\n\n" + narrative.self_reflection.strip() + "\n")
+    path = Path(report_path)
+    path.write_text(path.read_text(encoding="utf-8").rstrip() + section, encoding="utf-8")
+    return str(path)

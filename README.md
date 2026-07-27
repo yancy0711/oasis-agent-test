@@ -5,7 +5,7 @@ OASIS is a GeoAI workflow for equity-aware public health facility siting. It res
 The project supports two execution modes:
 
 - `pipeline`: runs the deterministic six-tool workflow without an LLM.
-- `agent`: uses an OpenRouter model to parse a natural-language request, confirm ambiguous inputs through human-in-the-loop prompts, plan the tools, and execute the same workflow.
+- `agent`: parses the request, confirms ambiguous inputs, and repeatedly selects one registered action from observed tool results. It can run the baseline workflow or diagnose infeasible constraints with LSCP, minimum-threshold search, reachability analysis, and scenario comparison.
 
 Each successful run writes three files under `outputs_run/<place>/`:
 
@@ -63,7 +63,15 @@ Available value profiles are `balanced`, `efficiency_first`, `equity_first`, and
 python main.py --mode agent --prompt "Site 8 cooling centers in Washington, DC within a 15-minute walking threshold and maximize population coverage."
 ```
 
-The agent uses the LLM only for task parsing and tool planning. Geocoding validation, data processing, routing, optimization, caching, and output generation remain deterministic tools.
+The LLM handles task parsing, one-step action selection, bounded repair, and explanation. Geocoding, matrix analysis, MCLP/LSCP solving, threshold search, caching, validation, and output generation remain deterministic tools. Confirmed constraints are never changed without HITL.
+
+Diagnostic requests use the same registered primitives:
+
+```powershell
+python main.py --mode agent --prompt "At a strict 15-minute threshold, what is the minimum number of Phoenix cooling centers needed to cover every tract?"
+python main.py --mode agent --prompt "With exactly 2 Phoenix cooling centers, what is the smallest threshold that covers every tract?"
+python main.py --mode agent --prompt "Which Phoenix tracts are hardest to serve within 15 minutes?"
+```
 
 CLI values can override parameters parsed from the prompt:
 

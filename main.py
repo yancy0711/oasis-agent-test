@@ -1,4 +1,3 @@
-# test example: 1. python main.py --mode agent --prompt "Find 8 optimal locations for cooling centers in Los Angeles County, California, USA to maximize population coverage and vulnerable population coverage within a 15-minute travel threshold."; 2. python main.py --mode pipeline --place "New York City" --n-facilities 15 --threshold-minutes 12 --profile equity_first
 """CLI entry for deterministic and agent-driven OASIS workflows."""
 from __future__ import annotations
 import argparse, logging, pathlib
@@ -40,7 +39,7 @@ def run_agent(cfg: dict, prompt: str, model_override: str | None = None,
               llm=None, interactive: bool = True, validate_place: bool = True,
               n_facilities: int | None = None, threshold_minutes: float | None = None,
               profile: str | None = None) -> dict:
-    """Natural language -> parse -> HITL -> plan -> execute."""
+    """Natural language -> parse -> HITL -> bounded observe-decide-act loop."""
     if not prompt.strip(): raise ValueError("--prompt is required in agent mode")
     llm_cfg = dict(cfg["llm"])
     if model_override: llm_cfg["model"] = model_override
@@ -68,18 +67,11 @@ def run_agent(cfg: dict, prompt: str, model_override: str | None = None,
     logging.info("agent task: place=%s; n=%d; threshold=%g min; weights=%s", task.place_name,
                  task.n_facilities, task.threshold_minutes,
                  task.weights.model_dump() if task.weights else None)
-    orch.ctx.put("task", task)
-    plan, results = orch.plan(task), []
-    logging.info("agent plan: %s", " -> ".join(step.tool for step in plan.steps))
-    for step in plan.steps:
-        result = orch.execute(step); results.append(result)
-        if not result.ok:
-            logging.error("agent step %s failed: %s", step.tool, result.error)
-            break
-    ok = len(results) == len(plan.steps) and all(result.ok for result in results)
-    return {"ok": ok, "failed_tool": None if ok else (results[-1].tool if results else "plan"),
-            "task": task, "plan": plan, "results": results,
-            "lineage": orch.ctx.lineage, "outputs": orch.ctx.get("outputs", None)}
+    orch.ctx.record("hitl", "Human-confirmed task parameters were bound before execution.",
+                    place_name=task.place_name, n_facilities=task.n_facilities,
+                    threshold_minutes=task.threshold_minutes,
+                    weights=task.weights.model_dump() if task.weights else None)
+    return {"task": task, **orch.run(task)}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -99,6 +91,8 @@ if __name__ == "__main__":
         except ValueError as exc:
             logging.error("agent input stopped: %s", exc)
             raise SystemExit(2)
+        if result.get("message"): logging.info("agent answer: %s", result["message"])
+        if result.get("diagnostics"): logging.info("diagnostics: %s", result["diagnostics"])
         if result["outputs"]: logging.info("outputs: %s", result["outputs"])
         if not result["ok"]: raise SystemExit(1)
     else:

@@ -80,12 +80,13 @@ def test_agent_prompts_for_a_missing_place_without_reparsing(monkeypatch):
     @registry.register("capture_recovered_place_test", "capture recovered place")
     def capture(ctx):
         """Return the place stored after interactive recovery."""
+        ctx.put("outputs", {})
         return ToolResult(ok=True, tool="capture_recovered_place_test",
                           summary={"place": ctx.get("task").place_name})
 
     fake = FakeLLM([
         {"n_facilities": "some", "threshold_minutes": 15, "weights": None},
-        {"steps": [{"tool": "capture_recovered_place_test"}]},
+        {"kind": "tool", "tool": "capture_recovered_place_test"},
     ])
     monkeypatch.setattr("builtins.input", lambda _: "DC")
     monkeypatch.setattr(main.hitl, "clarify_place", lambda task, **_: task)
@@ -148,7 +149,8 @@ def test_agent_plan_binds_confirmed_task_arguments():
     assert steps[0].args == {"place_name": task.place_name}
     assert steps[1].args == {"amenities": task.candidate_amenities}
     assert steps[2].args == {"n_facilities": 8, "threshold_minutes": 15,
-                             "weights": task.weights.model_dump()}
+                             "weights": task.weights.model_dump(), "coverage_target": None,
+                             "coverage_group": "all"}
 
 
 def test_agent_stops_after_unrecoverable_step():
@@ -168,25 +170,27 @@ def test_agent_stops_after_unrecoverable_step():
 
     fake = FakeLLM([
         {"place_name": "DC", "weights": None},
-        {"steps": [{"tool": "agent_fail_stop_test"}, {"tool": "agent_should_not_run_test"}]},
+        {"kind": "tool", "tool": "agent_fail_stop_test"},
+        {"kind": "hitl", "message": "The required input is missing."},
     ])
     result = run_agent({"llm": {"model": "fake", "max_self_correction_rounds": 0}},
                        "test", llm=fake, interactive=False, validate_place=False)
     assert not result["ok"] and result["failed_tool"] == "agent_fail_stop_test"
-    assert len(result["results"]) == 1 and not called
+    assert len(result["results"]) == 1 and result["paused"] and not called
 
 
-def test_run_agent_performs_parse_hitl_plan_execute():
-    """Verify the public agent entry executes parse, HITL, plan, and execute."""
+def test_run_agent_performs_parse_hitl_observe_and_act():
+    """Verify the public agent entry executes parse, HITL, observe, act, and finish."""
     @registry.register("capture_task_test", "capture clarified task")
     def capture(ctx):
         """Confirm the clarified TaskSpec is available through Context."""
         task = ctx.get("task")
+        if task.is_complete(): ctx.put("outputs", {})
         return ToolResult(ok=task.is_complete(), tool="capture_task_test", summary={"notes": task.notes})
 
     fake = FakeLLM([
         {"place_name": "Phoenix, Arizona, USA", "weights": None, "notes": "equity is vague"},
-        {"steps": [{"tool": "capture_task_test", "args": {}}], "reasoning": "test"},
+        {"kind": "tool", "tool": "capture_task_test", "rationale": "Verify the confirmed task."},
     ])
     cfg = {"llm": {"model": "fake", "max_self_correction_rounds": 0}}
     result = run_agent(cfg, "help underserved Phoenix", llm=fake, interactive=False, validate_place=False,

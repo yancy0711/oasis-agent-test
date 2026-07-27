@@ -2,14 +2,12 @@
 from __future__ import annotations
 
 import contextvars
-import functools
 import hashlib
-import json
 import pathlib
 import re
 import unicodedata
 from contextlib import contextmanager
-from typing import Callable, Iterator
+from typing import Iterator
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 CACHE_DIR = PROJECT_ROOT / "data" / "cache"
@@ -48,20 +46,3 @@ def cache_dir(namespace: str) -> pathlib.Path:
     path = CACHE_DIR / "places" / current_cache_scope() / namespace / CACHE_VERSION
     path.mkdir(parents=True, exist_ok=True)
     return path
-
-
-def cached(name: str) -> Callable:
-    """Cache a JSON-serializable keyword-only function inside the active place."""
-    def deco(fn: Callable) -> Callable:
-        """Wrap one function with place-scoped JSON caching."""
-        @functools.wraps(fn)
-        def wrapper(**kwargs):
-            """Read a cached response or execute and store a live response."""
-            key = hashlib.sha256(json.dumps(kwargs, sort_keys=True, default=str).encode()).hexdigest()[:16]
-            path = cache_dir(name) / f"{key}.json"
-            if path.exists(): return json.loads(path.read_text(encoding="utf-8")), "cache"
-            result = fn(**kwargs)
-            path.write_text(json.dumps(result, default=str), encoding="utf-8")
-            return result, "live"
-        return wrapper
-    return deco

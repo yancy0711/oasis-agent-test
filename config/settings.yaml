@@ -1,29 +1,24 @@
-# ============ Global runtime configuration ============
+# Global runtime configuration
 llm:
-  # anthropic | google | openai
   provider: openrouter
   base_url: "https://openrouter.ai/api/v1"
-  model: "openai/gpt-4o"       # must use complete model id 
+  model: "openai/gpt-4o"
   max_tokens: 4096
-  temperature: 0.2             # low temp for stable orchestration/modeling output
-  json_mode: true                 # enforce JSON output from LLMs
-  max_self_correction_rounds: 3  # bounds the repair loop (quota + demo time)
-
-spatial:
-  storage_crs: "EPSG:4326"     # all geometry stored/passed in 4326
-  spatial_unit: tract          # tract | block_group (tract recommended for beginners)
+  temperature: 0.2
+  max_self_correction_rounds: 3
+  max_agent_steps: 14
 
 accessibility:
   mode: walking
-  speed_kmh: 4.8               # walking speed for the haversine fallback
-  threshold_minutes: 15        # coverage threshold -- Track B's key parameter
-  router: ors                  # ors | osrm | haversine (haversine = last resort)
-  ors_city_only: false        # cities and counties may proceed to quota checks
-  ors_max_area_km2: 15000     # includes LA County; larger boundaries use Haversine
+  speed_kmh: 4.8
+  threshold_minutes: 15
+  router: ors
+  ors_city_only: false
+  ors_max_area_km2: 15000
   ors_max_eligible_pairs: 250000
-  detour_factor: 1.3           # straight-line -> network distance correction
+  detour_factor: 1.3
   ors_base_url: "https://api.heigit.org/openrouteservice/v2/matrix"
-  ors_sparse: true             # prune with an optimistic Haversine lower bound before ORS
+  ors_sparse: true
   ors_upper_speed_kmh: 6.0
   ors_max_policy_threshold_minutes: 20
   ors_pruning_margin: 1.5
@@ -31,19 +26,14 @@ accessibility:
   ors_source_chunk_size: 25
   ors_destination_chunk_size: 50
   ors_max_routes_per_request: 2500
-  ors_max_requests: 500        # quota guard after sparse spatial pruning
+  ors_max_requests: 500
   ors_request_interval_s: 1.6
   ors_timeout_s: 60
 
 optimization:
-  model: mclp                  # mclp | p_median
-  value_profile: balanced      # efficiency_first | equity_first | cooling_first | balanced
+  value_profile: balanced
   n_facilities: 8
   solver_time_limit_s: 120
-
-robustness:
-  cache_ttl_hours: 168         # long during dev; clear before review to prove liveness
-  allow_sample_fallback: true  # live API -> cache -> data/samples
 
 output:
   dir: outputs_run
