@@ -1,0 +1,1 @@
+"""External data acquisition adapters."""

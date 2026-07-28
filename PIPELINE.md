@@ -10,13 +10,13 @@ Activate the project environment from the repository root and run:
 ```powershell
 conda activate oasis-agent
 pytest tests -q
-python main.py --mode pipeline --place "Los Angeles County, California, USA"
-python main.py --mode pipeline --place "San Francisco, California, USA" --profile cooling_first
-python main.py --mode pipeline --place "New York" --n-facilities 12 --threshold-minutes 10
+python -m cli.main --mode pipeline --place "Los Angeles County, California, USA"
+python -m cli.main --mode pipeline --place "San Francisco, California, USA" --profile cooling_first
+python -m cli.main --mode pipeline --place "New York" --n-facilities 12 --threshold-minutes 10
 ```
 
 `pytest.ini` sets `pythonpath = .`, so both commands below resolve the local
-`agent` and `tools` packages in the same way:
+`oasis`, `api`, `ui`, and `cli` packages in the same way:
 
 ```powershell
 pytest tests -q
@@ -33,12 +33,12 @@ outputs_run/<place_slug>/report.md
 
 ## 2. Deterministic pipeline entry
 
-`main.run_pipeline(cfg, place, profile=None, ..., n_facilities=None, threshold_minutes=None)` performs four small actions:
+`cli.main.run_pipeline(cfg, place, profile=None, ..., n_facilities=None, threshold_minutes=None)` performs four small actions:
 
 1. Read facility count, accessibility threshold, and value profile from `cfg`.
 2. Build a complete `TaskSpec`; `optimization.value_profile` defaults to `balanced`.
 3. Resolve one unique US boundary or require HITL confirmation before any data tool runs.
-4. Call `tools.workflow.run_tool_chain(cfg, task)`.
+4. Call `oasis.services.workflow.run_tool_chain(cfg, task)`.
 
 The four valid profiles are `efficiency_first`, `equity_first`, `cooling_first`, and `balanced`; `--profile` overrides the YAML value for one CLI run.
 
@@ -46,7 +46,7 @@ The function returns a dictionary. Check `result["ok"]` before reading
 `result["solution"]` or `result["outputs"]`.
 
 ```python
-from main import load_cfg, run_pipeline
+from cli.main import load_cfg, run_pipeline
 
 result = run_pipeline(load_cfg(), "Los Angeles County, California, USA")
 if not result["ok"]:
@@ -136,10 +136,10 @@ agent to repair the amenity list without receiving raw geospatial objects.
 registry.get("build_travel_matrix").fn(ctx=ctx)
 ```
 
-When `router: ors`, deterministic guards run before the Notebook sparse path:
+When `router: ors`, deterministic guards run before the production sparse-routing path:
 
 1. City and county boundaries may enter sparse ORS checks when `ors_city_only: false`.
-2. Areas above `ors_max_area_km2` (default 15,000 km?) use Haversine and print a warning.
+2. Areas above `ors_max_area_km2` (default 15,000 km2) use Haversine and print a warning.
 3. Build the complete Haversine fallback and an optimistic lower bound.
 4. Keep pairs within `20 * 1.5 = 30` minutes as ORS-eligible.
 5. Eligible-pair counts above `ors_max_eligible_pairs` use Haversine and print a warning.
@@ -179,11 +179,11 @@ The report uses only solver results, the clarified `TaskSpec`, and accumulated
 This is the non-LLM equivalence check for `run_pipeline()`:
 
 ```python
-from agent.memory import Context
-from agent.schemas import TaskSpec
-from hitl.knobs import get_weights
-from main import load_cfg
-from tools.registry import registry
+from oasis.agent.context import Context
+from oasis.contracts.domain import TaskSpec
+from oasis.settings import get_weights
+from cli.main import load_cfg
+from oasis.services.registry import registry
 
 cfg = load_cfg()
 task = TaskSpec(
@@ -217,12 +217,12 @@ for name, args in calls:
 ```
 
 The automated version is `test_cli_pipeline_matches_manual_six_tool_chain()`
-in `tests/test_pipeline_agent.py`. It runs both paths on the same synthetic geospatial
+in `tests/integration/test_pipeline_agent.py`. It runs both paths on the same synthetic geospatial
 data and compares the complete serialized `SiteSolution` objects.
 
 ## 5. Agent entry
 
-`main.run_agent()` validates the task through HITL and then runs a bounded observation-action loop:
+`cli.main.run_agent()` validates the task through HITL and then runs a bounded observation-action loop:
 
 ```text
 user prompt
@@ -239,7 +239,7 @@ user prompt
 For an infeasible fixed-budget request, the model can select LSCP, minimum-threshold search, or reachability analysis instead of silently changing a confirmed constraint.
 
 ```powershell
-python main.py --mode agent --prompt "At a strict 15-minute threshold, how many Phoenix cooling centers are required for full tract coverage?"
+python -m cli.main --mode agent --prompt "At a strict 15-minute threshold, how many Phoenix cooling centers are required for full tract coverage?"
 ```
 
 ## 6. Offline and live agent tests
@@ -254,4 +254,4 @@ fake = FakeLLM([
 ])
 ```
 
-Run all deterministic tests with `pytest tests -q`. Run `python scripts/evaluate_agent_behavior.py` to evaluate live model branching, diagnostic tool selection, and self-correction; this command uses the configured OpenRouter model.
+Run all deterministic tests with `pytest tests -q`. Run `python -m experiments.evaluate_agent_behavior` to evaluate live model branching, diagnostic tool selection, and self-correction; this command uses the configured OpenRouter model.

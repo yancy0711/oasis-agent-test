@@ -1,17 +1,46 @@
 # OASIS Agent
 
-OASIS is a GeoAI workflow for equity-aware public health facility siting. It resolves a US city or county, acquires census, OpenStreetMap, and heat-exposure data, estimates walking accessibility, optimizes facility locations, and produces decision-support outputs.
+OASIS is a GeoAI decision-support agent for equity-aware public-health facility siting in the United States. It resolves a city or county, prepares Census, OpenStreetMap, and heat-exposure data, estimates walking access, solves location models, and produces an interactive map, a Pareto chart, and a provenance report.
 
-The project supports two execution modes:
+Two execution modes share the same deterministic geospatial core:
 
-- `pipeline`: runs the deterministic six-tool workflow without an LLM.
-- `agent`: parses the request, confirms ambiguous inputs, and repeatedly selects one registered action from observed tool results. It can run the baseline workflow or diagnose infeasible constraints with LSCP, minimum-threshold search, reachability analysis, and scenario comparison.
+- `pipeline`: runs the fixed six-stage workflow without an LLM.
+- `agent`: uses an LLM to parse intent and choose the next registered action from observed results. Deterministic tools still perform geocoding, routing, validation, MCLP/LSCP solving, threshold search, and output generation.
 
-Each successful run writes three files under `outputs_run/<place>/`:
+## Architecture
 
-- `coverage_map.html`: interactive coverage, selected facilities, census tracts, and heat exposure.
-- `pareto.png`: efficiency and equity trade-off chart.
-- `report.md`: selected sites, coverage statistics, parameters, and provenance.
+```text
+oasis-agent/
+|-- oasis/                         # Framework-independent application package
+|   |-- contracts/                 # Shared Pydantic domain contracts
+|   |-- agent/                     # Context, prompts, and observation-action orchestration
+|   |-- core/
+|   |   |-- data/                  # Census, geocoding, Landsat, and OSM acquisition
+|   |   |-- spatial/               # CRS alignment and walking-access matrices
+|   |   |-- optimization/          # MCLP, LSCP, threshold search, and Pareto analysis
+|   |   `-- outputs/               # Folium maps, charts, and Markdown reports
+|   |-- services/                  # Registered tools, use cases, jobs, and artifacts
+|   `-- settings.py                # Runtime settings and value profiles
+|-- api/                           # FastAPI routes and HTTP schemas
+|-- ui/                            # Streamlit presentation and API client
+|-- cli/                           # Pipeline/agent commands and terminal HITL
+|-- config/                        # YAML settings and value profiles
+|-- data/samples/                  # Small committed input examples
+|-- experiments/                   # Live agent-behavior evaluation
+|-- tests/                         # Unit, integration, and Streamlit acceptance tests
+|-- notebooks/                     # Research exploration, not production state
+|-- Dockerfile                     # Shared backend/frontend container image
+`-- docker-compose.yml             # Starts FastAPI and Streamlit together
+```
+
+Runtime flow:
+
+```text
+Streamlit UI -> FastAPI service -> OASIS services -> agent + deterministic core
+                                              -> cache, outputs, and provenance
+```
+
+Web execution keeps API keys and filesystem paths in the backend. Streamlit exchanges typed tasks, opaque IDs, progress, summaries, and allow-listed artifacts through `/v1`. Uvicorn currently uses one worker because run state is in memory; caches and outputs remain on disk.
 
 ## Requirements
 
@@ -20,25 +49,24 @@ Each successful run writes three files under `outputs_run/<place>/`:
 - CBC solver for PuLP
 - Internet access for live geocoding and data acquisition
 
-Major Python libraries include GeoPandas, Shapely, PyProj, OSMnx, pygris, Planetary Computer, OpenRouteService-compatible requests, PuLP, Pydantic, Folium, Matplotlib, and Streamlit. Full versions are listed in `requirements.txt`.
+Important Python packages include GeoPandas, Shapely, OSMnx, PyGRIS, Planetary Computer, Rasterio, PuLP, Pydantic, Folium, Matplotlib, FastAPI, Uvicorn, HTTPX, and Streamlit. Exact constraints are in `requirements.txt`.
 
 ## API keys
 
-Copy `.env.example` to `.env` and fill in the required values:
+Copy the example environment file:
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-- `OPENROUTER_API_KEY`: required for `agent` mode. Create one at [OpenRouter](https://openrouter.ai/).
-- `ORS_API_KEY`: required when the default OpenRouteService walking matrix is used. Create one at [openrouteservice](https://openrouteservice.org/sign-up/).
-- `CENSUS_API_KEY`: recommended for more reliable US Census API access. Request one from the [US Census Bureau](https://api.census.gov/data/key_signup.html).
-- `OPENROUTER_SITE_URL`: optional application URL sent to OpenRouter.
-- `OPENROUTER_APP_NAME`: optional application name sent to OpenRouter.
+- `OPENROUTER_API_KEY`: required for agent mode.
+- `ORS_API_KEY`: required for OpenRouteService walking matrices.
+- `CENSUS_API_KEY`: recommended for reliable Census API access.
+- `OPENROUTER_SITE_URL` and `OPENROUTER_APP_NAME`: optional OpenRouter metadata.
 
-Never commit the populated `.env` file.
+The deterministic pipeline can run without OpenRouter. Never commit the populated `.env` file.
 
-## Local installation
+## Install and test
 
 ```powershell
 conda create -n oasis-agent python=3.11
@@ -47,53 +75,58 @@ pip install -r requirements.txt
 pytest tests -q
 ```
 
-The production workflow does not depend on Notebook global variables. `notebooks/explore.ipynb` is retained for exploration only.
+## Run from the command line
 
-## Run the deterministic pipeline
-
-```powershell
-python main.py --mode pipeline --place "New York City" --n-facilities 12 --threshold-minutes 10 --profile equity_first
-```
-
-Available value profiles are `balanced`, `efficiency_first`, `equity_first`, and `cooling_first`. Ambiguous place names are presented as candidates for user confirmation. Large study areas or requests exceeding the routing policy limits use the documented Haversine fallback.
-
-## Run the agent
+Deterministic pipeline:
 
 ```powershell
-python main.py --mode agent --prompt "Site 8 cooling centers in Washington, DC within a 15-minute walking threshold and maximize population coverage."
+python -m cli.main --mode pipeline --place "New York City" --n-facilities 12 --threshold-minutes 10 --profile equity_first
 ```
 
-The LLM handles task parsing, one-step action selection, bounded repair, and explanation. Geocoding, matrix analysis, MCLP/LSCP solving, threshold search, caching, validation, and output generation remain deterministic tools. Confirmed constraints are never changed without HITL.
-
-Diagnostic requests use the same registered primitives:
+Agent mode:
 
 ```powershell
-python main.py --mode agent --prompt "At a strict 15-minute threshold, what is the minimum number of Phoenix cooling centers needed to cover every tract?"
-python main.py --mode agent --prompt "With exactly 2 Phoenix cooling centers, what is the smallest threshold that covers every tract?"
-python main.py --mode agent --prompt "Which Phoenix tracts are hardest to serve within 15 minutes?"
+python -m cli.main --mode agent --prompt "Site 8 cooling centers in Washington, DC within a 15-minute walking threshold and maximize population coverage."
 ```
 
-CLI values can override parameters parsed from the prompt:
+Diagnostic examples:
 
 ```powershell
-python main.py --mode agent --prompt "Plan cooling centers in NYC" --n-facilities 10 --threshold-minutes 12 --profile balanced
+python -m cli.main --mode agent --prompt "At a strict 15-minute threshold, what is the minimum number of Phoenix cooling centers needed to cover every tract?"
+python -m cli.main --mode agent --prompt "With exactly 2 Phoenix cooling centers, what is the smallest threshold that covers every tract?"
+python -m cli.main --mode agent --prompt "Which Phoenix tracts are hardest to serve within 15 minutes?"
 ```
 
-## Streamlit interface
+The profiles are `balanced`, `efficiency_first`, `equity_first`, and `cooling_first`. CLI arguments can override parsed facility count, threshold, and profile. Ambiguous places require confirmation; repeated names resolve to the same canonical cache identity.
+
+CLI runs write to `outputs_run/<place>/`; web runs use `outputs_run/api_runs/<run_id>/<place>/`. A successful siting run produces `coverage_map.html`, `pareto.png`, and `report.md`. A heat-only review produces `heat_exposure_map.html`, `heat_analysis.png`, and `heat_report.md`.
+
+## Run the web application
+
+Start FastAPI in one terminal:
 
 ```powershell
-streamlit run streamlit_app.py
+uvicorn api.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-Open the displayed local URL to enter a request, review human-in-the-loop decisions, run the workflow, and inspect the generated outputs.
-
-## Docker
+Start Streamlit in another terminal:
 
 ```powershell
-docker build -t oasis-agent .
-docker run --rm -it --env-file .env oasis-agent python main.py --mode agent --prompt "Site 8 cooling centers in Washington, DC."
+streamlit run ui/streamlit_app.py
 ```
 
-The Docker image installs the required GDAL and CBC system packages. Mount `outputs_run` as a volume if generated files must persist after the container exits.
+Open `http://127.0.0.1:8501`. Health and API documentation are available at `http://127.0.0.1:8000/health` and `http://127.0.0.1:8000/docs`. Set `OASIS_API_URL` only when the services run on different hosts.
 
-For the formal tool sequence and manual equivalence checks, see `PIPELINE.md`.
+
+## Run with Docker Compose
+
+Docker Compose is the recommended tester package because it supplies the same Python, GDAL, CBC, API, and UI environment on Windows, macOS, and Linux:
+
+```powershell
+Copy-Item .env.example .env
+docker compose up --build
+```
+
+Open `http://localhost:8501`; stop with `docker compose down`. `data/cache` and `outputs_run` are mounted from the host. PyInstaller is still possible, but it must be built separately on each operating system and is harder to maintain with native geospatial dependencies.
+
+For the tool sequence and manual equivalence checks, see `PIPELINE.md`.
