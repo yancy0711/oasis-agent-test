@@ -146,17 +146,4 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Open `http://localhost:8501`; stop with `docker compose down`. `data/cache` and `outputs_run` are mounted from the host. Both Intel and Apple Silicon Macs use their native image architecture; do not add `platform: linux/amd64` unless a dependency is proven unavailable on arm64.
-
-If a macOS build stalls at `apt-get update`, print the full error and test Debian access from Docker:
-
-```bash
-docker compose --progress plain build --no-cache
-docker run --rm python:3.11-slim-bookworm sh -c 'apt-get update'
-```
-
-If the probe also times out, restart Docker Desktop, disconnect or correctly configure any VPN/proxy, and check Docker Desktop's proxy/DNS settings. Changing to a regional Debian mirror should be a last resort because it makes the build location-dependent. Once the probe succeeds, run `docker compose build` followed by `docker compose up`.
-
-PyInstaller is possible, but it must be built separately on each operating system and is harder to maintain with native geospatial dependencies.
-
-For the tool sequence and manual equivalence checks, see `PIPELINE.md`.
+Open `http://localhost:8501`; stop with `docker compose down`. `data/cache` and `outputs_run` are mounted from the host. For the tool sequence and manual equivalence checks, see `PIPELINE.md`.
