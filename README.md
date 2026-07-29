@@ -53,10 +53,16 @@ Important Python packages include GeoPandas, Shapely, OSMnx, PyGRIS, Planetary C
 
 ## API keys
 
-Copy the example environment file:
+Copy the example environment file on Windows PowerShell:
 
 ```powershell
 Copy-Item .env.example .env
+```
+
+On macOS or Linux:
+
+```bash
+cp .env.example .env
 ```
 
 - `OPENROUTER_API_KEY`: required for agent mode.
@@ -68,12 +74,16 @@ The deterministic pipeline can run without OpenRouter. Never commit the populate
 
 ## Install and test
 
+The commands below are the same on Windows, macOS, and Linux once Conda is installed:
+
 ```powershell
 conda create -n oasis-agent python=3.11
 conda activate oasis-agent
 pip install -r requirements.txt
-pytest tests -q
+python -m pytest tests -q
 ```
+
+Docker is preferred for macOS because the image supplies Linux GDAL and CBC without requiring separate Homebrew packages. Native macOS installation may require Xcode Command Line Tools when a dependency has no compatible wheel.
 
 ## Run from the command line
 
@@ -120,13 +130,33 @@ Open `http://127.0.0.1:8501`. Health and API documentation are available at `htt
 
 ## Run with Docker Compose
 
-Docker Compose is the recommended tester package because it supplies the same Python, GDAL, CBC, API, and UI environment on Windows, macOS, and Linux:
+Docker Compose is the recommended tester package because it supplies the same Python, GDAL, CBC, API, and UI environment on Windows, macOS, and Linux.
+
+Windows PowerShell:
 
 ```powershell
 Copy-Item .env.example .env
 docker compose up --build
 ```
 
-Open `http://localhost:8501`; stop with `docker compose down`. `data/cache` and `outputs_run` are mounted from the host. PyInstaller is still possible, but it must be built separately on each operating system and is harder to maintain with native geospatial dependencies.
+macOS or Linux:
+
+```bash
+cp .env.example .env
+docker compose up --build
+```
+
+Open `http://localhost:8501`; stop with `docker compose down`. `data/cache` and `outputs_run` are mounted from the host. Both Intel and Apple Silicon Macs use their native image architecture; do not add `platform: linux/amd64` unless a dependency is proven unavailable on arm64.
+
+If a macOS build stalls at `apt-get update`, print the full error and test Debian access from Docker:
+
+```bash
+docker compose --progress plain build --no-cache
+docker run --rm python:3.11-slim-bookworm sh -c 'apt-get update'
+```
+
+If the probe also times out, restart Docker Desktop, disconnect or correctly configure any VPN/proxy, and check Docker Desktop's proxy/DNS settings. Changing to a regional Debian mirror should be a last resort because it makes the build location-dependent. Once the probe succeeds, run `docker compose build` followed by `docker compose up`.
+
+PyInstaller is possible, but it must be built separately on each operating system and is harder to maintain with native geospatial dependencies.
 
 For the tool sequence and manual equivalence checks, see `PIPELINE.md`.
