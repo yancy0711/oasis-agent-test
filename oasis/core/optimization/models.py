@@ -10,6 +10,110 @@ import pulp
 from oasis.contracts.domain import SiteSolution, ValueWeights
 
 
+def _solve_mclp_selection(
+    cover: np.ndarray,
+    demand_weights: np.ndarray,
+    n_facilities: int,
+    time_limit_s: int = 120,
+    coverage_target: float | None = None,
+    coverage_mask: np.ndarray | None = None,
+) -> tuple[list[int], str]:
+    """Solve the binary coverage model and return selected column indices."""
+    cover = np.asarray(cover, dtype=bool)
+    demand_weights = np.asarray(demand_weights, dtype=float)
+    if cover.ndim != 2:
+        raise ValueError("cover must be two-dimensional")
+    n_demand, n_supply = cover.shape
+    if demand_weights.shape != (n_demand,):
+        raise ValueError("demand_weights length must match cover rows")
+    if n_facilities < 1 or n_facilities > n_supply:
+        raise ValueError("n_facilities must be between 1 and candidate count")
+    if coverage_target is not None and not 0 <= coverage_target <= 1:
+        raise ValueError("coverage_target must be between 0 and 1")
+    target_mask = (
+        np.ones(n_demand, dtype=bool)
+        if coverage_mask is None
+        else np.asarray(coverage_mask, dtype=bool)
+    )
+    if target_mask.shape != (n_demand,) or not target_mask.any():
+        raise ValueError("coverage_mask must select at least one aligned demand row")
+
+    if not np.isfinite(demand_weights).all() or (demand_weights < 0).any():
+        raise ValueError("demand_weights must be non-negative and finite")
+    objective_rows = demand_weights > 0
+    constrained_rows = objective_rows | target_mask if coverage_target is not None else objective_rows
+    if not constrained_rows.any():
+        return [], "Optimal"
+
+    problem = pulp.LpProblem("MCLP", pulp.LpMaximize)
+    x = [pulp.LpVariable(f"x_{j}", cat="Binary") for j in range(n_supply)]
+    y = {i: pulp.LpVariable(f"y_{i}", cat="Binary") for i in np.flatnonzero(constrained_rows)}
+    problem += pulp.lpSum(demand_weights[i] * y[i] for i in np.flatnonzero(objective_rows))
+    problem += pulp.lpSum(x) <= n_facilities
+    for i in np.flatnonzero(constrained_rows):
+        reachable = np.flatnonzero(cover[i])
+        problem += (
+            y[i] == 0
+            if len(reachable) == 0
+            else y[i] <= pulp.lpSum(x[j] for j in reachable)
+        )
+    if coverage_target is not None:
+        required = int(np.ceil(coverage_target * int(target_mask.sum()) - 1e-9))
+        problem += pulp.lpSum(y[i] for i in np.flatnonzero(target_mask)) >= required
+
+    problem.solve(
+        pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit_s, threads=1)
+    )
+    status = pulp.LpStatus[problem.status]
+    chosen = (
+        [j for j in range(n_supply) if (x[j].value() or 0) > 0.5]
+        if status in {"Optimal", "Feasible"}
+        else []
+    )
+    return chosen, status
+
+
+def _site_solution_from_selection(
+    travel_matrix: np.ndarray,
+    cover: np.ndarray,
+    population: np.ndarray,
+    vulnerable_mask: np.ndarray,
+    candidate_ids: list[str],
+    chosen: list[int],
+    solver_status: str,
+    profile_name: str,
+    weights: ValueWeights | None,
+) -> SiteSolution:
+    """Evaluate one solver selection in the parent process."""
+    n_demand = len(population)
+    covered = (
+        cover[:, chosen].any(axis=1)
+        if chosen
+        else np.zeros(n_demand, dtype=bool)
+    )
+    served = (
+        travel_matrix[:, chosen].min(axis=1)
+        if chosen
+        else np.full(n_demand, np.inf)
+    )
+    covered_times = served[covered & np.isfinite(served)]
+    return SiteSolution(
+        profile_name=profile_name,
+        selected_ids=[candidate_ids[j] for j in chosen],
+        covered_population=float(population[covered].sum()),
+        covered_ratio=float(population[covered].sum() / max(population.sum(), 1)),
+        vulnerable_covered_ratio=float(
+            population[covered & vulnerable_mask].sum()
+            / max(population[vulnerable_mask].sum(), 1)
+        ),
+        mean_travel_minutes=float(
+            np.mean(covered_times) if covered_times.size else -1
+        ),
+        weights_used=weights,
+        solver_status=solver_status,
+    )
+
+
 def build_demand_weights(indicators: dict[str, np.ndarray], population: np.ndarray,
                          weights: ValueWeights) -> np.ndarray:
     """weight_i = population_i * sum_k( w_k * minmax(indicator_ik) ).
@@ -86,45 +190,26 @@ def solve_mclp(travel_matrix: np.ndarray, demand_weights: np.ndarray,
 
     cover = travel_matrix <= threshold_minutes
 
-    prob = pulp.LpProblem("MCLP", pulp.LpMaximize)
-    x = [pulp.LpVariable(f"x_{j}", cat="Binary") for j in range(n_supply)]
-    y = [pulp.LpVariable(f"y_{i}", cat="Binary") for i in range(n_demand)]
-    prob += pulp.lpSum(demand_weights[i] * y[i] for i in range(n_demand))
-    prob += pulp.lpSum(x) <= n_facilities
-    for i in range(n_demand):
-        js = np.flatnonzero(cover[i])
-        prob += (y[i] == 0) if len(js) == 0 else (y[i] <= pulp.lpSum(x[j] for j in js))
-    if coverage_target is not None:
-        required = int(np.ceil(coverage_target * int(target_mask.sum()) - 1e-9))
-        prob += pulp.lpSum(y[i] for i in np.flatnonzero(target_mask)) >= required
-    prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit_s))
-
-    solver_status = pulp.LpStatus[prob.status]
-    chosen = ([j for j in range(n_supply) if (x[j].value() or 0) > 0.5]
-              if solver_status in {"Optimal", "Feasible"} else [])
-    # Report geographic coverage from chosen sites. Solver y values can be
-    # arbitrary for zero-weight rows and must not define evaluation metrics.
-    covered = (
-        cover[:, chosen].any(axis=1)
-        if chosen
-        else np.zeros(n_demand, dtype=bool)
+    chosen, solver_status = _solve_mclp_selection(
+        cover,
+        demand_weights,
+        n_facilities,
+        time_limit_s,
+        coverage_target,
+        target_mask,
     )
-    served = travel_matrix[:, chosen].min(axis=1) if chosen else np.full(n_demand, np.inf)
-    covered_times = served[covered & np.isfinite(served)]
-
-    return SiteSolution(
-        profile_name=profile_name,
-        selected_ids=[candidate_ids[j] for j in chosen],
-        covered_population=float(population[covered].sum()),
-        covered_ratio=float(population[covered].sum() / max(population.sum(), 1)),
-        vulnerable_covered_ratio=float(
-            population[covered & vulnerable_mask].sum()
-            / max(population[vulnerable_mask].sum(), 1)),
-        mean_travel_minutes=float(
-            np.mean(covered_times) if covered_times.size else -1
-        ),
-        weights_used=weights,
-        solver_status=solver_status,
+    # Solver y values can be arbitrary for zero-weight rows. Always derive
+    # reported coverage from the selected geography instead.
+    return _site_solution_from_selection(
+        travel_matrix,
+        cover,
+        population,
+        vulnerable_mask,
+        candidate_ids,
+        chosen,
+        solver_status,
+        profile_name,
+        weights,
     )
 
 def solve_lscp(travel_matrix: np.ndarray, population: np.ndarray, vulnerable_mask: np.ndarray,
@@ -152,7 +237,7 @@ def solve_lscp(travel_matrix: np.ndarray, population: np.ndarray, vulnerable_mas
         problem += (y[i] == 0) if len(reachable) == 0 else (y[i] <= pulp.lpSum(x[j] for j in reachable))
     required = int(np.ceil(coverage_target * int(target_mask.sum()) - 1e-9))
     problem += pulp.lpSum(y[i] for i in np.flatnonzero(target_mask)) >= required
-    problem.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit_s))
+    problem.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit_s, threads=1))
     status = pulp.LpStatus[problem.status]
     chosen = ([j for j in range(n_supply) if (x[j].value() or 0) > .5]
               if status in {"Optimal", "Feasible"} else [])

@@ -6,6 +6,7 @@ import hashlib
 import os
 import pathlib
 import re
+import tempfile
 import unicodedata
 from contextlib import contextmanager
 from typing import Iterator
@@ -47,3 +48,26 @@ def cache_dir(namespace: str) -> pathlib.Path:
     path = CACHE_DIR / "places" / current_cache_scope() / namespace / CACHE_VERSION
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+@contextmanager
+def atomic_target(path: str | pathlib.Path) -> Iterator[pathlib.Path]:
+    """Yield a same-directory temporary path and publish it with one atomic replace."""
+    target = pathlib.Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        dir=target.parent, prefix=f".{target.stem}.", suffix=target.suffix
+    )
+    os.close(descriptor)
+    temp = pathlib.Path(temporary)
+    temp.unlink(missing_ok=True)
+    try:
+        yield temp
+        os.replace(temp, target)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def atomic_write_text(path: str | pathlib.Path, content: str) -> None:
+    """Publish UTF-8 text without exposing a partially written cache entry."""
+    with atomic_target(path) as temporary:
+        temporary.write_text(content, encoding="utf-8")

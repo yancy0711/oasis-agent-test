@@ -19,6 +19,7 @@ AMENITY_TAGS = {
     "school": {"amenity": "school"},
     "place_of_worship": {"amenity": "place_of_worship"},
     "sports_centre": {"leisure": "sports_centre"},
+    "arts_centre": {"amenity": "arts_centre"},
 }
 
 

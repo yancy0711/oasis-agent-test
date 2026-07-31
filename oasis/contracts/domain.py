@@ -1,7 +1,8 @@
 """Typed contracts shared by the LLM, orchestrator, tools, and outputs."""
 from __future__ import annotations
+from datetime import date, time
 from typing import Any, Literal
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ValueWeights(BaseModel):
@@ -30,27 +31,97 @@ class RegionalRequirement(BaseModel):
     minimum_facilities: int = Field(..., ge=0)
 
 
+class OperatingWindow(BaseModel):
+    """One user-confirmed local service window for candidate availability."""
+
+    date: date
+    start: time
+    end: time
+    unknown_policy: Literal["include", "exclude"] = "include"
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "OperatingWindow":
+        if self.end <= self.start:
+            raise ValueError("operating window end must be after start")
+        return self
+
+MobilityScenario = Literal["walking", "cycling", "driving", "walk_drive_equity"]
+
+
 class TaskSpec(BaseModel):
     """Structured, human-confirmable task extracted from natural language."""
     place_name: str = Field(..., description="Geocodable US city or county")
     intervention: Literal["cooling_center", "mobile_clinic", "monitoring_station"] = "cooling_center"
     analysis_goal: Literal["facility_siting", "heat_review", "minimum_facilities",
-                           "minimum_threshold", "reachability_review", "scenario_comparison"] = "facility_siting"
+                           "minimum_threshold", "reachability_review", "scenario_comparison",
+                           "sensitivity_analysis"] = "facility_siting"
     candidate_source: Literal["osm", "csv"] = "osm"
     candidate_file: str | None = None
+    mobility_scenario: MobilityScenario = "walking"
+    recommended_mobility_scenario: MobilityScenario | None = None
+    recommended_value_profile: str | None = None
+    recommendation_rationale: str = ""
+    operating_window: OperatingWindow | None = None
     n_facilities: int = Field(8, ge=1, le=100)
     threshold_minutes: float = Field(15.0, gt=0)
     coverage_target: float | None = Field(None, ge=0.0, le=1.0)
     coverage_group: Literal["all", "vulnerable"] = "all"
     weights: ValueWeights | None = None
-    candidate_amenities: list[str] = Field(default_factory=lambda: ["library", "community_centre", "school"])
+    candidate_amenities: list[str] = Field(default_factory=lambda: ["library", "community_centre", "sports_centre", "arts_centre"])
     regional_requirements: list[RegionalRequirement] = Field(default_factory=list)
+    sensitivity_thresholds: list[float] = Field(default_factory=list, max_length=12)
+    sensitivity_facility_counts: list[int] = Field(default_factory=list, max_length=12)
+    recommended_sensitivity_thresholds: list[float] = Field(default_factory=list, max_length=12)
+    recommended_sensitivity_facility_counts: list[int] = Field(default_factory=list, max_length=12)
     preference_question: str = ""
     notes: str = ""
+
+    @field_validator(
+        "sensitivity_thresholds", "recommended_sensitivity_thresholds"
+    )
+    @classmethod
+    def _positive_thresholds(cls, values: list[float]) -> list[float]:
+        if any(value <= 0 for value in values):
+            raise ValueError("sensitivity thresholds must be positive")
+        return list(dict.fromkeys(float(value) for value in values))
+
+    @field_validator(
+        "sensitivity_facility_counts", "recommended_sensitivity_facility_counts"
+    )
+    @classmethod
+    def _positive_facility_counts(cls, values: list[int]) -> list[int]:
+        if any(value < 1 or value > 100 for value in values):
+            raise ValueError("sensitivity facility counts must be in [1,100]")
+        return list(dict.fromkeys(int(value) for value in values))
 
     def is_complete(self) -> bool:
         """Return whether all human value judgments have been supplied."""
         return self.analysis_goal != "facility_siting" or self.weights is not None
+
+
+RoutingMode = Literal["quick", "precise", "auto"]
+RunStatus = Literal[
+    "queued", "running", "cancelling", "cancelled", "superseded",
+    "interrupted", "succeeded", "awaiting_hitl", "failed",
+]
+
+
+class RunSpec(BaseModel):
+    """Bind one decision task to an explicit, reproducible execution mode."""
+    task: TaskSpec
+    mode: RoutingMode = "auto"
+
+
+class ExecutionProvenance(BaseModel):
+    """Describe how one quick or precise execution phase was computed."""
+    mode: RoutingMode
+    phase: Literal["quick", "precise"]
+    router_requested: Literal["haversine", "ors"]
+    router_used: str | None = None
+    accuracy: Literal["approximate", "network"] | None = None
+    status: Literal["complete", "failed", "cancelled"] = "complete"
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    cache_stats: dict[str, Any] = Field(default_factory=dict)
 
 
 class Provenance(BaseModel):

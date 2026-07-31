@@ -6,7 +6,7 @@ import folium
 import geopandas as gpd
 import pandas as pd
 
-from oasis.contracts.domain import SiteSolution
+from oasis.contracts.domain import SiteSolution, TaskSpec
 from oasis.core.spatial.alignment import ensure_crs
 
 
@@ -32,10 +32,77 @@ def _tract_details(tracts: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, list[str
         fields.append(target); aliases.append(label)
     return details, fields, aliases
 
+_MODE_LABELS = {
+    "walking": "Walking",
+    "cycling": "Cycling",
+    "driving": "Driving",
+    "walk_drive_equity": "Car-access equity: households without a car walk; others drive",
+}
+
+
+def _selected_site_popup(row: pd.Series, task: TaskSpec | None) -> folium.Popup:
+    """Describe one selected site's declared hours and scenario feasibility."""
+    name = _candidate_name(row) or str(row.get("cand_id", "unnamed site"))
+    status = str(row.get("hours_status", "not_evaluated"))
+    status_label = {
+        "open": "Open for the full requested window",
+        "partial": "Open for only part of the requested window",
+        "closed": "Closed in the requested window",
+        "unknown": "Unknown - no usable opening_hours tag",
+        "invalid": "Unknown - invalid opening_hours expression",
+        "not_evaluated": "Not evaluated (no service window selected)",
+    }.get(status, status)
+    expression = row.get("opening_hours")
+    declared = expression.strip() if isinstance(expression, str) and expression.strip() else "Not tagged in OpenStreetMap"
+    access_status = {
+        "osm_public": "OSM marks access as public/permissive",
+        "conditional": "OSM access is conditional; verify the stated restriction",
+        "unknown": "Not verified - OSM has no explicit public-access tag",
+    }.get(str(row.get("public_access_status", "unknown")), "Not verified")
+    cooling_status = {
+        "verified": "Verified public cooling service",
+        "unverified": "Not verified as an active public cooling service",
+    }.get(str(row.get("cooling_service_status", "unverified")), "Not verified")
+    parts = [
+        f"<b>{escape(name)}</b>",
+        f"Candidate ID: {escape(str(row.get('cand_id', 'unknown')))}",
+        f"Mobility scenario: {escape(_MODE_LABELS.get(getattr(task, 'mobility_scenario', ''), getattr(task, 'mobility_scenario', 'not specified')))}",
+        f"Public access evidence: {escape(access_status)}",
+        f"Cooling-service status: {escape(cooling_status)}",
+        f"OSM opening_hours: {escape(declared)}",
+        f"Window feasibility: {escape(status_label)}",
+    ]
+    website = next(
+        (
+            row.get(field).strip()
+            for field in ("website", "contact:website")
+            if isinstance(row.get(field), str) and row.get(field).strip()
+        ),
+        None,
+    )
+    if website:
+        safe_url = escape(website, quote=True)
+        parts.append(f'<a href="{safe_url}" target="_blank">Candidate website</a>')
+    if declared == "Not tagged in OpenStreetMap":
+        parts.append(
+            "OSM has no hours tag for this feature; school or office hours from a website "
+            "must not be assumed to be public cooling-service hours."
+        )
+    window = getattr(task, "operating_window", None)
+    if window:
+        parts.append(
+            f"Requested window: {window.date.isoformat()} "
+            f"{window.start.isoformat(timespec='minutes')}-{window.end.isoformat(timespec='minutes')}"
+        )
+        if status in {"unknown", "invalid"}:
+            parts.append("<b>Availability was not verified; retained by the selected unknown-hours policy.</b>")
+    return folium.Popup("<br>".join(parts), max_width=380)
+
 
 def coverage_map(tracts: gpd.GeoDataFrame, candidates: gpd.GeoDataFrame,
                  solution: SiteSolution, indicator: str, out_path: str,
-                 boundary: gpd.GeoDataFrame | None = None) -> str:
+                 boundary: gpd.GeoDataFrame | None = None, *,
+                 task: TaskSpec | None = None) -> str:
     """Render aligned heat, tract details, selected named sites, and boundary layers."""
     tracts, candidates = ensure_crs(tracts), ensure_crs(candidates)
     frame = candidates if not candidates.empty else tracts
@@ -65,10 +132,14 @@ def coverage_map(tracts: gpd.GeoDataFrame, candidates: gpd.GeoDataFrame,
     sites = folium.FeatureGroup(name="Selected candidate sites").add_to(m)
     for _, row in selected.iterrows():
         name = _candidate_name(row); tooltip = f"Selected site: {escape(name)}" if name else None
-        folium.Marker([row.geometry.y, row.geometry.x], tooltip=tooltip,
-                      icon=folium.Icon(color="blue", icon="star")).add_to(sites)
+        folium.Marker(
+            [row.geometry.y, row.geometry.x],
+            tooltip=tooltip,
+            popup=_selected_site_popup(row, task),
+            icon=folium.Icon(color="blue", icon="star"),
+        ).add_to(sites)
     m.fit_bounds([[miny, minx], [maxy, maxx]], padding=(20, 20))
-    folium.LayerControl(collapsed=False).add_to(m); m.save(out_path)
+    folium.LayerControl(collapsed=True).add_to(m); m.save(out_path)
     return out_path
 
 def heat_exposure_map(tracts: gpd.GeoDataFrame, out_path: str,
@@ -93,5 +164,5 @@ def heat_exposure_map(tracts: gpd.GeoDataFrame, out_path: str,
                        style_function=lambda _: {"color": "#2455ff", "weight": 2, "dashArray": "6 6",
                                                  "fillOpacity": 0}).add_to(m)
     m.fit_bounds([[miny, minx], [maxy, maxx]], padding=(20, 20))
-    folium.LayerControl(collapsed=False).add_to(m); m.save(out_path)
+    folium.LayerControl(collapsed=True).add_to(m); m.save(out_path)
     return out_path

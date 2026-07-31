@@ -9,7 +9,9 @@ import geopandas as gpd
 import requests
 from shapely.geometry import shape
 
-from oasis.core.cache import CACHE_DIR, CACHE_VERSION, cache_dir, place_slug, scoped_cache
+from oasis.core.cache import (
+    CACHE_DIR, CACHE_VERSION, atomic_write_text, cache_dir, place_slug, scoped_cache,
+)
 from oasis.core.retry import RETRYABLE_STATUS, TransientError, with_retry
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
@@ -116,7 +118,7 @@ def cache_place_candidates(place_name: str, rows: list[dict], selected: dict, li
     with scoped_cache(canonical) as scope:
         for query, payload in ((canonical, [selected]), (place_name, rows)):
             path = cache_dir("nominatim") / _candidate_filename(query, limit)
-            path.write_text(json.dumps(payload), encoding="utf-8")
+            atomic_write_text(path, json.dumps(payload))
     return scope
 
 
@@ -185,7 +187,7 @@ def _coordinate_fips(lon: float, lat: float) -> dict[str, str]:
     else:
         response = requests.get("https://geocoding.geo.census.gov/geocoder/geographies/coordinates", params=params, timeout=30)
         if response.status_code in RETRYABLE_STATUS: raise TransientError(f"Census Geocoder {response.status_code}")
-        response.raise_for_status(); data = response.json(); path.write_text(json.dumps(data), encoding="utf-8")
+        response.raise_for_status(); data = response.json(); atomic_write_text(path, json.dumps(data))
     counties = data.get("result", {}).get("geographies", {}).get("Counties", [])
     if not counties: raise ValueError("Census Geocoder returned no US county for this place")
     state_fips, county_fips = str(counties[0].get("STATE", "")).zfill(2), str(counties[0].get("COUNTY", "")).zfill(3)

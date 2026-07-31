@@ -14,7 +14,7 @@ import pygris
 import hashlib, json
 from oasis.core.spatial.alignment import ensure_crs, repair_geometry
 from oasis.core.retry import with_retry, TransientError, RETRYABLE_STATUS
-from oasis.core.cache import cache_dir
+from oasis.core.cache import atomic_target, atomic_write_text, cache_dir
 
 ACS_BASE = "https://api.census.gov/data/{year}/acs/acs5"
 
@@ -33,6 +33,15 @@ VARIABLES: dict[str, dict[str, str]] = {
 }
 
 
+def _validate_table(result) -> list[list[str]]:
+    """Reject transient empty/malformed Census payloads before indexing rows."""
+    if not isinstance(result, list) or len(result) < 2 or not isinstance(result[0], list):
+        raise TransientError("Census API returned no tract rows or a malformed table")
+    if not all(isinstance(row, list) and len(row) == len(result[0]) for row in result[1:]):
+        raise TransientError("Census API returned rows with inconsistent columns")
+    return result
+
+
 @with_retry(max_retries=4)
 def _get(url: str, params: dict) -> list[list[str]]:
     """Fetch and cache one Census API JSON table."""
@@ -44,16 +53,25 @@ def _get(url: str, params: dict) -> list[list[str]]:
     path = cache_dir("census") / f"acs_{request_key}.json"
 
     if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
+        try:
+            return _validate_table(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError, TransientError):
+            path.unlink(missing_ok=True)
 
-    r = requests.get(url, params=params, timeout=30)
+    try:
+        r = requests.get(url, params=params, timeout=30)
+    except requests.RequestException as exc:
+        raise TransientError(f"Census API request failed: {exc}") from exc
     if r.status_code in RETRYABLE_STATUS:
         raise TransientError(f"Census API {r.status_code}")
     r.raise_for_status()
-    result = r.json()
+    try:
+        result = _validate_table(r.json())
+    except requests.JSONDecodeError as exc:
+        raise TransientError("Census API returned invalid JSON") from exc
     # Cache the result to disk for future calls with the same parameters.
     if not path.exists():
-        path.write_text(json.dumps(result),encoding="utf-8",)
+        atomic_write_text(path, json.dumps(result))
     return result
 
 
@@ -130,6 +148,15 @@ def derive_indicators(df: pd.DataFrame) -> pd.DataFrame:
             below_poverty / poverty_universe
         ).astype("float64")
 
+    if {"no_vehicle_households", "households"} <= set(df.columns):
+        no_vehicle = pd.to_numeric(
+            df["no_vehicle_households"], errors="coerce"
+        ).astype("float64")
+        households = pd.to_numeric(
+            df["households"], errors="coerce"
+        ).astype("float64").mask(lambda values: values == 0, np.nan)
+        out["no_vehicle_ratio"] = (no_vehicle / households).clip(0.0, 1.0)
+
     return out
 
 
@@ -201,7 +228,8 @@ def fetch_tract_geometry(state_fips: str, county_fips: str, year: int = 2022) ->
             f"{expected_prefix}"
         )
 
-    gdf.to_file(cache_path, driver="GPKG")    # Cache the cleaned tract geometry to disk for future calls with the same parameters.
+    with atomic_target(cache_path) as temporary:
+        gdf.to_file(temporary, driver="GPKG")
 
     return gdf.reset_index(drop=True)
 
@@ -219,5 +247,6 @@ def fetch_county_geometry(state_fips: str, year: int = 2022) -> gpd.GeoDataFrame
     gdf["COUNTYFP"] = gdf["COUNTYFP"].astype(str).str.zfill(3)
     gdf = repair_geometry(ensure_crs(gdf, target="EPSG:4326"))
     if gdf.empty: raise ValueError(f"No valid county geometry remained for state={state_fips}")
-    gdf.to_file(path, driver="GPKG")
+    with atomic_target(path) as temporary:
+        gdf.to_file(temporary, driver="GPKG")
     return gdf.reset_index(drop=True)

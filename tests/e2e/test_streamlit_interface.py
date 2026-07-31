@@ -37,6 +37,36 @@ def test_start_page_exposes_copyable_agent_examples():
     code = "\n".join(block.value for block in app.code)
     assert "candidate sites in a CSV" in code and "highest heat exposure" in code
     assert "every tract must be reachable" in code and "15-minute walking threshold" in code
+    assert any(button.label == "Analyze request" for button in app.button)
+
+def test_llm_suggestion_buttons_update_keyed_controls_via_callbacks():
+    """Recommendations must remain applicable after their widgets have been instantiated."""
+    app = AppTest.from_file("ui/streamlit_app.py")
+    app.session_state["task_data"] = {
+        "place_name": "Phoenix, Arizona, USA",
+        "analysis_goal": "sensitivity_analysis",
+        "candidate_source": "osm",
+        "n_facilities": 8,
+        "threshold_minutes": 15,
+        "weights": None,
+        "recommended_value_profile": "equity_first",
+        "recommended_mobility_scenario": "walk_drive_equity",
+        "recommended_sensitivity_thresholds": [10, 15, 20],
+        "recommended_sensitivity_facility_counts": [6, 8, 10],
+    }
+    app.run(timeout=30)
+
+    next(button for button in app.button if button.label == "Apply suggested value profile").click().run(timeout=30)
+    assert not app.exception and app.session_state["profile_choice"] == "equity_first"
+
+    next(button for button in app.button if button.label == "Apply suggested mobility mode").click().run(timeout=30)
+    assert not app.exception and app.session_state["mobility_input"] == "walk_drive_equity"
+
+    next(button for button in app.button if button.label == "Apply suggested sensitivity grid").click().run(timeout=30)
+    assert not app.exception
+    assert app.session_state["sensitivity_thresholds_input"] == [10, 15, 20]
+    assert app.session_state["sensitivity_facility_counts_input"] == [6, 8, 10]
+
 
 def test_recovery_button_updates_widgets_before_the_next_render():
     """A confirmed recovery must update keyed controls without a session-state error."""
@@ -78,3 +108,27 @@ def test_entry_bootstraps_project_root_from_ui_directory():
     result = subprocess.run([sys.executable, "-c", code], cwd=root / "ui",
                             capture_output=True, text=True, timeout=45)
     assert result.returncode == 0, result.stdout + result.stderr
+
+def test_compare_view_uses_two_completed_independent_runs():
+    app = AppTest.from_file("ui/streamlit_app.py")
+    place = "Austin, Texas, USA"
+    app.session_state["task_data"] = {"place_name": place, "analysis_goal": "heat_review"}
+    app.session_state["place_input"] = place
+    app.session_state["resolved_place"] = place
+    app.session_state["resolved_query"] = place
+    app.session_state["completed_runs"] = [
+        {"run_id": "one", "place": place, "mobility": "walking", "n_facilities": 2,
+         "threshold_minutes": 15, "coverage": .5, "vulnerable": .4,
+         "covered_tract_ratio": .5, "mean_travel_minutes": 9.0,
+         "selected_ids": ["a", "b"], "accuracy": "network"},
+        {"run_id": "two", "place": place, "mobility": "driving", "n_facilities": 2,
+         "threshold_minutes": 15, "coverage": .8, "vulnerable": .7,
+         "covered_tract_ratio": .75, "mean_travel_minutes": 6.0,
+         "selected_ids": ["b", "c"], "accuracy": "network"},
+    ]
+
+    app.run(timeout=30)
+
+    assert not app.exception
+    assert any(metric.label == "Selected-site overlap" and metric.value == "1/3" for metric in app.metric)
+    assert not any("Run and compare two successful scenarios" in item.value for item in app.info)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 from typing import Any, Callable
 from oasis.contracts.domain import AgentEvent, Provenance
+from oasis.core.cancellation import RunCancelled
 _MISSING = object()
 
 
@@ -16,7 +17,8 @@ class Context:
         self.failures: list[dict] = []
         self.history: list[AgentEvent] = []
         self.event_callback: Callable[[AgentEvent], None] | None = None
-        self.progress_callback: Callable[[str, int, int], None] | None = None
+        self.progress_callback: Callable[..., None] | None = None
+        self.cancel_callback: Callable[[], bool] | None = None
 
     def put(self, handle: str, obj: Any, prov: Provenance | list[Provenance] | None = None) -> str:
         """Store an object by handle and record any attached provenance."""
@@ -35,9 +37,19 @@ class Context:
         if self.event_callback: self.event_callback(event)
         return event
 
-    def progress(self, label: str, done: int, total: int) -> None:
+    def cancelled(self) -> bool:
+        """Return whether the owning application run requested cancellation."""
+        return bool(self.cancel_callback and self.cancel_callback())
+
+    def check_cancelled(self) -> None:
+        """Stop at a safe checkpoint without converting cancellation to failure."""
+        if self.cancelled():
+            raise RunCancelled("Run cancelled by user")
+
+    def progress(self, label: str, done: int, total: int, **stats: Any) -> None:
         """Forward transient deterministic progress without expanding history."""
-        if self.progress_callback: self.progress_callback(label, done, total)
+        self.check_cancelled()
+        if self.progress_callback: self.progress_callback(label, done, total, **stats)
 
     def get(self, handle: str, default: Any = _MISSING) -> Any:
         """Return a stored object or an explicit default for a missing handle."""

@@ -68,3 +68,30 @@ def test_fetch_heat_exposure_reuses_derived_cache(monkeypatch, tmp_path):
     result, provenance = heat.fetch_heat_exposure(tracts, "2022-06-01", "2022-08-31")
     assert provenance.tier == "cache"
     assert result.to_dict("records") == [{"GEOID": "06037101100", "mean_lst": 35.0}]
+
+
+def test_landsat_probe_retries_a_transient_ssl_failure(monkeypatch):
+    """One Azure EOF must be retried without aborting every scene probe."""
+    import planetary_computer
+    import requests
+
+    item = SimpleNamespace(
+        id="retry",
+        assets={
+            band: SimpleNamespace(href=f"https://blob.example/{band}.tif")
+            for band in ("lwir11", "qa_pixel")
+        },
+    )
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append(url)
+        if len(calls) == 1:
+            raise requests.exceptions.SSLError("unexpected EOF")
+        return SimpleNamespace(content=b"II*\x00", raise_for_status=lambda: None)
+
+    monkeypatch.setattr(planetary_computer, "sign", lambda url: url)
+    monkeypatch.setattr(requests, "get", get)
+    monkeypatch.setattr(heat.time, "sleep", lambda _: None)
+    assert heat._item_is_readable(item)
+    assert len(calls) == 3

@@ -48,10 +48,11 @@ class ApiClient:
         """Upload one candidate CSV and return its opaque backend ID."""
         return self._request("POST", "/uploads", files={"file": (filename, content, "text/csv")})
 
-    def start_run(self, task: dict, router: str, candidate_upload_id: str | None = None) -> dict:
+    def start_run(self, task: dict, mode: str = "auto", candidate_upload_id: str | None = None) -> dict:
         """Queue one confirmed analysis run."""
+        resolved = {"ors": "precise", "haversine": "quick"}.get(mode, mode)
         return self._request("POST", "/runs",
-                             json={"task": task, "router": router,
+                             json={"task": task, "mode": resolved,
                                    "candidate_upload_id": candidate_upload_id})
 
     def get_run(self, run_id: str) -> dict:
@@ -64,3 +65,18 @@ class ApiClient:
         except httpx.HTTPError as exc: raise BackendError(f"Artifact unavailable: {exc}") from exc
         if response.is_error: raise BackendError(f"Artifact {name} returned {response.status_code}")
         return response.content
+
+    def cancel_run(self, run_id: str) -> dict:
+        """Request cooperative cancellation of queued or running work."""
+        return self._request("POST", f"/runs/{run_id}/cancel")
+
+    def revise_run(self, run_id: str, task: dict | None = None, mode: str | None = None,
+                   candidate_upload_id: str | None = None) -> dict:
+        """Queue an immutable child run with revised confirmed parameters."""
+        payload: dict[str, Any] = {}
+        if task is not None: payload["task"] = task
+        if mode is not None:
+            payload["mode"] = {"ors": "precise", "haversine": "quick"}.get(mode, mode)
+        if candidate_upload_id is not None:
+            payload["candidate_upload_id"] = candidate_upload_id
+        return self._request("POST", f"/runs/{run_id}/revisions", json=payload)

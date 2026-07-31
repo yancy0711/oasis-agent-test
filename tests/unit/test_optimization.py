@@ -5,8 +5,8 @@ behaviors are guaranteed vs model-decided.
 """
 import numpy as np
 from oasis.contracts.domain import ValueWeights
-from oasis.core.optimization.models import (build_demand_weights, minimum_coverage_threshold,
-                                       solve_lscp, solve_mclp)
+from oasis.core.optimization.models import (_solve_mclp_selection, build_demand_weights,
+                                       minimum_coverage_threshold, solve_lscp, solve_mclp)
 from oasis.core.optimization.pareto import coverage_pareto_sweep, non_dominated
 
 
@@ -20,6 +20,28 @@ def test_mclp_prefers_high_weight_demand():
                      ind["poverty_rate"] > 0.5, 1, 15., ["a", "b", "c"], "test", w)
     assert sol.selected_ids == ["b"], "equity weighting should pick the site serving the vulnerable point"
     assert sol.solver_status == "Optimal"
+
+
+def test_mclp_omits_zero_weight_rows_without_changing_the_exact_objective(monkeypatch):
+    """Pure-equity Pareto endpoints must not create irrelevant binary demand rows."""
+    import pulp
+
+    created = []
+    real_variable = pulp.LpVariable
+
+    def tracked_variable(name, *args, **kwargs):
+        created.append(name)
+        return real_variable(name, *args, **kwargs)
+
+    monkeypatch.setattr(pulp, "LpVariable", tracked_variable)
+    chosen, status = _solve_mclp_selection(
+        np.array([[True, False], [False, True]]),
+        np.array([0.0, 1.0]),
+        n_facilities=1,
+    )
+
+    assert status == "Optimal" and chosen == [1]
+    assert "y_0" not in created and "y_1" in created
 
 
 def test_unreachable_demand_yields_zero_coverage_not_error():

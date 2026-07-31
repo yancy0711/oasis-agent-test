@@ -58,6 +58,20 @@ class FakeService:
         return {"run_id": run_id, "status": "succeeded", "events": [], "progress": None,
                 "result": {"ok": True, "artifacts": {"report": "/v1/runs/run-1/artifacts/report"}}}
 
+    def cancel_run(self, run_id: str) -> dict:
+        """Return an idempotent cancelled snapshot for the known run."""
+        self.calls.append(("cancel", run_id))
+        if run_id != "run-1": raise KeyError("Unknown run")
+        return {"run_id": run_id, "status": "cancelled"}
+
+    def revise_run(self, run_id: str, task, mode: str | None, candidate_upload_id: str | None) -> dict:
+        """Return one queued immutable child run."""
+        self.calls.append(("revise", run_id, task, mode, candidate_upload_id))
+        if run_id != "run-1": raise KeyError("Unknown run")
+        return {"run_id": "run-2", "status": "queued", "mode": mode or "precise",
+                "parent_run_id": run_id, "revision": 1,
+                "reuse": ["travel_matrix"], "recompute": ["optimization"]}
+
     def artifact(self, run_id: str, name: str) -> Path:
         """Expose only the explicitly allow-listed report."""
         self.calls.append(("artifact", run_id, name))
@@ -80,6 +94,8 @@ def test_health_config_and_parse_contract(tmp_path):
     assert config["optimization"]["n_facilities"] == 8
     assert config["accessibility"] == {"threshold_minutes": 15}
     assert config["agent"] == {"max_steps": 14}
+    assert config["execution"]["modes"] == ["auto", "quick", "precise"]
+    assert config["execution"]["default_mode"] == "auto"
     response = client.post("/v1/parse", json={"prompt": "Site centers in Phoenix"})
     assert response.status_code == 200
     assert response.json()["task"]["place_name"] == "Phoenix, Arizona, USA"
@@ -104,8 +120,22 @@ def test_place_upload_run_and_status_contract(tmp_path):
     assert started.status_code == 202 and started.json() == {"run_id": "run-1", "status": "queued"}
     start_call = next(call for call in service.calls if call[0] == "start")
     assert start_call[1].place_name == "Phoenix, Arizona, USA"
-    assert start_call[2:] == ("haversine", "upload-1")
+    assert start_call[2:] == ("quick", "upload-1")
     assert client.get("/v1/runs/run-1").json()["status"] == "succeeded"
+
+
+def test_cancel_and_revision_contracts(tmp_path):
+    """Cancellation is explicit and revisions preserve immutable parent identity."""
+    client, service = _client(tmp_path)
+    cancelled = client.post("/v1/runs/run-1/cancel")
+    assert cancelled.status_code == 202 and cancelled.json()["status"] == "cancelled"
+    revised = client.post("/v1/runs/run-1/revisions", json={
+        "task": {"place_name": "Phoenix", "n_facilities": 4}, "mode": "quick"
+    })
+    assert revised.status_code == 202
+    assert revised.json()["parent_run_id"] == "run-1" and revised.json()["revision"] == 1
+    assert service.calls[-1][0:2] == ("revise", "run-1")
+    assert service.calls[-1][2].n_facilities == 4 and service.calls[-1][3] == "quick"
 
 
 def test_artifact_allow_list_and_route_errors(tmp_path):

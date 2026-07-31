@@ -1,10 +1,13 @@
 """Tract heat exposure from Landsat 8/9 Collection 2 Level-2 surface temperature."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import logging
 from pathlib import Path
+import time
+from typing import Callable
 from urllib.parse import urlsplit, urlunsplit
 
 import geopandas as gpd
@@ -12,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 from oasis.contracts.domain import Provenance
-from oasis.core.cache import cache_dir
+from oasis.core.cache import atomic_target, atomic_write_text, cache_dir
 from oasis.core.spatial.alignment import ensure_crs, pick_metric_crs
 
 STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
@@ -34,22 +37,78 @@ def _strip_asset_signatures(items: list) -> list:
     return items
 
 
-def _readable_items(items: list) -> list:
-    """Keep scenes whose required assets expose a valid TIFF header."""
+def _item_is_readable(item) -> bool:
+    """Validate one scene's required TIFF headers."""
     import planetary_computer
     import requests
 
-    valid = []
-    for item in items:
-        for band in ("lwir11", "qa_pixel"):
-            response = requests.get(planetary_computer.sign(item.assets[band].href),
-                                    headers={"Range": "bytes=0-3"}, timeout=30)
-            response.raise_for_status()
-            if not response.content.startswith(TIFF_MAGIC):
-                log.warning("Skipping corrupt Landsat scene %s: %s is not a TIFF", item.id, band)
+    for band in ("lwir11", "qa_pixel"):
+        for attempt in range(3):
+            try:
+                response = requests.get(
+                    planetary_computer.sign(item.assets[band].href),
+                    headers={"Range": "bytes=0-3"},
+                    timeout=30,
+                )
+                response.raise_for_status()
+                if not response.content.startswith(TIFF_MAGIC):
+                    log.warning(
+                        "Skipping corrupt Landsat scene %s: %s is not a TIFF",
+                        item.id,
+                        band,
+                    )
+                    return False
                 break
-        else: valid.append(item)
-    if not valid: raise ValueError("no readable Landsat scenes remain after asset validation")
+            except requests.RequestException as exc:
+                if attempt == 2:
+                    log.warning(
+                        "Skipping unreadable Landsat scene %s after retries: %s",
+                        item.id,
+                        exc,
+                    )
+                    return False
+                time.sleep(0.5 * 2**attempt)
+    return True
+
+
+def _readable_items(
+    items: list,
+    max_workers: int = 1,
+    cancel_check: Callable[[], None] | None = None,
+) -> list:
+    """Keep readable scenes, probing independent headers in bounded threads."""
+    if not items:
+        raise ValueError("no Landsat scenes are available for asset validation")
+    worker_count = min(8, max(1, int(max_workers)), len(items))
+    if worker_count == 1:
+        valid = []
+        for item in items:
+            if cancel_check:
+                cancel_check()
+            if _item_is_readable(item):
+                valid.append(item)
+    else:
+        readable = [False] * len(items)
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="landsat-probe",
+        ) as executor:
+            futures = {
+                executor.submit(_item_is_readable, item): index
+                for index, item in enumerate(items)
+            }
+            try:
+                for future in as_completed(futures):
+                    if cancel_check:
+                        cancel_check()
+                    readable[futures[future]] = future.result()
+            except Exception:
+                for future in futures:
+                    future.cancel()
+                raise
+        valid = [item for item, ok in zip(items, readable) if ok]
+    if not valid:
+        raise ValueError("no readable Landsat scenes remain after asset validation")
     return valid
 
 
@@ -107,7 +166,7 @@ def _search_items(
     if not items:
         raise ValueError("no Landsat 8/9 L2SP surface-temperature scenes matched the query")
     items = _strip_asset_signatures(items)
-    path.write_text(json.dumps(pystac.ItemCollection(items).to_dict()), encoding="utf-8")
+    atomic_write_text(path, json.dumps(pystac.ItemCollection(items).to_dict()))
     return items, "live"
 
 
@@ -126,6 +185,7 @@ def _median_composite(
     bbox: list[float],
     metric_crs: str,
     resolution: float,
+    dask_workers: int = 1,
 ):
     """Build a clear-pixel median surface-temperature composite."""
     import planetary_computer
@@ -144,7 +204,9 @@ def _median_composite(
     dn = data["lwir11"]
     qa = data["qa_pixel"].fillna(1)
     lst = _temperature_celsius(dn).where((dn >= 293) & _clear_mask(qa))
-    composite = lst.median("time", skipna=True).compute()
+    composite = lst.median("time", skipna=True).compute(
+        scheduler="threads", num_workers=min(8, max(1, int(dask_workers)))
+    )
     if not np.isfinite(composite.values).any():
         raise ValueError("Landsat composite contains no clear surface-temperature pixels")
     return composite
@@ -156,6 +218,10 @@ def _zonal_mean(tracts: gpd.GeoDataFrame, composite, metric_crs: str) -> pd.Data
     from rasterstats import zonal_stats
 
     x, y = composite.x.values, composite.y.values
+    if x.size < 2 or y.size < 2:
+        raise ValueError(
+            f"Landsat raster grid is too small for zonal statistics: x={x.size}, y={y.size}"
+        )
     xres, yres = abs(float(x[1] - x[0])), abs(float(y[1] - y[0]))
     transform = from_origin(float(x.min()) - xres / 2, float(y.max()) + yres / 2, xres, yres)
     values = np.where(np.isfinite(composite.values), composite.values, -9999).astype("float32")
@@ -178,8 +244,14 @@ def fetch_heat_exposure(
     end_date: str,
     cloud_cover: float = 20,
     resolution: float = 120,
+    *,
+    readable_workers: int = 1,
+    dask_workers: int = 1,
+    cancel_check: Callable[[], None] | None = None,
 ) -> tuple[pd.DataFrame, Provenance]:
     """Return `GEOID, mean_lst`; an identical request reuses the tract CSV."""
+    if cancel_check:
+        cancel_check()
     if tracts.crs is None or "GEOID" not in tracts or tracts["GEOID"].duplicated().any():
         raise ValueError("tracts must have a CRS and unique GEOID values")
     if resolution <= 0 or not 0 < cloud_cover <= 100:
@@ -203,11 +275,30 @@ def fetch_heat_exposure(
         )
 
     items, search_tier = _search_items(bbox, start_date, end_date, cloud_cover)
-    items = _readable_items(items)
+    if cancel_check:
+        cancel_check()
+    items = _readable_items(
+        items,
+        max_workers=readable_workers,
+        cancel_check=cancel_check,
+    )
     metric_crs = pick_metric_crs(study)
-    composite = _median_composite(items, bbox, metric_crs, resolution)
+    if cancel_check:
+        cancel_check()
+    composite = _median_composite(
+        items,
+        bbox,
+        metric_crs,
+        resolution,
+        dask_workers=dask_workers,
+    )
+    if cancel_check:
+        cancel_check()
     result = _zonal_mean(study, composite, metric_crs)
-    result.to_csv(path, index=False)
+    if cancel_check:
+        cancel_check()
+    with atomic_target(path) as temporary:
+        result.to_csv(temporary, index=False)
     return result, Provenance(
         source="Landsat 8/9 Collection 2 Level-2 via Microsoft Planetary Computer",
         tier="live", record_count=len(result), crs=metric_crs,

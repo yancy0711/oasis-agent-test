@@ -12,6 +12,8 @@ _TEMPLATE = """# Siting Decision Report -- {place}
 
 ## 1. Task & Value Assumptions
 - Intervention: {intervention}; max facilities: {n}; access threshold: {thr} min
+- Mobility scenario: {mobility}; operating window: {operating_window}
+- Availability semantics: operating hours restrict feasible supply before demand-weighted equity optimization; they are not a nearest-site recommendation.
 - Value profile applied: {profile} (weights: {weights})
 - Recorded assumptions/ambiguities: {notes}
 
@@ -39,6 +41,14 @@ def render_report(task: TaskSpec, solution: SiteSolution,
     return _TEMPLATE.format(
         place=task.place_name, intervention=task.intervention,
         n=task.n_facilities, thr=task.threshold_minutes,
+        mobility={
+            "walking": "Walking", "cycling": "Cycling", "driving": "Driving",
+            "walk_drive_equity": (
+                "Car-access equity: households without a car walk; others drive"
+            ),
+        }.get(task.mobility_scenario, task.mobility_scenario),
+        operating_window=(task.operating_window.model_dump(mode="json")
+                          if task.operating_window else "not applied"),
         profile=solution.profile_name, weights=weights,
         notes=task.notes or "none",
         sites=", ".join(solution.selected_ids),

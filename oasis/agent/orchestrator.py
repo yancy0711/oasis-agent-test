@@ -3,6 +3,7 @@ from __future__ import annotations
 import json, logging, os, pathlib, re
 from typing import Any
 from oasis.agent.context import Context
+from oasis.core.cancellation import RunCancelled
 from oasis.contracts.domain import (AgentAction, AgentPlan, PlanStep, RecoveryProposal, ResultNarrative, TaskSpec,
                            ToolError, ToolResult)
 from oasis.services.registry import registry
@@ -74,11 +75,54 @@ class Orchestrator:
         if raw.get("analysis_goal") == "minimum_facilities" and not asks_for_count:
             raw["analysis_goal"] = "facility_siting"
         nullable_defaults = {"intervention": "cooling_center", "analysis_goal": "facility_siting",
-                             "candidate_source": "osm", "candidate_amenities": ["library", "community_centre", "school"],
-                             "coverage_group": "all", "regional_requirements": [],
+                             "candidate_source": "osm", "candidate_amenities": ["library", "community_centre", "sports_centre", "arts_centre"],
+                             "mobility_scenario": "walking", "recommended_mobility_scenario": None,
+                             "recommended_value_profile": None, "recommendation_rationale": "",
+                             "operating_window": None, "coverage_group": "all",
+                             "regional_requirements": [], "sensitivity_thresholds": [],
+                             "sensitivity_facility_counts": [],
+                             "recommended_sensitivity_thresholds": [],
+                             "recommended_sensitivity_facility_counts": [],
                              "preference_question": "", "notes": ""}
         for field, default in nullable_defaults.items():
             if raw.get(field) is None: raw[field] = default
+        if not isinstance(raw.get("mobility_scenario"), str) or not raw["mobility_scenario"].strip():
+            raw["mobility_scenario"] = "walking"
+        for field in ("recommended_mobility_scenario", "recommended_value_profile",
+                      "operating_window", "coverage_target", "weights"):
+            if isinstance(raw.get(field), str) and not raw[field].strip():
+                raw[field] = None
+        for field in ("regional_requirements", "sensitivity_thresholds",
+                      "sensitivity_facility_counts", "recommended_sensitivity_thresholds",
+                      "recommended_sensitivity_facility_counts"):
+            if raw.get(field) in (None, ""):
+                raw[field] = []
+        if not re.search(r"\bschools?\b", user_prompt, re.I):
+            raw["candidate_amenities"] = [
+                item for item in raw["candidate_amenities"] if item != "school"
+            ]
+        equity_mode = re.search(
+            r"\b(?:walk[-_ ]?drive[-_ ]?equity|car[- ]?(?:access|availability)[-_ ]?equity)\b",
+            user_prompt, re.I,
+        )
+        mode_patterns = {
+            "walking": r"\b(?:walk(?:ing)?|on\s+foot)\b|\u6b65\u884c",
+            "cycling": r"\b(?:cycl(?:e|ing)|bik(?:e|ing)|bicycle)\b|\u9a91\u884c",
+            "driving": (
+                r"\b(?:driv(?:e|ing)|by\s+(?:a\s+)?cars?|via\s+(?:a\s+)?cars?|"
+                r"car[- ]?(?:travel|routing|accessibility)|automobiles?)\b|\u9a7e\u8f66|\u5f00\u8f66"
+            ),
+        }
+        detected_modes = [
+            mode for mode, pattern in mode_patterns.items()
+            if re.search(pattern, user_prompt, re.I)
+        ]
+        if equity_mode:
+            raw["mobility_scenario"] = "walk_drive_equity"
+        elif len(detected_modes) == 1:
+            raw["mobility_scenario"] = detected_modes[0]
+        elif not detected_modes:
+            raw["mobility_scenario"] = "walking"
         applied = []
         if isinstance(raw.get("n_facilities"), bool) or not isinstance(raw.get("n_facilities"), int):
             raw["n_facilities"] = defaults["n_facilities"]; applied.append("n_facilities")
@@ -87,14 +131,34 @@ class Orchestrator:
             raw["threshold_minutes"] = defaults["threshold_minutes"]; applied.append("threshold_minutes")
         if applied: raw["notes"] = f"{raw.get('notes', '')} [runtime defaults: {', '.join(applied)}]".strip()
         profiles, weights = runtime["value_profiles"], raw.get("weights")
-        known = [profile["weights"] for profile in profiles.values()]
-        if weights is not None and weights not in known:
+        profile_by_weights = {
+            json.dumps(profile["weights"], sort_keys=True): name
+            for name, profile in profiles.items()
+        }
+        known = list(profile_by_weights)
+        weight_key = json.dumps(weights, sort_keys=True) if weights is not None else None
+        explicit_profile = any(
+            token.lower() in user_prompt.lower()
+            for name, profile in profiles.items()
+            for token in (name, profile.get("label", name))
+        )
+        if weight_key is not None and weight_key not in known:
             raw["weights"] = None
             raw["notes"] = f"{raw.get('notes', '')} [unregistered weights require HITL]".strip()
+        elif weight_key is not None and not explicit_profile:
+            raw["recommended_value_profile"] = raw.get("recommended_value_profile") or profile_by_weights[weight_key]
+            raw["weights"] = None
+        if raw.get("recommended_value_profile") not in profiles:
+            raw["recommended_value_profile"] = None
         place = raw.get("place_name")
         self.ctx.record("parse", "Natural-language request parsed into a proposed task.",
                         fields={k: raw.get(k) for k in ("place_name", "analysis_goal", "candidate_source", "n_facilities",
-                                                        "threshold_minutes", "coverage_target", "coverage_group",
+                                                        "threshold_minutes", "coverage_target", "coverage_group", "mobility_scenario",
+                                                        "operating_window", "recommended_value_profile",
+                                                        "recommended_mobility_scenario", "recommendation_rationale",
+                                                        "sensitivity_thresholds", "sensitivity_facility_counts",
+                                                        "recommended_sensitivity_thresholds",
+                                                        "recommended_sensitivity_facility_counts",
                                                         "regional_requirements", "preference_question", "notes")})
         if not isinstance(place, str) or not place.strip(): raise MissingPlaceError(raw)
         raw["place_name"] = place.strip()
@@ -128,6 +192,13 @@ class Orchestrator:
                         coverage_group=task.coverage_group)
         elif step.tool == "analyze_reachability":
             args.update(threshold_minutes=task.threshold_minutes, coverage_group=task.coverage_group)
+        elif step.tool == "run_sensitivity_analysis":
+            args.update(
+                threshold_minutes=task.sensitivity_thresholds or [task.threshold_minutes],
+                facility_counts=task.sensitivity_facility_counts or [task.n_facilities],
+                weights=task.weights.model_dump() if task.weights else None,
+                coverage_group=task.coverage_group,
+            )
         return PlanStep(tool=step.tool, args=args, rationale=step.rationale)
 
     def _normalize_plan_payload(self, payload: dict) -> dict:
@@ -187,12 +258,16 @@ class Orchestrator:
         return {"facility_siting": "outputs", "heat_review": "heat_summary",
                 "minimum_facilities": "minimum_facilities", "minimum_threshold": "minimum_threshold",
                 "reachability_review": "reachability_analysis",
-                "scenario_comparison": "scenario_comparison"}[task.analysis_goal]
+                "scenario_comparison": "scenario_comparison",
+                "sensitivity_analysis": "sensitivity_results"}[task.analysis_goal]
 
     def _validated_changes(self, task: TaskSpec, changes: dict[str, Any]) -> dict[str, Any]:
         """Keep only typed human-editable changes proposed by the model."""
         allowed = {"n_facilities", "threshold_minutes", "coverage_target", "candidate_amenities"}
         filtered = {key: value for key, value in changes.items() if key in allowed}
+        amenities = filtered.get("candidate_amenities")
+        if amenities and "school" not in task.candidate_amenities:
+            filtered["candidate_amenities"] = [item for item in amenities if item != "school"]
         if not filtered: return {}
         try: validated = TaskSpec(**{**task.model_dump(), **filtered})
         except Exception: return {}
@@ -222,11 +297,15 @@ class Orchestrator:
         step = self._sanitize_step(step)
         rounds = self.cfg.get("max_self_correction_rounds", 3)
         for attempt in range(rounds + 1):
+            self.ctx.check_cancelled()
             self.ctx.record("tool_call", f"Calling {step.tool}.", step.tool, args=step.args, attempt=attempt + 1)
             try: result: ToolResult = registry.get(step.tool).fn(ctx=self.ctx, **step.args)
+            except RunCancelled:
+                raise
             except Exception as exc:
                 result = ToolResult(ok=False, tool=step.tool, error=ToolError(kind="unknown", message=str(exc)))
             issue = self._quality_issue(step, result) if result.ok else None
+            self.ctx.check_cancelled()
             if result.ok and not issue:
                 self.ctx.successes.append({"tool": step.tool, "args": step.args, "summary": result.summary})
                 self.ctx.record("tool_result", f"{step.tool} completed.", step.tool, ok=True, summary=result.summary)
@@ -241,6 +320,8 @@ class Orchestrator:
                                       "error": result.error.message if result.error else ""})
             if attempt == rounds or (result.error and not result.error.retryable): return result
             try: repaired = self._sanitize_step(self._repair(step, result.error))
+            except RunCancelled:
+                raise
             except Exception as exc:
                 log.warning("repair response rejected: %s", exc)
                 self.ctx.record("observation", "The proposed repair failed schema validation; execution stopped safely.",
@@ -278,6 +359,8 @@ class Orchestrator:
             if not self.ctx.has("study"): return "resolve_study_area"
             if not self.ctx.has("demand"): return "prepare_demand"
             return "summarize_heat_exposure"
+        if task.analysis_goal == "sensitivity_analysis":
+            return "run_sensitivity_analysis" if self.ctx.has("travel") else None
         if task.analysis_goal != "facility_siting": return None
         if task.coverage_target is not None and self.ctx.has("travel") and not self.ctx.has("analysis"):
             return "optimize_sites"
@@ -302,7 +385,17 @@ class Orchestrator:
     def _failure_recovery(self, task: TaskSpec, results: list[ToolResult], question: str = "",
                           safety_limited: bool = False) -> RecoveryProposal:
         """Build a user-visible diagnosis from deterministic errors and bound analyses."""
-        error = next((item.error for item in reversed(results) if item.error), None)
+        errors = [item.error for item in results if item.error]
+        error = next(
+            (
+                item for item in reversed(errors)
+                if not (
+                    item.kind == "constraint_conflict"
+                    and item.message.startswith("The same failed tool call")
+                )
+            ),
+            errors[-1] if errors else None,
+        )
         limit = self.cfg.get("max_agent_steps", self.cfg.get("llm", {}).get("max_agent_steps", 14))
         diagnosis = error.message if error else (f"The agent reached its {limit}-action safety limit."
                                                  if safety_limited else "The requested analysis did not produce its required result.")
@@ -332,6 +425,7 @@ class Orchestrator:
                           "equity_metric": p.equity_metric,
                           "covered_population": p.solution.covered_population} for p in analysis["frontier"]],
             "quality": self.ctx.get("quality", {}),
+            "routing": self.ctx.get("travel", {}).get("routing_report", {}),
             "provenance": [p.model_dump(mode="json") for p in self.ctx.lineage],
             "indicators_used": ["population_density", "elderly_ratio", "poverty_rate", "heat_exposure"],
         }
@@ -339,6 +433,27 @@ class Orchestrator:
         narrative = ResultNarrative(**self.llm.structured(load_prompt("result_interpretation"), json.dumps(evidence)))
         self.ctx.record("explanation", "Generated an evidence-grounded interpretation and reflection.",
                         decision_summary=narrative.decision_summary, self_reflection=narrative.self_reflection)
+        return narrative
+
+    def interpret_sensitivity_results(self, task: TaskSpec) -> ResultNarrative:
+        """Explain only the confirmed deterministic experiment grid and its provenance."""
+        evidence = {
+            "task": task.model_dump(mode="json"),
+            "sensitivity_results": self.ctx.get("sensitivity_results"),
+            "quality": self.ctx.get("quality", {}),
+            "routing": self.ctx.get("travel", {}).get("routing_report", {}),
+            "provenance": [item.model_dump(mode="json") for item in self.ctx.lineage],
+            "indicators_used": ["population_density", "elderly_ratio", "poverty_rate", "heat_exposure"],
+        }
+        self.ctx.record("explanation", "Requesting an evidence-grounded sensitivity interpretation.")
+        narrative = ResultNarrative(**self.llm.structured(
+            load_prompt("result_interpretation"), json.dumps(evidence)
+        ))
+        self.ctx.record(
+            "explanation", "Generated a provenance-grounded sensitivity interpretation.",
+            decision_summary=narrative.decision_summary,
+            self_reflection=narrative.self_reflection,
+        )
         return narrative
 
     def interpret_heat_results(self, task: TaskSpec) -> ResultNarrative:
@@ -361,6 +476,7 @@ class Orchestrator:
         goal_handle = self._goal_handle(task); ok, paused, safety_limited = False, False, False
         closure_attempted: set[str] = set()
         for index in range(1, max_steps + 1):
+            self.ctx.check_cancelled()
             if self.ctx.has(goal_handle):
                 ok = True; message = f"{task.analysis_goal.replace('_', ' ')} completed."
                 self.ctx.record("decision", f"Verified completed result handle: {goal_handle}.",
@@ -432,13 +548,15 @@ class Orchestrator:
                     narrative = self.interpret_results(task)
                     from oasis.core.outputs.report import append_agent_narrative
                     append_agent_narrative(self.ctx.get("outputs")["report"], narrative)
+                elif task.analysis_goal == "sensitivity_analysis" and self.ctx.has("sensitivity_results"):
+                    narrative = self.interpret_sensitivity_results(task)
                 elif task.analysis_goal == "heat_review" and self.ctx.has("heat_summary"):
                     narrative = self.interpret_heat_results(task)
                     from oasis.core.outputs.report import append_heat_narrative
                     append_heat_narrative(self.ctx.get("heat_summary")["report"], narrative)
             except Exception as exc: log.warning("result interpretation skipped: %s", exc)
         diagnostic_handles = ["constraint_validation", "minimum_facilities", "minimum_threshold",
-                              "reachability_analysis", "scenario_comparison"]
+                              "reachability_analysis", "scenario_comparison", "sensitivity_results"]
         diagnostics = {name: json.loads(json.dumps(self.ctx.get(name), default=lambda value: value.model_dump(mode="json")))
                        for name in diagnostic_handles if self.ctx.has(name)}
         plan = AgentPlan(steps=steps, reasoning="Actions were selected from observations one step at a time.")

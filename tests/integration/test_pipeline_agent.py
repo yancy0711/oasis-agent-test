@@ -217,7 +217,7 @@ def test_cli_pipeline_matches_manual_six_tool_chain(monkeypatch, tmp_path):
     monkeypatch.setattr(workflow, "resolve_fips", lambda *args: {"state_fips": "06", "county_fips": "037"})
     monkeypatch.setattr(workflow, "fetch_acs", lambda *args: raw)
     monkeypatch.setattr(workflow, "fetch_tract_geometry", lambda *args: tracts)
-    monkeypatch.setattr(workflow, "fetch_heat_exposure", lambda *args: (heat, Provenance(source="fake heat", record_count=3)))
+    monkeypatch.setattr(workflow, "fetch_heat_exposure", lambda *args, **kwargs: (heat, Provenance(source="fake heat", record_count=3)))
     monkeypatch.setattr(workflow, "fetch_candidates", lambda *args: (candidates, None))
 
     cfg = {"llm": {}, "accessibility": {"router": "haversine", "threshold_minutes": 15},
@@ -245,12 +245,14 @@ def test_build_travel_matrix_uses_sparse_ors_path(monkeypatch):
     points = gpd.GeoDataFrame(geometry=[Point(-118.20, 34.00), Point(-118.21, 34.01)], crs="EPSG:4326")
     candidates = gpd.GeoDataFrame({"cand_id": ["a"]}, geometry=[Point(-118.205, 34.005)], crs="EPSG:4326")
     cfg = {"accessibility": {
-        "router": "ors", "ors_sparse": True, "ors_base_url": "https://example.test/matrix",
+        "router": "ors", "ors_base_url": "https://example.test/matrix",
         "ors_max_policy_threshold_minutes": 20, "ors_pruning_margin": 1.5,
     }}
     ctx = Context(); ctx.put("config", cfg)
     ctx.put("study", {"place_type": "city", "area_km2": 1, "cache_scope": "test_city"})
-    ctx.put("demand", {"points": points}); ctx.put("candidates", candidates)
+    ctx.put("demand", {"points": points, "population": np.array([1.0, 1.0]),
+                       "vulnerable_mask": np.array([False, False]), "indicators": {}})
+    ctx.put("candidates", candidates)
     seen = {}
 
     def fake_sparse(demand, supply, eligible, **kwargs):
@@ -262,7 +264,6 @@ def test_build_travel_matrix_uses_sparse_ors_path(monkeypatch):
         }
 
     monkeypatch.setattr(workflow, "sparse_network_matrix", fake_sparse)
-    monkeypatch.setattr(workflow, "travel_time_matrix", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dense path used")))
     result = registry.get("build_travel_matrix").fn(ctx=ctx)
     assert result.ok and result.summary["router"] == "ors_sparse"
     assert result.summary["tier"] == "cache" and result.summary["live_pairs"] == 0
@@ -328,7 +329,7 @@ def test_prepare_demand_combines_multiple_counties(monkeypatch):
         x = 0 if county == "001" else 1
         return gpd.GeoDataFrame({"GEOID": [state + county + "000100"], "ALAND": [100000]}, geometry=[box(x, 0, x + .5, .5)], crs="EPSG:4326")
     monkeypatch.setattr(workflow, "fetch_acs", fake_acs); monkeypatch.setattr(workflow, "fetch_tract_geometry", fake_tracts)
-    monkeypatch.setattr(workflow, "fetch_heat_exposure", lambda areas, *args: (
+    monkeypatch.setattr(workflow, "fetch_heat_exposure", lambda areas, *args, **kwargs: (
         pd.DataFrame({"GEOID": areas["GEOID"], "mean_lst": [30., 31.]}), Provenance(source="fake heat", record_count=2)))
     result = registry.get("prepare_demand").fn(ctx=ctx)
     assert result.ok and result.summary["tracts"] == 2

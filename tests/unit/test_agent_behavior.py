@@ -495,3 +495,160 @@ def test_heat_review_appends_one_evidence_grounded_llm_paragraph(tmp_path):
     assert result["ok"] and result["narrative"].decision_summary
     assert "## Agent interpretation" in text and "does not establish causation" in text
     assert "geometry" not in llm.calls[0]["user"] and '"morans_i": 0.42' in llm.calls[0]["user"]
+
+def test_parser_keeps_llm_recommendations_separate_from_confirmed_values():
+    profiles = {
+        "balanced": {"label": "Balanced", "weights": {
+            "population_density": .25, "elderly_ratio": .25,
+            "poverty_rate": .25, "heat_exposure": .25,
+        }}
+    }
+    llm = RecordingLLM([{
+        "place_name": "Austin, Texas, USA",
+        "weights": profiles["balanced"]["weights"],
+        "mobility_scenario": "driving",
+        "recommended_mobility_scenario": "walk_drive_equity",
+        "recommendation_rationale": "The request mentions households without cars.",
+    }])
+
+    task = Orchestrator(llm, {"value_profiles": profiles}).parse_task(
+        "Prioritize low-income older residents in Austin."
+    )
+
+    assert task.weights is None
+    assert task.mobility_scenario == "walking"
+    assert task.recommended_value_profile == "balanced"
+    assert task.recommended_mobility_scenario == "walk_drive_equity"
+
+
+def test_parser_recognizes_reachability_by_cars_as_driving():
+    """Explicit natural-language car access must override a mistaken walking model value."""
+    llm = RecordingLLM([{
+        "place_name": "Phoenix, Arizona, USA",
+        "analysis_goal": "facility_siting",
+        "n_facilities": 2,
+        "threshold_minutes": 10,
+        "coverage_target": 1.0,
+        "mobility_scenario": "walking",
+    }])
+
+    task = Orchestrator(llm, {}).parse_task(
+        "The budget allows only 2 cooling centers in Phoenix, but every tract "
+        "must be reachable by cars within 10 minutes."
+    )
+
+    assert task.mobility_scenario == "driving"
+    assert task.n_facilities == 2 and task.threshold_minutes == 10
+    assert task.coverage_target == 1.0
+
+
+def test_parser_normalizes_blank_optional_recommendations():
+    """Blank model fields should behave like omitted optional values, not fail validation."""
+    llm = RecordingLLM([{
+        "place_name": "Phoenix, Arizona, USA",
+        "mobility_scenario": "walking",
+        "recommended_mobility_scenario": "",
+        "recommended_value_profile": "",
+        "operating_window": "",
+        "recommended_sensitivity_thresholds": "",
+    }])
+
+    task = Orchestrator(llm, {}).parse_task(
+        "Site 8 cooling centers in Phoenix, Arizona within a 15-minute walking threshold."
+    )
+
+    assert task.recommended_mobility_scenario is None
+    assert task.recommended_value_profile is None
+    assert task.operating_window is None
+    assert task.recommended_sensitivity_thresholds == []
+
+
+def test_sensitivity_action_uses_only_confirmed_task_values():
+    llm = RecordingLLM([{
+        "kind": "tool", "tool": "run_sensitivity_analysis",
+        "args": {"threshold_minutes": [60], "facility_counts": [99]},
+        "rationale": "Run confirmed what-if experiments.",
+    }])
+    task = TaskSpec(
+        place_name="Austin, Texas, USA", analysis_goal="sensitivity_analysis",
+        sensitivity_thresholds=[10, 15], sensitivity_facility_counts=[2, 3],
+        weights=ValueWeights(),
+    )
+
+    action = Orchestrator(llm, {}).decide_next(task, [], 1)
+
+    assert action.args["threshold_minutes"] == [10.0, 15.0]
+    assert action.args["facility_counts"] == [2, 3]
+
+
+def test_sensitivity_tool_solves_the_confirmed_grid():
+    ctx = Context()
+    candidates = gpd.GeoDataFrame(
+        {"cand_id": ["a", "b"]}, geometry=[Point(0, 0), Point(1, 1)], crs="EPSG:4326"
+    )
+    demand = {
+        "population": np.array([100.0, 100.0]),
+        "vulnerable_mask": np.array([True, False]),
+        "indicators": {
+            "population_density": np.array([1.0, 1.0]),
+            "elderly_ratio": np.array([.2, .1]),
+            "poverty_rate": np.array([.4, .1]),
+            "heat_exposure": np.array([40.0, 39.0]),
+        },
+    }
+    task = TaskSpec(
+        place_name="Test City", analysis_goal="sensitivity_analysis",
+        sensitivity_thresholds=[5, 10], sensitivity_facility_counts=[1, 2],
+        weights=ValueWeights(),
+    )
+    ctx.put("task", task)
+    ctx.put("config", {"optimization": {"solver_time_limit_s": 10}})
+    ctx.put("demand", demand)
+    ctx.put("candidates", candidates)
+    ctx.put("travel", {
+        "matrix": np.array([[4.0, 20.0], [20.0, 4.0]]),
+        "router": "haversine", "routing_report": {"router": "haversine"},
+    })
+
+    result = registry.get("run_sensitivity_analysis").fn(
+        ctx=ctx, threshold_minutes=[5, 10], facility_counts=[1, 2],
+        weights=ValueWeights().model_dump(),
+    )
+
+    assert result.ok and result.summary["experiment_count"] == 4
+    assert ctx.has("sensitivity_results")
+    assert {row["n_facilities"] for row in result.summary["experiments"]} == {1, 2}
+
+def test_sensitivity_interpretation_receives_mobility_hours_and_provenance():
+    llm = RecordingLLM([{
+        "decision_summary": "Coverage changed across the confirmed experiment grid.",
+        "self_reflection": "Opening hours and public access remain partly unknown.",
+    }])
+    orch = Orchestrator(llm, {"max_agent_steps": 2})
+    orch.ctx.put("sensitivity_results", {
+        "baseline": {"covered_population_ratio": .5},
+        "experiments": [{"n_facilities": 2, "threshold_minutes": 15,
+                         "covered_population_ratio": .5}],
+    })
+    orch.ctx.put("travel", {"routing_report": {
+        "router": "ors_multimodal", "mobility_scenario": "walk_drive_equity",
+        "mode_population_share": {"walking": .3, "driving": .7},
+    }})
+    orch.ctx.put("quality", {
+        "operating_hours": {"available_candidates": 8, "unknown_candidates": 3},
+        "public_access": {"unknown_access_candidates": 2},
+    })
+    orch.ctx.lineage.append(Provenance(source="test", tier="cache", record_count=2))
+    task = TaskSpec(
+        place_name="Austin", analysis_goal="sensitivity_analysis",
+        mobility_scenario="walk_drive_equity", sensitivity_thresholds=[15],
+        sensitivity_facility_counts=[2],
+    )
+
+    result = orch.run(task)
+
+    evidence = llm.calls[0]["user"]
+    assert result["ok"] and result["narrative"] is not None
+    assert '"mobility_scenario": "walk_drive_equity"' in evidence
+    assert '"unknown_candidates": 3' in evidence
+    assert '"tier": "cache"' in evidence

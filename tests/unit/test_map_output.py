@@ -2,7 +2,7 @@
 import geopandas as gpd
 from shapely.geometry import Point, box
 
-from oasis.contracts.domain import SiteSolution
+from oasis.contracts.domain import SiteSolution, TaskSpec
 from oasis.core.outputs.maps import coverage_map, heat_exposure_map
 
 
@@ -37,3 +37,46 @@ def test_heat_exposure_map_renders_tracts_and_boundary(tmp_path):
     html = path.read_text(encoding="utf-8")
     assert "Heat exposure (\\u00b0C)" in html and "Census tract details" in html
     assert "OSM administrative boundary (includes water)" in html and "42.0" in html
+
+def test_coverage_map_shows_selected_site_hours_and_collapsed_controls(tmp_path):
+    """Selected-site popups expose hours while the layer control stays collapsed."""
+    tracts = gpd.GeoDataFrame(
+        {"GEOID": ["tract-1"], "heat_exposure": [40.0]},
+        geometry=[box(-97.76, 30.25, -97.74, 30.27)],
+        crs="EPSG:4326",
+    )
+    candidates = gpd.GeoDataFrame(
+        {
+            "cand_id": ["site-1"],
+            "name": ["Central Cooling Center"],
+            "opening_hours": ["Mo-Fr 09:00-19:00"],
+            "hours_status": ["open"],
+        },
+        geometry=[Point(-97.73, 30.26)],
+        crs="EPSG:4326",
+    )
+    solution = SiteSolution(
+        profile_name="test", selected_ids=["site-1"], covered_population=100,
+        covered_ratio=1, vulnerable_covered_ratio=1, mean_travel_minutes=7.5,
+        weights_used=None, solver_status="Optimal",
+    )
+    task = TaskSpec(
+        place_name="Austin", mobility_scenario="driving",
+        operating_window={
+            "date": "2026-07-29", "start": "14:00", "end": "18:00",
+            "unknown_policy": "include",
+        },
+    )
+
+    path = tmp_path / "mobility-hours.html"
+
+    coverage_map(
+        tracts, candidates, solution, "heat_exposure", str(path), task=task,
+    )
+
+    html = path.read_text(encoding="utf-8")
+    assert "Mo-Fr 09:00-19:00" in html
+    assert "Open for the full requested window" in html
+    assert "2026-07-29 14:00-18:00" in html
+    assert "accessibility links" not in html
+    assert "collapsed" in html and "true" in html

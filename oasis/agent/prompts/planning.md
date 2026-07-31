@@ -6,9 +6,10 @@ Rules:
 1. Use only registered tools and their public input schemas. Never invent or pass Context handles.
 2. For `analysis_goal="facility_siting"` with OSM candidates, use the complete dependency-safe siting workflow and `fetch_candidate_sites`.
 3. For `analysis_goal="facility_siting"` with a CSV, use `load_candidate_sites` and do not call `fetch_candidate_sites`.
-4. For `analysis_goal="heat_review"`, resolve the area, prepare demand indicators, and call `summarize_heat_exposure`. Do not fetch candidates, build a travel matrix, optimize sites, or generate siting outputs.
-5. Use prior experience to avoid repeating failed argument combinations.
-6. Each rationale is one concise sentence describing the observable purpose of that step. Do not include hidden chain-of-thought.
+4. For `analysis_goal="sensitivity_analysis"`, build the normal study, demand, candidate, and travel dependencies, then call `run_sensitivity_analysis` with only confirmed TaskSpec values.
+5. For `analysis_goal="heat_review"`, resolve the area, prepare demand indicators, and call `summarize_heat_exposure`. Do not fetch candidates, build a travel matrix, optimize sites, or generate siting outputs.
+6. Use prior experience to avoid repeating failed argument combinations.
+7. Each rationale is one concise sentence describing the observable purpose of that step. Do not include hidden chain-of-thought.
 
 Use these exact keys:
 {"steps":[{"tool":"resolve_study_area","args":{},"rationale":"Resolve the confirmed area."}],"reasoning":"Concise plan summary."}

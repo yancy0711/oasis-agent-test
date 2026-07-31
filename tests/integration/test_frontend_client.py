@@ -25,16 +25,20 @@ def test_client_serializes_contracts_and_downloads_artifacts():
         client.upload_candidates("sites.csv", b"name\nA\n")
         client.start_run({"place_name": "Phoenix"}, "ors", "upload-1")
         client.get_run("run-1")
+        client.cancel_run("run-1")
+        client.revise_run("run-1", {"place_name": "Phoenix", "n_facilities": 4}, "quick")
         assert client.artifact("run-1", "report") == b"# Report"
     finally:
         client.client.close()
 
     assert [request.url.path for request in seen] == [
         "/v1/parse", "/v1/config", "/v1/places/resolve", "/v1/places/confirm", "/v1/uploads",
-        "/v1/runs", "/v1/runs/run-1", "/v1/runs/run-1/artifacts/report"]
+        "/v1/runs", "/v1/runs/run-1", "/v1/runs/run-1/cancel",
+        "/v1/runs/run-1/revisions", "/v1/runs/run-1/artifacts/report"]
     assert seen[0].read() == b'{"prompt":"Site centers"}'
     assert b'name="file"; filename="sites.csv"' in seen[4].read()
     assert b'"candidate_upload_id":"upload-1"' in seen[5].read()
+    assert b'"mode":"quick"' in seen[8].read()
 
 
 @pytest.mark.parametrize(

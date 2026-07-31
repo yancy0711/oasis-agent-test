@@ -9,7 +9,11 @@ RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 
 
 class TransientError(Exception):
-    """Retryable failure. Tools map HTTP 429/5xx and timeouts to this."""
+    """Retryable failure with an optional provider-mandated wait."""
+
+    def __init__(self, message: str, retry_after_s: float | None = None):
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
 
 
 def with_retry(max_retries: int = 4, base: float = 1.5) -> Callable:
@@ -25,7 +29,10 @@ def with_retry(max_retries: int = 4, base: float = 1.5) -> Callable:
                 except TransientError as e:
                     if attempt == max_retries:
                         raise
-                    delay = base ** attempt + random.random()
+                    delay = max(
+                        base ** attempt + random.random(),
+                        e.retry_after_s or 0.0,
+                    )
                     log.warning("retry %s (%d/%d): %s -- sleeping %.1fs",
                                 fn.__name__, attempt + 1, max_retries, e, delay)
                     time.sleep(delay)
