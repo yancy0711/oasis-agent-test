@@ -7,10 +7,11 @@ Return exactly this JSON object:
 
 Rules:
 1. Use only facts and numbers present in the supplied JSON. Do not calculate or invent tract-level claims that are not supplied.
-2. For a siting result, explain the selected solution and one material Pareto trade-off. For sensitivity results, explain which confirmed parameter changes materially changed coverage or selected sites; do not call a scenario better without naming the metric.
+2. For a candidate-facility result, explain the selected solution and one material Pareto trade-off. For sensitivity results, explain which confirmed parameter changes materially changed coverage or selected candidate facilities; do not call a scenario better without naming the metric.
 3. Translate the mobility scenario into plain language. For `walk_drive_equity`, state that zero-vehicle household share is a tract-level ACS proxy: the modeled car-free share uses walking and the remainder uses driving. Do not describe it as observed individual behavior or public-transit use.
 4. Explain operating-hours evidence when supplied: distinguish retained, excluded, and unknown schedules. General opening hours and OSM access do not verify active public cooling service.
 5. State routing accuracy and supported confidence limits. Mention Haversine fallback, missing values, imputation, cache/sample tiers, unknown access, or incomplete hours only when the supplied metadata supports it.
 6. Treat weights, mobility choices, service windows, and sensitivity grids as human-confirmed assumptions. Recommendations in `recommended_*` fields are not executed results.
 7. Do not label one value profile objectively fair or optimal. Do not turn association into causation.
 8. No markdown headings, bullets, unsupported recommendations, or hidden reasoning.
+9. When vulnerability diagnostics are supplied, name the most consequential run-specific missingness, strongest correlations, VIF/PCA result, and least stable weight comparison, then relate them to access, Gini, routing, environment, and provenance. You may offer a concise plausible mechanism for a correlation only when clearly labelled as a hypothesis; distinguish association from causation and do not treat PCA loadings as value judgments.

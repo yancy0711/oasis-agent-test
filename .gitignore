@@ -2,7 +2,6 @@
 .env
 .env.*
 !.env.example
-.streamlit/secrets.toml
 
 # Python
 __pycache__/
@@ -13,6 +12,12 @@ htmlcov/
 .venv/
 venv/
 .ipynb_checkpoints/
+
+# Frontend
+/frontend/node_modules/
+/frontend/dist/
+/frontend/playwright-report/
+/frontend/test-results/
 
 # Local tools
 .vscode/
@@ -26,3 +31,9 @@ venv/
 
 # Local notes
 /DEVELOPMENT.md
+/PROJECT_STRUCTURE.md
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini

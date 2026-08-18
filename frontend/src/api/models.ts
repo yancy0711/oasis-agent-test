@@ -1,0 +1,22 @@
+import type { components } from "./generated";
+
+export type TaskSpec = components["schemas"]["TaskSpec"];
+export type RunRequest = components["schemas"]["RunRequest"];
+export type RunRevisionRequest = components["schemas"]["RunRevisionRequest"];
+export type RunAccepted = components["schemas"]["RunAccepted"];
+export type RunSnapshot = components["schemas"]["RunSnapshotResponse"];
+export type RunResult = components["schemas"]["RunResultResponse"];
+export type RunProgress = components["schemas"]["RunProgress"];
+export type PublicAgentEvent = components["schemas"]["PublicAgentEvent"];
+export type ParseResponse = components["schemas"]["ParseResponse"];
+export type RouteOriginCandidate = components["schemas"]["RouteOriginCandidate"];
+export type RequestDisposition = ParseResponse["disposition"];
+export type PlaceCandidate = components["schemas"]["PlaceCandidate"];
+export type PlaceResolveResponse = components["schemas"]["PlaceResolveResponse"];
+export type PlaceConfirmResponse = components["schemas"]["PlaceConfirmResponse"];
+export type UploadResponse = components["schemas"]["UploadResponse"];
+export type UiConfigResponse = components["schemas"]["UiConfigResponse"];
+export type DataSourceStatus = components["schemas"]["DataSourceStatusResponse"];
+export type OfficialResources = components["schemas"]["OfficialResourcesResponse"];
+export type RoutingMode = "quick" | "precise" | "auto";
+export type MobilityMode = TaskSpec["mobility_scenario"];

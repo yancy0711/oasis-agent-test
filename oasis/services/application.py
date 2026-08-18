@@ -1,11 +1,14 @@
 """Application services and a bounded in-memory run queue for the HTTP API."""
 from __future__ import annotations
 import hashlib
+import ipaddress
 import json
 import multiprocessing
 import os
+import socket
 import signal
 import subprocess
+import requests
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -13,11 +16,13 @@ from pathlib import Path
 from threading import Lock
 from time import monotonic
 from typing import Any
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from fastapi.encoders import jsonable_encoder
 
 from oasis.agent.orchestrator import LLMClient, MissingPlaceError, Orchestrator
+from oasis.agent.scope import classify_request
 from oasis.contracts.domain import (AgentEvent, ExecutionProvenance, RoutingMode,
                                     RunSpec, TaskSpec)
 from oasis.core.cancellation import CancellationToken, RunCancelled
@@ -25,7 +30,12 @@ from oasis.settings import PROJECT_ROOT, load_cfg
 from oasis.settings import load_profiles
 from oasis.core.outputs.report import render_diagnostic_report
 from oasis.core.data.geocoding import (AmbiguousPlaceError, cache_place_candidates,
-                                               canonical_place_name, select_place_candidate)
+                                       canonical_place_name, route_origin_options, search_origin_candidates,
+                                       select_place_candidate)
+from oasis.core.data.source_status import inspect_data_sources
+from oasis.core.data.official_resources import discover_official_resources
+from oasis.core.cache import scoped_cache
+from oasis.core.spatial.routes import plan_point_to_nearest_site
 from oasis.services.run_store import RunStore
 
 
@@ -37,6 +47,7 @@ class _RunControl:
     terminal_status: str = "cancelled"
     process: multiprocessing.Process | None = None
     termination_lock: Lock = field(default_factory=Lock)
+    llm_config: dict[str, Any] | None = None
 
 
 def _run_process(
@@ -75,6 +86,7 @@ class OasisService:
         self.lock = Lock()
         self.execution_lock = Lock()
         self.resolutions: dict[str, dict] = {}; self.uploads: dict[str, Path] = {}
+        self.llm_sessions: dict[str, dict[str, Any]] = {}
         self.upload_root = PROJECT_ROOT / "tmp" / "uploads"; self.upload_root.mkdir(parents=True, exist_ok=True)
         for path in self.upload_root.glob("*.csv"):
             upload_id = path.name.split("_", 1)[0]
@@ -88,14 +100,251 @@ class OasisService:
         self.controls: dict[str, _RunControl] = {}
         self.progress_clocks: dict[str, tuple[str, float, int]] = {}
 
-    def parse(self, prompt: str) -> dict:
+    def data_source_status(self, force: bool = False) -> dict[str, Any]:
+        """Return a cached, read-only check of approved external sources."""
+        return inspect_data_sources(self.cfg, force=force)
+
+    def official_resources(self, place_name: str) -> dict[str, Any]:
+        """Return notify-only city/county official catalog matches."""
+        return discover_official_resources(place_name)
+
+    def _llm_session_config(self, session_id: str | None) -> dict[str, Any] | None:
+        if not session_id:
+            return None
+        with self.lock:
+            session = self.llm_sessions.get(session_id)
+            if not session or session["expires_at"] <= monotonic():
+                self.llm_sessions.pop(session_id, None)
+                raise KeyError("The LLM session is missing or expired. Test the connection again.")
+            return deepcopy(session["config"])
+
+    def revoke_llm_session(self, session_id: str) -> bool:
+        """Remove one visitor model credential from process memory immediately."""
+        with self.lock:
+            return self.llm_sessions.pop(session_id, None) is not None
+
+    def _validated_llm_url(self, provider: str, base_url: str, allow_private: bool) -> str:
+        presets = {
+            "openai": "https://api.openai.com/v1",
+            "openrouter": "https://openrouter.ai/api/v1",
+        }
+        if provider in presets:
+            return presets[provider]
+        parsed = urlparse(base_url)
+        if parsed.scheme not in ({"http", "https"} if provider == "local" else {"https"}) or not parsed.hostname:
+            raise ValueError("Custom providers require an HTTPS base URL; local providers may use HTTP.")
+        allowed_hosts = {str(value).lower() for value in self.cfg.get("llm", {}).get("allowed_custom_hosts", [])}
+        if provider == "custom" and not allow_private and parsed.hostname.lower() not in allowed_hosts:
+            raise ValueError("This custom endpoint is not approved by the server administrator. Use OpenAI, OpenRouter, or ask the administrator to allow its host.")
+        try:
+            addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))}
+        except OSError as exc:
+            raise ValueError("The model endpoint hostname could not be resolved.") from exc
+        private = any(ipaddress.ip_address(value).is_private or ipaddress.ip_address(value).is_loopback
+                      or ipaddress.ip_address(value).is_link_local for value in addresses)
+        if private and not (provider == "local" and allow_private):
+            raise ValueError("Private or loopback model endpoints are allowed only from a local OASIS session.")
+        if provider == "local" and not private:
+            raise ValueError("The local-model option must resolve to this machine or its private network.")
+        return base_url.rstrip("/")
+
+    def test_llm_connection(
+        self, provider: str, base_url: str, model: str, api_key: str,
+        *, allow_private: bool = False,
+    ) -> dict[str, Any]:
+        """Validate one provider and retain its secret only in process memory."""
+        provider = provider.lower()
+        if provider not in {"openai", "openrouter", "custom", "local"}:
+            raise ValueError("Choose OpenAI, OpenRouter, custom HTTPS, or a local model.")
+        if not model.strip():
+            raise ValueError("Model is required.")
+        if provider != "local" and not api_key.strip():
+            raise ValueError("API key is required.")
+        endpoint = self._validated_llm_url(provider, base_url, allow_private)
+        runtime_config = {
+            **self.cfg.get("llm", {}),
+            "provider": provider,
+            "base_url": endpoint,
+            "model": model.strip(),
+            "temperature": 0,
+            "_session_api_key": api_key.strip() or "local-model",
+        }
+        probe_config = {
+            **runtime_config,
+            "max_tokens": min(int(runtime_config.get("max_tokens", 4096)), 1024),
+        }
+        started = monotonic()
+        try:
+            client = LLMClient(probe_config)
+            if provider == "local":
+                installed = client.list_models()
+                aliases = {item.removesuffix(":latest") for item in installed}
+                if model.strip() not in installed and model.strip() not in aliases:
+                    available = ", ".join(installed) if installed else "none"
+                    raise RuntimeError(
+                        f"Local service is reachable, but model '{model.strip()}' is not installed. "
+                        f"Run: ollama pull {model.strip()}. Installed models: {available}."
+                    )
+            response, resolved_model = client.probe(
+                "Parse a cooling-access request into a structured task draft. Return only JSON.",
+                'Request: Select 2 cooling facilities in Phoenix within 15 minutes. '
+                'Return {"place_name":"Phoenix, Arizona, USA","analysis_goal":"facility_siting",'
+                '"n_facilities":2,"threshold_minutes":15,"mobility_scenario":"walking"}.',
+            )
+            required = {"place_name", "analysis_goal", "n_facilities", "threshold_minutes"}
+            if not required.issubset(response) or response.get("n_facilities") != 2:
+                raise RuntimeError("The model responded, but it failed the OASIS task-structure check.")
+        except Exception as exc:
+            message = str(exc)
+            if api_key: message = message.replace(api_key, "<redacted>")
+            message = message[:400]
+            raise RuntimeError(f"Model connection failed: {message}") from exc
+        session_id = uuid4().hex
+        ttl_seconds = 2 * 60 * 60
+        with self.lock:
+            now = monotonic()
+            self.llm_sessions = {
+                key: value for key, value in self.llm_sessions.items()
+                if value["expires_at"] > now
+            }
+            if len(self.llm_sessions) >= 256:
+                oldest = min(self.llm_sessions, key=lambda key: self.llm_sessions[key]["expires_at"])
+                self.llm_sessions.pop(oldest, None)
+            self.llm_sessions[session_id] = {
+                "expires_at": now + ttl_seconds,
+                "config": runtime_config,
+            }
+        return {
+            "session_id": session_id,
+            "provider": provider,
+            "model": model.strip(),
+            "resolved_model": resolved_model,
+            "latency_ms": round((monotonic() - started) * 1000),
+            "expires_in_seconds": ttl_seconds,
+            "structured_output": isinstance(response, dict),
+        }
+
+    def list_llm_models(
+        self, provider: str, base_url: str, api_key: str, *, allow_private: bool = False,
+    ) -> dict[str, Any]:
+        """Discover models from an explicitly configured endpoint without retaining its key."""
+        provider = provider.lower()
+        if provider not in {"openai", "openrouter", "custom", "local"}:
+            raise ValueError("Choose OpenAI, OpenRouter, custom HTTPS, or a local model.")
+        if provider not in {"local", "openrouter"} and not api_key.strip():
+            raise ValueError("Enter an API key before checking available models.")
+        endpoint = self._validated_llm_url(provider, base_url, allow_private)
+        if provider == "openrouter" and not api_key.strip():
+            try:
+                response = requests.get(
+                    f"{endpoint}/models", timeout=20,
+                    headers={"User-Agent": "OASIS model catalog/1.0"},
+                )
+                response.raise_for_status()
+                models = sorted({
+                    str(item["id"]) for item in response.json().get("data", [])
+                    if isinstance(item, dict) and item.get("id") and (
+                        "structured_outputs" in set(item.get("supported_parameters") or [])
+                        or {"tools", "tool_choice"}.issubset(
+                            set(item.get("supported_parameters") or [])
+                        )
+                    )
+                })
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not read the public OpenRouter model list: {type(exc).__name__}."
+                ) from exc
+            return {"provider": provider, "models": models}
+        config = {
+            **self.cfg.get("llm", {}), "provider": provider, "base_url": endpoint,
+            "model": "model-discovery", "_session_api_key": api_key.strip() or "local-model",
+        }
+        try:
+            models = LLMClient(config).list_models()
+        except Exception as exc:
+            message = str(exc)
+            if api_key: message = message.replace(api_key, "<redacted>")
+            message = message[:400]
+            raise RuntimeError(f"Could not read the endpoint model list: {message}") from exc
+        return {"provider": provider, "models": models}
+
+    def parse(self, prompt: str, llm_session_id: str | None = None) -> dict:
         """Parse a task draft while preserving missing-place HITL metadata."""
-        orch = Orchestrator(self.llm_factory(), {**self.cfg, "value_profiles": self.profiles})
+        scope = classify_request(prompt)
+        if scope.disposition in {"needs_clarification", "out_of_scope"}:
+            return {
+                "disposition": scope.disposition, "task": None, "missing_place": False,
+                "message": scope.alternative, "reason": scope.reason,
+                "alternative": scope.alternative,
+                "route_origin_candidates": [],
+                "events": [{"kind": "scope", "stage": "request routing",
+                            "message": scope.reason, "data": {"disposition": scope.disposition}}],
+            }
+        session = self._llm_session_config(llm_session_id)
+        llm = LLMClient(session) if session else self.llm_factory()
+        orch = Orchestrator(llm, {**self.cfg, "value_profiles": self.profiles})
         message = ""; missing_place = False
         try: task = orch.parse_task(prompt).model_dump(mode="json")
         except MissingPlaceError as exc:
-            task, message, missing_place = exc.task_data, str(exc), True
-        return {"task": task, "missing_place": missing_place, "message": message,
+            task = TaskSpec(**{**exc.task_data, "place_name": ""}).model_dump(mode="json")
+            message, missing_place = str(exc), True
+        route_origin = task.get("route_origin")
+        route_candidates = []
+        if route_origin:
+            try:
+                entity = route_origin["entity"]
+                context = route_origin.get("context", "")
+                positional_hint = route_origin.get("positional_hint", "")
+                route_candidates, administrative_query = route_origin_options(
+                    entity, context, positional_hint,
+                    fallback_language=route_origin.get("source") == "fallback",
+                )
+                if not route_candidates:
+                    raise ValueError(
+                        "No address or landmark could be selected after exact and contextual "
+                        "searches. Enter a street address, named landmark, intersection, postal "
+                        "code, city, or county."
+                    )
+                if administrative_query:
+                    task = TaskSpec(**{
+                        **task, "place_name": ", ".join(
+                            part for part in (entity, context) if part
+                        ), "route_origin": None,
+                    }).model_dump(mode="json")
+                    route_candidates = []
+                    message = (
+                        f"{entity} was interpreted as the study area rather than an exact "
+                        "route origin. Confirm its city or county boundary."
+                    )
+                else:
+                    task = TaskSpec(**{**task, "place_name": ""}).model_dump(mode="json")
+                    message = "Choose the intended route origin, then confirm its city or county study area."
+                missing_place = False
+            except ValueError as exc:
+                task = TaskSpec(**{**task, "place_name": ""}).model_dump(mode="json")
+                message, missing_place = str(exc), True
+        if (not missing_place and task.get("analysis_goal") == "scenario_comparison"
+                and len(task.get("comparison_profiles") or []) < 2):
+            return {
+                "disposition": "needs_clarification", "task": task, "missing_place": False,
+                "message": "Select at least two registered value profiles in the comparison field below.",
+                "reason": "A comparison needs two confirmed weighting schemes before it can run.",
+                "alternative": "For an efficiency and inequality comparison, start with Efficiency first and Equity first.",
+                "events": [event.model_dump(mode="json") for event in orch.ctx.history],
+            }
+        disposition = "needs_clarification" if missing_place or route_candidates else (
+            "quick_diagnostic" if task.get("analysis_goal") in {"heat_review", "reachability_review"}
+            else "full_analysis"
+        )
+        reason = ("Choose the intended point and confirm how it should be interpreted." if route_candidates else
+                  "A city or county is required before analysis." if missing_place else
+                  "The named location is administrative, so it is being treated as the study area." if route_origin and not task.get("route_origin") else
+                  "This reachability request prepares candidate facilities and then opens the existing point route planner." if route_origin else
+                  "This request uses a bounded diagnostic workflow." if disposition == "quick_diagnostic" else
+                  "This request uses the complete candidate facility analysis.")
+        return {"disposition": disposition, "task": task, "missing_place": missing_place,
+                "message": message, "reason": reason, "alternative": message if missing_place else "",
+                "route_origin_candidates": route_candidates,
                 "events": [event.model_dump(mode="json") for event in orch.ctx.history]}
 
     @staticmethod
@@ -167,6 +416,7 @@ class OasisService:
         *,
         parent_run_id: str | None = None,
         revision: int = 0,
+        llm_session_id: str | None = None,
     ) -> dict:
         """Persist and submit one immutable run specification."""
         internal_task = self._internal_task(spec.task, candidate_upload_id)
@@ -177,7 +427,7 @@ class OasisService:
         ).hexdigest()
         self.store.create(run_id, public_spec, parent_run_id=parent_run_id,
                           revision=revision, candidate_upload_id=candidate_upload_id)
-        control = _RunControl(CancellationToken())
+        control = _RunControl(CancellationToken(), llm_config=self._llm_session_config(llm_session_id))
         with self.lock:
             self.controls[run_id] = control
         if self.executor is None:
@@ -193,19 +443,22 @@ class OasisService:
         candidate_upload_id: str | None = None,
         *,
         router: str | None = None,
+        llm_session_id: str | None = None,
     ) -> dict:
         """Queue one confirmed run; legacy router values remain accepted."""
         resolved = self._mode(router or mode)
         public_task = TaskSpec(**{**task.model_dump(), "candidate_file": None})
-        return self._queue_run(RunSpec(task=public_task, mode=resolved), candidate_upload_id)
+        return self._queue_run(RunSpec(task=public_task, mode=resolved), candidate_upload_id,
+                               llm_session_id=llm_session_id)
 
     @staticmethod
     def _reuse_plan(old: RunSpec, new: RunSpec) -> dict[str, list[str]]:
         """Explain which content-addressed stages a revision can reuse."""
         old_task, new_task = old.task.model_dump(), new.task.model_dump()
         changed = {name for name in old_task if old_task[name] != new_task[name]}
-        optimization_only = {"n_facilities", "weights", "coverage_target", "coverage_group",
-                             "regional_requirements", "preference_question", "notes"}
+        optimization_only = {"n_facilities", "weights", "facility_capacity", "coverage_target",
+                             "coverage_group", "equity_alpha", "regional_requirements",
+                             "preference_question", "notes"}
         if old.mode == new.mode and changed <= optimization_only:
             return {"reuse": ["study", "demand", "candidates", "travel_matrix"],
                     "recompute": ["optimization", "outputs"]}
@@ -224,6 +477,7 @@ class OasisService:
         task: TaskSpec | None = None,
         mode: str | None = None,
         candidate_upload_id: str | None = None,
+        llm_session_id: str | None = None,
     ) -> dict:
         """Create an immutable child run and cooperatively supersede active work."""
         old_record = self.store.get(run_id)
@@ -238,7 +492,8 @@ class OasisService:
         self._internal_task(new_task, upload_id)
         self.cancel_run(run_id, superseded=True)
         accepted = self._queue_run(new_spec, upload_id, parent_run_id=run_id,
-                                   revision=int(old_record["revision"]) + 1)
+                                   revision=int(old_record["revision"]) + 1,
+                                   llm_session_id=llm_session_id)
         return {**accepted, **plan}
 
     def cancel_run(self, run_id: str, *, superseded: bool = False) -> dict:
@@ -259,6 +514,15 @@ class OasisService:
         if record["status"] == "queued" and control and control.future and control.future.cancel():
             self.store.transition(run_id, ("queued",), desired, progress=None,
                                   cancel_reason="superseded" if superseded else "user")
+        elif process is None:
+            # Close the narrow window after a worker claims the future but before
+            # an isolated process is registered. Late worker writes cannot replace
+            # this terminal state because every transition is state-guarded.
+            self.store.transition(
+                run_id, ("queued", "running", "cancelling"), desired,
+                progress=None, error=None,
+                cancel_reason="superseded" if superseded else "user",
+            )
         else:
             self.store.transition(run_id, ("queued", "running"), "cancelling",
                                   cancel_reason="superseded" if superseded else "user")
@@ -338,11 +602,18 @@ class OasisService:
             if solution and solution.solver_status in {"Optimal", "Feasible"}:
                 metrics = {"coverage": solution.covered_ratio,
                            "vulnerable": solution.vulnerable_covered_ratio,
+                           "population_weighted_access_gini": solution.population_weighted_access_gini,
+                           "mean_access_score": solution.mean_access_score,
+                           "gradual_coverage": solution.gradual_coverage_ratio,
+                           "assigned_population": solution.assigned_population,
+                           "maximum_capacity_utilization": solution.maximum_capacity_utilization,
                            "avg_walk": solution.mean_travel_minutes}
         elif orch.ctx.has("sensitivity_results"):
             baseline = orch.ctx.get("sensitivity_results", {}).get("baseline", {})
             metrics = {"coverage": baseline.get("covered_population_ratio"),
                        "vulnerable": baseline.get("vulnerable_covered_ratio"),
+                       "population_weighted_access_gini": baseline.get("population_weighted_access_gini"),
+                       "mean_access_score": baseline.get("mean_access_score"),
                        "avg_walk": baseline.get("mean_travel_minutes")}
         for item in payload.get("results", []):
             if item.get("tool") == "build_travel_matrix" and item.get("ok"):
@@ -361,13 +632,14 @@ class OasisService:
     def _artifacts(self, run_id: str, payload: dict, root: Path) -> dict[str, Path]:
         """Collect output, heat, and diagnostic artifacts under stable public names."""
         manifest: dict[str, Path] = {}; outputs = payload.get("outputs") or {}
-        for name in ("map", "pareto", "report"): self._add_artifact(manifest, name, outputs.get(name), root)
+        for name in ("map", "pareto", "report"):
+            self._add_artifact(manifest, name, outputs.get(name), root)
         heat = payload.get("heat_summary") or {}
         if "map" not in manifest: self._add_artifact(manifest, "map", heat.get("map"), root)
         self._add_artifact(manifest, "heat_analysis", heat.get("analysis_chart"), root)
         if "report" not in manifest: self._add_artifact(manifest, "report", heat.get("report"), root)
         diagnostics = payload.get("diagnostics") or {}
-        for handle in ("minimum_facilities", "minimum_threshold"):
+        for handle in ("minimum_facilities", "minimum_threshold", "reachability_analysis", "scenario_comparison"):
             if "map" not in manifest:
                 self._add_artifact(manifest, "map", (diagnostics.get(handle) or {}).get("map"), root)
         if "report" not in manifest and (payload.get("recovery") or diagnostics):
@@ -389,6 +661,26 @@ class OasisService:
             "strict_routing": precise,
             "allow_fallback": not precise,
         }
+        cfg["data"] = deepcopy(cfg.get("data", {}))
+        cfg["data"]["landsat_environment_indices"] = {
+            **cfg["data"].get("landsat_environment_indices", {}),
+            # Keep the approximate preview fast; the precise phase computes
+            # and caches diagnostic optical indices with visible progress.
+            "enabled": precise,
+        }
+        cfg["optimization"] = deepcopy(cfg.get("optimization", {}))
+        if not precise:
+            # A preview must become useful quickly, especially for large metros.
+            # The precise phase retains the configured full sweep limits.
+            cfg["optimization"]["solver_time_limit_s"] = min(
+                cfg["optimization"].get("solver_time_limit_s", 120), 30
+            )
+            cfg["optimization"]["pareto_point_time_limit_s"] = min(
+                cfg["optimization"].get("pareto_point_time_limit_s", 30), 10
+            )
+            cfg["optimization"]["pareto_total_time_limit_s"] = min(
+                cfg["optimization"].get("pareto_total_time_limit_s", 90), 25
+            )
         cfg["value_profiles"] = self.profiles
         cfg["max_self_correction_rounds"] = cfg.get("llm", {}).get("max_self_correction_rounds", 3)
         return cfg
@@ -411,7 +703,8 @@ class OasisService:
         with self.lock:
             control = self.controls[run_id]
             self.progress_clocks.pop(run_id, None)
-        orch = Orchestrator(self.llm_factory(), cfg)
+        llm = LLMClient(control.llm_config) if control.llm_config else self.llm_factory()
+        orch = Orchestrator(llm, cfg)
         orch.ctx.cancel_callback = control.token.is_cancelled
         orch.ctx.event_callback = lambda event: self._event(run_id, event)
         orch.ctx.progress_callback = (
@@ -426,6 +719,34 @@ class OasisService:
                         operating_window=(task.operating_window.model_dump(mode="json")
                                           if task.operating_window else None))
         internal = jsonable_encoder(orch.run(task))
+        analysis = orch.ctx.get("analysis", {}) if orch.ctx.has("analysis") else {}
+        frontier_alphas = {round(point.alpha, 8) for point in analysis.get("frontier", [])}
+        candidate_lookup = {}
+        if orch.ctx.has("candidates"):
+            for _, row in orch.ctx.get("candidates").to_crs("EPSG:4326").iterrows():
+                geometry = row.geometry
+                if geometry is not None and not geometry.is_empty:
+                    point = geometry if geometry.geom_type == "Point" else geometry.representative_point()
+                    candidate_lookup[str(row["cand_id"])] = {
+                        "id": str(row["cand_id"]),
+                        "name": str(row.get("name") or row["cand_id"]),
+                        "longitude": float(point.x), "latitude": float(point.y),
+                    }
+        internal["pareto_points"] = [
+            {
+                "alpha": point.alpha, "efficiency": point.efficiency_metric,
+                "equality": point.equity_metric, "gini": point.population_weighted_gini,
+                "covered_population_ratio": point.solution.covered_ratio,
+                "vulnerable_coverage_ratio": point.solution.vulnerable_covered_ratio,
+                "mean_access_score": point.solution.mean_access_score,
+                "mean_travel_minutes": point.solution.mean_travel_minutes,
+                "selected_ids": point.solution.selected_ids,
+                "selected_sites": [candidate_lookup[value] for value in map(str, point.solution.selected_ids)
+                                   if value in candidate_lookup],
+                "is_frontier": round(point.alpha, 8) in frontier_alphas,
+            }
+            for point in analysis.get("points", [])
+        ]
         internal["task"] = spec.task.model_dump(mode="json")
         internal["metrics"] = self._metrics(orch, internal)
         routing = internal.get("routing_status") or {}
@@ -487,8 +808,80 @@ class OasisService:
         status = "succeeded" if payload["ok"] else "awaiting_hitl" if payload.get("recovery") else "failed"
         return status, payload
 
-    def _fail_run(self, run_id: str, spec: RunSpec, phase: str, exc: Exception) -> None:
-        """Persist one backend failure without discarding an auto-mode preview."""
+    def _retain_approximate(
+        self, run_id: str, payload: dict, exc: Exception, *, preview: bool
+    ) -> None:
+        """Finish successfully with an honest warning when ORS cannot refine a result."""
+        warning = (
+            "The full study-area ORS matrix was unavailable, so the completed approximate "
+            f"selection result has been retained. Reason: {exc} Point route planning remains "
+            "available because it sends only a small shortlist to ORS. "
+            "Choose a smaller city study area for a full ORS selection matrix. "
+            "Change mobility only when that matches the policy question; driving does not "
+            "bypass the study-area safeguard."
+        )
+        retained = deepcopy(payload)
+        retained["message"] = warning
+        diagnostics = dict(retained.get("diagnostics") or {})
+        diagnostics["precise_refinement"] = {
+            "status": "unavailable", "reason": str(exc),
+            "retained_result": "approximate_haversine",
+        }
+        retained["diagnostics"] = diagnostics
+        artifact_name = "preview_report" if preview else "report"
+        try:
+            report = self.store.artifact(run_id, artifact_name)
+            old_notice = (
+                "> **Approximate preview (Haversine):** This report uses estimated "
+                "straight-line travel times. Wait for ORS refinement before treating "
+                "the siting result as final.\n\n"
+            )
+            fallback_notice = (
+                "> **Approximate fallback (Haversine):** The full study-area ORS matrix "
+                "could not be completed, so the approximate selection result is retained. "
+                f"Reason: {exc} Point route planning remains available through a small "
+                "ORS shortlist.\n\n"
+            )
+            report.write_text(
+                report.read_text(encoding="utf-8").replace(
+                    old_notice, fallback_notice, 1
+                ),
+                encoding="utf-8",
+            )
+        except (KeyError, OSError):
+            pass
+        self.store.transition(
+            run_id, ("running",), "succeeded",
+            preview_result=retained if preview else None,
+            result=None if preview else retained,
+            error=str(exc), progress=None,
+        )
+        self.store.append_event(run_id, {
+            "kind": "finish", "stage": "precise fallback", "message": warning,
+            "data": {"accuracy": "approximate", "router": "haversine"},
+        })
+
+    def _fail_run(
+        self, run_id: str, spec: RunSpec, phase: str, exc: Exception,
+        task: TaskSpec | None = None,
+    ) -> None:
+        """Persist a failure, retaining or generating an approximate ORS fallback."""
+        snapshot = self.store.snapshot(run_id)
+        if spec.mode == "auto" and phase == "precise" and snapshot.get("preview_result"):
+            self._retain_approximate(
+                run_id, snapshot["preview_result"], exc, preview=True
+            )
+            return
+        if phase == "precise" and task is not None and "Precise mode requires ORS" in str(exc):
+            try:
+                status, payload = self._execute_phase(
+                    run_id, task, spec, "quick", preview=False
+                )
+            except Exception:
+                status = "failed"
+            if status == "succeeded":
+                self._retain_approximate(run_id, payload, exc, preview=False)
+                return
         recovery = {"diagnosis": str(exc),
                     "question": "Review the request and backend configuration before retrying.",
                     "suggested_changes": {}}
@@ -561,9 +954,12 @@ class OasisService:
         self, run_id: str, task: TaskSpec, spec: RunSpec, control: _RunControl
     ) -> None:
         """Start and monitor a whole-run subprocess so cancellation is stage-independent."""
+        run_cfg = deepcopy(self.cfg)
+        if control.llm_config:
+            run_cfg["llm"] = deepcopy(control.llm_config)
         process = multiprocessing.get_context("spawn").Process(
             target=_run_process,
-            args=(self.cfg, run_id, task.model_dump(mode="json"), spec.model_dump(mode="json")),
+            args=(run_cfg, run_id, task.model_dump(mode="json"), spec.model_dump(mode="json")),
             name=f"oasis-run-{run_id[:8]}",
         )
         process.start()
@@ -605,6 +1001,30 @@ class OasisService:
                 if spec.mode == "auto" and phase == "quick":
                     self.store.update(run_id, preview_result=payload, progress=None)
                     if status == "succeeded":
+                        routing = payload.get("routing_status") or {}
+                        reports = routing.get("mode_reports") or {}
+                        eligible_pairs = max(
+                            (int(report.get("eligible_pairs", report.get("total_pairs", 0)) or 0)
+                             for report in reports.values()),
+                            default=0,
+                        )
+                        pair_limit = int(
+                            self.cfg.get("accessibility", {}).get(
+                                "ors_max_eligible_pairs", 250000
+                            )
+                        )
+                        if eligible_pairs > pair_limit:
+                            self._fail_run(
+                                run_id, spec, "precise",
+                                RuntimeError(
+                                    "Precise ORS refinement was skipped because the "
+                                    f"approximate matrix contains {eligible_pairs:,} "
+                                    "eligible demand-candidate pairs after distance pruning, "
+                                    "above the automatic ORS "
+                                    f"preflight limit of {pair_limit:,}."
+                                ), task,
+                            )
+                            return
                         continue
                 if not self.store.transition(run_id, ("running",), status,
                                              result=payload, progress=None):
@@ -623,11 +1043,106 @@ class OasisService:
                 self.store.transition(run_id, ("queued", "running", "cancelling"),
                                       control.terminal_status, progress=None, error=None)
             else:
-                self._fail_run(run_id, spec, phase, exc)
+                self._fail_run(run_id, spec, phase, exc, task)
 
     def run_snapshot(self, run_id: str) -> dict:
         """Return one durable JSON-safe copy of current job state."""
         return self.store.snapshot(run_id)
+
+    def _visible_map_artifact(self, run_id: str) -> Path:
+        """Return the precise map when present, otherwise the retained preview map."""
+        for name in ("map", "preview_map"):
+            try:
+                path = self.store.artifact(run_id, name)
+            except KeyError:
+                continue
+            if path.is_file():
+                return path
+        raise ValueError("point route planning requires an available map result")
+
+    def plan_point_route(
+        self, run_id: str, longitude: float, latitude: float, mode: str
+    ) -> dict:
+        """Plan a transient clicked-point route from the map currently visible to the user."""
+        import geopandas as gpd
+
+        snapshot = self.store.snapshot(run_id)
+        map_path = self._visible_map_artifact(run_id)
+        payload = json.loads(map_path.read_text(encoding="utf-8"))
+        tract_features = [
+            feature for feature in payload.get("features", [])
+            if feature.get("properties", {}).get("layer_kind") == "tract"
+        ]
+        site_features = [
+            feature for feature in payload.get("features", [])
+            if feature.get("properties", {}).get("layer_kind") == "selected_site"
+        ]
+        if not tract_features or not site_features:
+            raise ValueError("completed map does not contain tracts and selected candidate facilities")
+        areas = gpd.GeoDataFrame.from_features(tract_features, crs="EPSG:4326")
+        areas["mean_lst"] = areas.get("tract_mean_heat_c")
+        candidates = gpd.GeoDataFrame.from_features(site_features, crs="EPSG:4326")
+        candidates["cand_id"] = candidates["candidate_id"].astype(str)
+        place_name = snapshot["task"]["place_name"]
+        accessibility = self.cfg.get("accessibility", {})
+        with scoped_cache(place_name):
+            return plan_point_to_nearest_site(
+                longitude, latitude, areas, candidates, candidates["cand_id"].tolist(),
+                mode=mode, base_url=(
+                    accessibility.get("ors_base_url")
+                    or "https://api.heigit.org/openrouteservice/v2/matrix"
+                ),
+                timeout_s=accessibility.get("ors_timeout_s", 60),
+                request_interval_s=accessibility.get("ors_request_interval_s", 1.6),
+                candidate_limit=accessibility.get("point_route_candidate_limit", 15),
+            )
+
+    def plan_place_route(self, run_id: str, query: str, mode: str) -> dict:
+        """Geocode one US origin inside the displayed study area and plan its route."""
+        import geopandas as gpd
+        from shapely.geometry import Point
+
+        snapshot = self.store.snapshot(run_id)
+        payload = json.loads(
+            self._visible_map_artifact(run_id).read_text(encoding="utf-8")
+        )
+        tract_features = [
+            feature for feature in payload.get("features", [])
+            if feature.get("properties", {}).get("layer_kind") == "tract"
+        ]
+        if not tract_features:
+            raise ValueError("the displayed map contains no Census tract geometry")
+        areas = gpd.GeoDataFrame.from_features(tract_features, crs="EPSG:4326")
+        place_name = snapshot["task"]["place_name"]
+        with scoped_cache(place_name):
+            rows = search_origin_candidates(query)
+        if not rows:
+            raise ValueError(f"Location not found in the United States: {query}")
+        matched = None
+        for row in rows:
+            try:
+                point = Point(float(row["lon"]), float(row["lat"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if areas.geometry.covers(point).any():
+                matched = (row, point)
+                break
+        if matched is None:
+            first = rows[0].get("display_name", query)
+            raise ValueError(
+                f"Location found ({first}), but it is outside the current study area "
+                f"({place_name}). Enter an address inside the displayed tracts."
+            )
+        row, point = matched
+        result = self.plan_point_route(run_id, float(point.x), float(point.y), mode)
+        result["summary"].update({
+            "origin_query": query,
+            "origin_label": row.get("display_name", query),
+            "origin_longitude": float(point.x),
+            "origin_latitude": float(point.y),
+            "origin_geocoder": "OpenStreetMap Nominatim",
+        })
+        return result
 
     def artifact(self, run_id: str, name: str) -> Path:
         """Return one explicitly allow-listed run artifact."""

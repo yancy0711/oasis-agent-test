@@ -1,6 +1,6 @@
 # Formal Pipeline and Agent Flow
 
-This document describes the production path extracted from `notebooks/explore.ipynb`.
+This document describes the maintained production workflow.
 The production code does not read Notebook variables or execution state.
 
 ## 1. Environment and verification
@@ -16,7 +16,7 @@ python -m cli.main --mode pipeline --place "New York" --n-facilities 12 --thresh
 ```
 
 `pytest.ini` sets `pythonpath = .`, so both commands below resolve the local
-`oasis`, `api`, `ui`, and `cli` packages in the same way:
+`oasis`, `api`, and `cli` packages in the same way:
 
 ```powershell
 pytest tests -q
@@ -26,7 +26,7 @@ python -m pytest tests -q
 A successful pipeline run writes:
 
 ```text
-outputs_run/<place_slug>/coverage_map.html
+outputs_run/<place_slug>/coverage_map.geojson
 outputs_run/<place_slug>/pareto.png
 outputs_run/<place_slug>/report.md
 ```
@@ -65,11 +65,11 @@ stores them in `Context` under a stable handle and returns a lightweight
 | Step | Registered tool | Reads | Stores | Main work |
 |---:|---|---|---|---|
 | 1 | `resolve_study_area` | `place_name` | `study` | OSM boundary and Census state/county FIPS |
-| 2 | `prepare_demand` | `study` | `demand` | ACS demographics, TIGER tracts, Landsat heat, centroids, indicators |
+| 2 | `prepare_demand` | `study` | `demand` | ACS/TIGER, WorldPop-weighted Landsat heat, environment indices, vulnerability diagnostics |
 | 3 | `fetch_candidate_sites` | `study` | `candidates` | OSM library/community-centre/school points |
 | 4 | `build_travel_matrix` | `demand`, `candidates` | `travel` | ORS or declared Haversine travel minutes plus diagnostics |
-| 5 | `optimize_sites` | `demand`, `candidates`, `travel` | `analysis` | Requested MCLP solution and coverage Pareto sweep |
-| 6 | `generate_outputs` | `study`, `demand`, `candidates`, `analysis` | `outputs` | HTML map, PNG chart, Markdown report |
+| 5 | `optimize_sites` | `demand`, `candidates`, `travel` | `analysis` | Gradual coverage/allocation, optional capacity, and efficiency–Gini sweep |
+| 6 | `generate_outputs` | `study`, `demand`, `candidates`, `analysis` | `outputs` | MapLibre GeoJSON, Pareto chart, and Markdown report |
 
 The additional agent-selectable tools are:
 
@@ -114,11 +114,14 @@ registry.get("prepare_demand").fn(ctx=ctx)
 ```
 
 This step joins ACS rows to TIGER polygons by `GEOID`, rejects a join rate at
-or below 95%, merges Landsat LST, calculates population density in a metric
-CRS, builds tract centroid demand points, and marks the top poverty quartile
-as vulnerable.
+or below 95%, merges Landsat LST and optical environment diagnostics, calculates
+WorldPop-weighted tract heat where raster coverage is sufficient, calculates
+population density in a metric CRS, and builds tract centroid demand points. The configured vulnerability
+pipeline then applies explicit missing-value and direction rules, percentile
+normalization, correlation/VIF and PCA diagnostics, and marks the top quartile
+of the active composite score as priority tracts.
 
-### Step 3: fetch candidate sites
+### Step 3: fetch candidate facilities
 
 ```python
 registry.get("fetch_candidate_sites").fn(
@@ -155,15 +158,23 @@ Every fallback reason and the actual cache/live tier are recorded in provenance.
 ```python
 registry.get("optimize_sites").fn(
     ctx=ctx,
-    n_facilities=8,
+    n_facilities=10,
     threshold_minutes=15,
     weights=task.weights.model_dump(),
 )
 ```
 
-The tool solves the requested weighted MCLP and an 11-point direct coverage
-sweep. It stores the selected solution, all sweep points, and the unique
-non-dominated frontier under `analysis`.
+The tool uses gradual network coverage and explicit tract-to-site assignment,
+with optional facility capacity. It evaluates population-weighted access
+efficiency against equality \\(1-G_P\\) over an 11-point \\(\\alpha\\) sweep.
+It stores the requested solution, all sweep points, and the unique non-dominated
+frontier under `analysis`. The web explorer may inspect and map-preview a point;
+only explicit confirmation creates a revision.
+
+Point routes are a separate post-optimization audit. ORS first selects the
+minimum-network-time site among the optimized sites and returns route geometry.
+Tract-intersection length weighting then reports route LST and available
+environment indices. This audit does not alter ORS routing or the siting objective.
 
 ### Step 6: generate the three outputs
 

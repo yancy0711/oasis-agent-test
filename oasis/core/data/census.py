@@ -12,11 +12,16 @@ import geopandas as gpd
 import numpy as np
 import pygris
 import hashlib, json
+from threading import Lock
 from oasis.core.spatial.alignment import ensure_crs, repair_geometry
 from oasis.core.retry import with_retry, TransientError, RETRYABLE_STATUS
 from oasis.core.cache import atomic_target, atomic_write_text, cache_dir
 
 ACS_BASE = "https://api.census.gov/data/{year}/acs/acs5"
+
+_BLOCK_GROUP_LOCKS: dict[tuple[int, str], Lock] = {}
+_BLOCK_GROUP_STATE_CACHE: dict[tuple[int, str], gpd.GeoDataFrame] = {}
+_BLOCK_GROUP_LOCK_GUARD = Lock()
 
 # Semantic alias -> ACS variable codes.
 VARIABLES: dict[str, dict[str, str]] = {
@@ -96,6 +101,74 @@ def fetch_acs(state_fips: str, county_fips: str, groups: list[str],
     return df
 
 
+def _state_block_groups(state_fips: str, year: int) -> gpd.GeoDataFrame:
+    """Load one state TIGER block-group file once without temporary-file races."""
+    key = (int(year), str(state_fips).zfill(2))
+    with _BLOCK_GROUP_LOCK_GUARD:
+        lock = _BLOCK_GROUP_LOCKS.setdefault(key, Lock())
+    with lock:
+        cached = _BLOCK_GROUP_STATE_CACHE.get(key)
+        if cached is None:
+            cached = pygris.block_groups(
+                state=key[1], year=key[0], cb=False, cache=True
+            )
+            if cached is None or cached.empty:
+                raise ValueError(f"No block-group geometry returned for state {key[1]}")
+            _BLOCK_GROUP_STATE_CACHE[key] = cached
+        return cached.copy()
+
+
+def fetch_block_group_population(
+    state_fips: str, county_fips: str, year: int = 2022
+) -> gpd.GeoDataFrame:
+    """Fetch same-vintage ACS population and TIGER geometry at block-group level."""
+    state_fips, county_fips = str(state_fips).zfill(2), str(county_fips).zfill(3)
+    rows = _get(ACS_BASE.format(year=year), {
+        "get": "NAME,B01003_001E",
+        "for": "block group:*",
+        "in": f"state:{state_fips} county:{county_fips} tract:*",
+        "key": os.getenv("CENSUS_API_KEY", ""),
+    })
+    population = pd.DataFrame(rows[1:], columns=rows[0]).rename(
+        columns={"B01003_001E": "population"}
+    )
+    population["GEOID"] = (
+        population["state"] + population["county"]
+        + population["tract"] + population["block group"]
+    )
+    population["population"] = pd.to_numeric(population["population"], errors="coerce").mask(
+        lambda values: values < 0
+    )
+
+    path = cache_dir("pygris") / f"block_groups_{year}_{state_fips}_{county_fips}_cb0.gpkg"
+    if path.exists():
+        geometry = gpd.read_file(path)
+    else:
+        geometry = _state_block_groups(state_fips, year)
+        county_columns = [column for column in geometry if column.upper().startswith("COUNTYFP")]
+        if not county_columns:
+            raise ValueError(f"Block-group data contains no COUNTYFP column: {list(geometry.columns)}")
+        geometry = geometry.loc[
+            geometry[county_columns[0]].astype(str).str.zfill(3) == county_fips
+        ].copy()
+        if geometry.empty:
+            raise ValueError(f"No block-group geometry returned for {state_fips}{county_fips}")
+        geoid_columns = [column for column in geometry if column.upper().startswith("GEOID")]
+        if not geoid_columns:
+            raise ValueError(f"Block-group data contains no GEOID column: {list(geometry.columns)}")
+        geometry = geometry.rename(columns={geoid_columns[0]: "GEOID"})
+        geometry["GEOID"] = geometry["GEOID"].astype(str).str.zfill(12)
+        geometry = repair_geometry(ensure_crs(geometry, target="EPSG:4326"))
+        with atomic_target(path) as temporary:
+            geometry.to_file(temporary, layer="block_groups", driver="GPKG")
+    result = geometry.merge(
+        population[["GEOID", "population"]], on="GEOID", how="inner", validate="one_to_one"
+    )
+    if result.empty:
+        raise ValueError(f"ACS/TIGER block-group join returned no rows for {state_fips}{county_fips}")
+    return result[["GEOID", "population", "geometry"]].reset_index(drop=True)
+
+
 def derive_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Convert raw ACS counts into numeric ratio indicators."""
     out = df.copy()
@@ -127,6 +200,7 @@ def derive_indicators(df: pd.DataFrame) -> pd.DataFrame:
         out["elderly_ratio"] = (
             elderly_population / total_population
         ).astype("float64")
+        out["elderly_population"] = elderly_population
 
     if {"below_poverty", "poverty_universe"} <= set(df.columns):
         below_poverty = pd.to_numeric(
@@ -229,7 +303,7 @@ def fetch_tract_geometry(state_fips: str, county_fips: str, year: int = 2022) ->
         )
 
     with atomic_target(cache_path) as temporary:
-        gdf.to_file(temporary, driver="GPKG")
+        gdf.to_file(temporary, layer="tracts", driver="GPKG")
 
     return gdf.reset_index(drop=True)
 
@@ -248,5 +322,5 @@ def fetch_county_geometry(state_fips: str, year: int = 2022) -> gpd.GeoDataFrame
     gdf = repair_geometry(ensure_crs(gdf, target="EPSG:4326"))
     if gdf.empty: raise ValueError(f"No valid county geometry remained for state={state_fips}")
     with atomic_target(path) as temporary:
-        gdf.to_file(temporary, driver="GPKG")
+        gdf.to_file(temporary, layer="counties", driver="GPKG")
     return gdf.reset_index(drop=True)

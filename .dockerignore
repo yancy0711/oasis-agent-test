@@ -3,7 +3,6 @@
 .vscode/
 .env
 .env.*
-.streamlit/secrets.toml
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -15,6 +14,8 @@ venv/
 data/cache/
 outputs_run/
 tmp/
+frontend/node_modules/
+frontend/dist/
 notebooks/
 tests/
 experiments/

@@ -60,11 +60,12 @@ def test_hours_filter_can_exclude_unknown_candidates():
     assert filtered.empty
     assert summary["unknown_candidates"] == 1
 
-def test_default_candidates_exclude_schools():
+def test_default_candidates_include_every_supported_osm_type():
     task = TaskSpec(place_name="Austin")
 
     assert task.candidate_amenities == [
-        "library", "community_centre", "sports_centre", "arts_centre"
+        "library", "community_centre", "school", "sports_centre",
+        "arts_centre", "place_of_worship",
     ]
 
 
@@ -84,3 +85,17 @@ def test_access_filter_excludes_explicitly_restricted_sites():
     assert filtered["public_access_status"].tolist() == ["osm_public", "unknown"]
     assert filtered["cooling_service_status"].tolist() == ["unverified", "unverified"]
     assert summary["restricted_candidates"] == 2
+
+
+def test_access_filter_excludes_explicit_fees_but_keeps_unknowns_auditable():
+    candidates = gpd.GeoDataFrame(
+        {"cand_id": ["free", "unknown", "paid", "charged"],
+         "access": ["yes"] * 4, "fee": ["no", None, "yes", None],
+         "charge": [None, None, None, "5 USD"]},
+        geometry=[Point(-97.7, 30.2)] * 4, crs="EPSG:4326",
+    )
+    filtered, summary = _filter_candidate_access(candidates)
+    assert filtered["cand_id"].tolist() == ["free", "unknown"]
+    assert filtered["fee_status"].tolist() == ["free", "unknown"]
+    assert summary["fee_required_candidates"] == 2
+    assert summary["unknown_fee_candidates"] == 1

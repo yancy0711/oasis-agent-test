@@ -5,7 +5,7 @@ behaviors are guaranteed vs model-decided.
 """
 import numpy as np
 from oasis.contracts.domain import ValueWeights
-from oasis.core.optimization.models import (_solve_mclp_selection, build_demand_weights,
+from oasis.core.optimization.models import (_solve_mclp_selection, build_demand_weights, gradual_coverage_matrix, population_weighted_gini,
                                        minimum_coverage_threshold, solve_lscp, solve_mclp)
 from oasis.core.optimization.pareto import coverage_pareto_sweep, non_dominated
 
@@ -89,6 +89,85 @@ def test_changing_weights_changes_selected_site():
     assert sol_eq.vulnerable_covered_ratio > sol_eff.vulnerable_covered_ratio
 
 
+def test_efficiency_profile_is_pure_population_not_density_squared():
+    population = np.array([100.0, 100.0])
+    indicators = {"population_density": np.array([1.0, 1000.0])}
+    weights = ValueWeights(
+        population_density=1., elderly_ratio=0., poverty_rate=0., heat_exposure=0.
+    )
+    assert np.array_equal(build_demand_weights(indicators, population, weights), population)
+
+
+def test_equity_coverage_accepts_explicit_group_population():
+    solution = solve_mclp(
+        np.array([[1.0, 99.0], [99.0, 1.0]]),
+        np.array([1.0, 0.0]),
+        np.array([100.0, 100.0]),
+        np.array([90.0, 10.0]),
+        1, 15.0, ["a", "b"], "explicit-equity", None,
+    )
+    assert solution.selected_ids == ["a"]
+    assert np.isclose(solution.vulnerable_covered_ratio, 0.9)
+
+
+def test_population_weighted_gini_respects_population_weights_and_zero_case():
+    assert np.isclose(population_weighted_gini(np.array([0., 1.]), np.array([1., 1.])), .5)
+    assert np.isclose(population_weighted_gini(np.array([0., 1.]), np.array([9., 1.])), .9)
+    assert population_weighted_gini(np.zeros(2), np.ones(2)) is None
+
+
+def test_solution_reports_gradual_access_gini():
+    solution = solve_mclp(
+        np.array([[0.0], [10.0]]), np.ones(2), np.ones(2), np.ones(2),
+        1, 20.0, ["a"], "gini", None,
+    )
+    assert np.isclose(solution.mean_access_score, .75)
+    assert np.isclose(solution.population_weighted_access_gini, 1 / 6)
+    assert np.isclose(solution.gradual_coverage_ratio, .75)
+
+
+def test_gradual_coverage_prefers_a_closer_site_within_the_same_threshold():
+    """Two binary-covered choices differ when travel-time decay is optimized."""
+    solution = solve_mclp(
+        np.array([[14.0, 2.0]]), np.ones(1), np.array([100.0]), np.array([100.0]),
+        1, 15.0, ["far", "near"], "gradual", None,
+    )
+    assert solution.selected_ids == ["near"]
+    assert np.isclose(gradual_coverage_matrix(np.array([[2.0]]), 15.0)[0, 0], 13 / 15)
+
+
+def test_capacity_assigns_demand_and_selects_enough_supply():
+    solution = solve_mclp(
+        np.array([[1.0, 1.0], [1.0, 1.0]]), np.ones(2),
+        np.array([80.0, 80.0]), np.array([40.0, 40.0]),
+        2, 15.0, ["a", "b"], "capacity", None,
+        facility_capacities=np.array([100.0, 100.0]),
+    )
+    assert len(solution.selected_ids) == 2
+    assert np.isclose(solution.assigned_population, 160.0)
+    assert all(load <= 100.0 + 1e-6 for load in solution.facility_loads.values())
+    assert np.isclose(solution.maximum_capacity_utilization, .8)
+
+
+def test_capacity_can_leave_population_partially_unassigned():
+    solution = solve_mclp(
+        np.array([[1.0]]), np.ones(1), np.array([100.0]), np.array([50.0]),
+        1, 15.0, ["a"], "capacity", None,
+        facility_capacities=np.array([40.0]),
+    )
+    assert np.isclose(solution.covered_ratio, .4)
+    assert np.isclose(solution.assigned_population, 40.0)
+
+
+def test_assignment_weighted_travel_time_respects_capacity_rerouting():
+    solution = solve_mclp(
+        np.array([[1.0, 9.0]]), np.ones(1), np.array([100.0]), np.array([50.0]),
+        2, 15.0, ["near", "far"], "capacity", None,
+        facility_capacities=np.array([40.0, 100.0]),
+    )
+    assert np.isclose(solution.mean_travel_minutes, 5.8)
+
+
 def test_coverage_is_monotonic_as_facility_budget_grows():
     tm = np.array([
         [5., 99., 99.],
@@ -113,21 +192,30 @@ def test_coverage_is_monotonic_as_facility_budget_grows():
     assert covered == sorted(covered)
 
 
-def test_coverage_pareto_endpoints_optimize_reported_metrics():
-    travel = np.array([[1, 99], [99, 1]], dtype=float)
-    population = np.array([100, 60], dtype=float)
-    vulnerable = np.array([False, True])
+def test_efficiency_gini_pareto_uses_gradual_access_and_actual_gini():
+    travel = np.array([[1, 99], [14, 1], [14, 1]], dtype=float)
+    population = np.array([100, 60, 60], dtype=float)
+    vulnerable = np.array([False, True, True])
     points = coverage_pareto_sweep(
         travel, population, vulnerable, ['efficient', 'equitable'],
         n_facilities=1, threshold_minutes=15, steps=3,
     )
 
-    assert points[0].solution.selected_ids == ['efficient']
-    assert points[-1].solution.selected_ids == ['equitable']
-    assert points[0].efficiency_metric > points[-1].efficiency_metric
-    assert points[-1].equity_metric > points[0].equity_metric
+    assert points[0].efficiency_metric == points[0].solution.gradual_coverage_ratio
+    assert all(
+        np.isclose(point.equity_metric, 1 - point.population_weighted_gini)
+        for point in points if point.population_weighted_gini is not None
+    )
     assert points[0].solution.weights_used is None
-    assert len(non_dominated(points)) == 2
+    assert non_dominated(points)
+
+
+def test_task_rejects_simultaneous_alpha_and_hard_coverage_target():
+    import pytest
+    from oasis.contracts.domain import TaskSpec
+
+    with pytest.raises(ValueError, match="equity_alpha"):
+        TaskSpec(place_name="Phoenix", equity_alpha=.5, coverage_target=.8)
 
 def test_hard_tract_coverage_is_a_real_solver_constraint():
     """Increasing the confirmed budget must make a feasible hard target solvable."""
@@ -148,7 +236,7 @@ def test_pareto_sweep_reports_real_solver_progress():
     coverage_pareto_sweep(np.array([[1., 99.], [99., 1.]]), np.array([10., 10.]),
                           np.array([True, False]), ["a", "b"], 1, 15., steps=3,
                           progress_callback=lambda label, done, total: events.append((label, done, total)))
-    assert events == [("Pareto sweep", 1, 3), ("Pareto sweep", 2, 3), ("Pareto sweep", 3, 3)]
+    assert events == [("Efficiency--Gini sweep", 1, 3), ("Efficiency--Gini sweep", 2, 3), ("Efficiency--Gini sweep", 3, 3)]
 
 def test_lscp_finds_the_exact_facility_lower_bound():
     """LSCP must return the minimum count instead of incrementally guessing budgets."""

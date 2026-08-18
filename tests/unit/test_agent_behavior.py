@@ -1,14 +1,17 @@
 """Behavioral tests that distinguish the agent from the fixed pipeline baseline."""
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import pytest
 from shapely.geometry import Point, box
 
 from oasis.agent.context import Context
-from oasis.agent.orchestrator import Orchestrator
+from oasis.agent.orchestrator import LLMClient, MissingPlaceError, Orchestrator
+from oasis.agent.scope import classify_request, route_origin_from_prompt
 from oasis.contracts.domain import (ParetoPoint, PlanStep, Provenance, SiteSolution, TaskSpec,
                            ToolError, ToolResult, ValueWeights)
 from oasis.services.registry import registry
@@ -26,6 +29,118 @@ class RecordingLLM:
         """Record one prompt pair and return the next structured response."""
         self.calls.append({"system": system, "user": user})
         return self.responses.pop(0)
+
+
+def test_request_scope_routes_clear_boundaries_with_a_useful_alternative():
+    unsupported = classify_request("Find vacant land for a new cooling-center building in Phoenix")
+    assert unsupported.disposition == "out_of_scope"
+    assert "parcel and zoning GIS" in unsupported.alternative
+    assert classify_request("Phoenix").disposition == "needs_clarification"
+    assert classify_request("Compare candidate facilities in Phoenix").disposition == "full_analysis"
+    vague = classify_request("Help me improve cooling access.")
+    assert vague.disposition == "needs_clarification"
+    assert "US city or county" in vague.alternative
+    realtime = classify_request("Which NYC cooling centers are open right now?")
+    assert realtime.disposition == "out_of_scope"
+    assert "311" in realtime.alternative
+
+
+def test_route_request_extracts_named_origin_without_treating_it_as_study_area():
+    prompt = "I'm in Lincoln Memorial, how can I find the nearest cooling site?"
+    assert route_origin_from_prompt(prompt) == "Lincoln Memorial"
+    llm = RecordingLLM([{
+        "place_name": "Lincoln Memorial", "analysis_goal": "reachability_review",
+        "n_facilities": 7, "threshold_minutes": 15, "weights": None,
+    }])
+    task = Orchestrator(llm, {"optimization": {"n_facilities": 10}}).parse_task(prompt)
+    assert task.analysis_goal == "facility_siting"
+    assert task.route_origin is not None
+    assert task.route_origin.entity == "Lincoln Memorial"
+    assert task.route_origin.source == "fallback"
+    assert task.n_facilities == 10
+    assert set(task.candidate_amenities) == {
+        "library", "community_centre", "school", "sports_centre",
+        "arts_centre", "place_of_worship",
+    }
+
+
+def test_llm_route_origin_structure_is_preserved_for_deterministic_search():
+    prompt = "I'm at the eastern entrance of Yellowstone in Wyoming. Find the nearest cooling facility."
+    llm = RecordingLLM([{
+        "place_name": "",
+        "analysis_goal": "facility_siting",
+        "route_origin": {
+            "entity": "Yellowstone National Park",
+            "context": "Wyoming",
+            "positional_hint": "eastern entrance",
+            "raw_text": "the eastern entrance of Yellowstone in Wyoming",
+            "source": "llm",
+        },
+    }])
+    with pytest.raises(MissingPlaceError) as error:
+        Orchestrator(llm, {"optimization": {"n_facilities": 10}}).parse_task(prompt)
+    origin = error.value.task_data["route_origin"]
+    assert origin["entity"] == "Yellowstone National Park"
+    assert origin["context"] == "Wyoming"
+    assert origin["positional_hint"] == "eastern entrance"
+    assert origin["source"] == "llm"
+
+
+def test_generic_park_gate_requires_a_named_park_before_geocoding():
+    decision = classify_request("I'm at national park's gate. How can I find the nearest cooling facility?")
+    assert decision.disposition == "needs_clarification"
+    assert "Name the park" in decision.alternative
+    named = classify_request("I'm at Yellowstone National Park's north entrance. How can I find the nearest cooling facility?")
+    assert named.disposition == "full_analysis"
+
+
+def test_json_payload_accepts_reasoning_wrappers_and_rejects_plain_text_cleanly():
+    wrapped = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+        content='<think>checking fields</think>\n```json\n{"analysis_goal":"heat_review"}\n```'
+    ))])
+    assert LLMClient._json_payload(wrapped) == {"analysis_goal": "heat_review"}
+    plain = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="I cannot format that."))])
+    try:
+        LLMClient._json_payload(plain)
+    except ValueError as exc:
+        assert "structured JSON output" in str(exc)
+    else:
+        raise AssertionError("Plain text must not be accepted as structured JSON.")
+
+
+def test_structured_output_retries_without_native_json_mode():
+    """A provider that ignores JSON mode can recover through forced function calling."""
+    calls = []
+    responses = [
+        SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content=""), finish_reason="stop"
+        )]),
+        SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content=None, tool_calls=[SimpleNamespace(
+                function=SimpleNamespace(arguments='{"payload":"{\\"analysis_goal\\":\\"heat_review\\"}"}')
+            )]),
+            finish_reason="stop",
+        )]),
+    ]
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return responses.pop(0)
+
+    client = LLMClient.__new__(LLMClient)
+    client.cfg = {"provider": "openrouter", "model": "vendor/model"}
+    client.client = SimpleNamespace(chat=SimpleNamespace(
+        completions=SimpleNamespace(create=create)
+    ))
+
+    result = client.structured("Parse the request.", "Find the hottest Phoenix tracts.")
+
+    assert result == {"analysis_goal": "heat_review"}
+    assert len(calls) == 2
+    assert calls[0]["response_format"] == {"type": "json_object"}
+    assert "response_format" not in calls[1]
+    assert calls[1]["tool_choice"]["function"]["name"] == "submit_json"
+    assert calls[0]["extra_body"]["provider"]["require_parameters"] is False
 
 
 def test_planning_branches_differ_from_the_fixed_pipeline():
@@ -177,6 +292,40 @@ def test_parser_normalizes_null_optional_fields_from_live_models():
     assert task.analysis_goal == "heat_review" and task.candidate_source == "osm"
     assert task.preference_question == "" and task.is_complete()
 
+def test_parser_preserves_explicit_integer_facility_count_from_float_model_output():
+    """An explicit user count wins even when a live model serializes it as 11.0."""
+    llm = RecordingLLM([{"place_name": "Phoenix, Arizona, USA", "analysis_goal": "facility_siting",
+                         "n_facilities": 11.0, "threshold_minutes": 10.0, "weights": None}])
+    task = Orchestrator(llm, {"optimization": {"n_facilities": 8}}).parse_task(
+        "Site 11 cooling centers in Phoenix, Arizona within 10 minutes."
+    )
+    assert task.n_facilities == 11
+    assert "runtime defaults: n_facilities" not in task.notes
+
+
+def test_parser_deterministically_preserves_select_facility_count():
+    llm = RecordingLLM([{
+        "place_name": "New York, New York, USA", "analysis_goal": "facility_siting",
+        "n_facilities": 8, "threshold_minutes": 15, "weights": None,
+    }])
+    task = Orchestrator(llm, {"optimization": {"n_facilities": 8}}).parse_task(
+        "Select 16 cooling facilities in NYC within a 15-minute walking threshold."
+    )
+    assert task.n_facilities == 16
+    assert task.threshold_minutes == 15
+
+
+def test_parser_normalizes_model_notes_list_to_text():
+    llm = RecordingLLM([{
+        "place_name": "Phoenix, Arizona, USA", "analysis_goal": "facility_siting",
+        "n_facilities": 16, "threshold_minutes": 15, "weights": None,
+        "notes": [],
+    }])
+    task = Orchestrator(llm, {}).parse_task(
+        "Select 16 candidate cooling facilities in Phoenix within 15 minutes."
+    )
+    assert task.notes == ""
+
 def test_insufficient_csv_candidates_require_hitl_instead_of_query_repair(tmp_path):
     """A fixed user candidate list cannot be broadened like an OSM query."""
     path = tmp_path / "one_site.csv"
@@ -202,7 +351,7 @@ def test_repository_phoenix_candidate_sample_is_loadable():
     assert result.ok and result.summary["candidates"] == 10
 
 
-def test_heat_only_tool_writes_a_folium_map(tmp_path):
+def test_heat_only_tool_writes_maplibre_data(tmp_path):
     """Verify heat review returns both ranked tracts and a persisted map path."""
     areas = gpd.GeoDataFrame({"GEOID": ["1", "2"], "heat_exposure": [39., 42.]},
                              geometry=[box(-112.10, 33.42, -112.05, 33.47),
@@ -214,7 +363,7 @@ def test_heat_only_tool_writes_a_folium_map(tmp_path):
     orch.ctx.put("demand", {"areas": areas})
     result = registry.get("summarize_heat_exposure").fn(ctx=orch.ctx, limit=2)
     assert result.ok and result.summary["top_tracts"][0]["GEOID"] == "2"
-    assert Path(result.summary["map"]).is_file() and Path(result.summary["map"]).name == "heat_exposure_map.html"
+    assert Path(result.summary["map"]).is_file() and Path(result.summary["map"]).name == "heat_exposure_map.geojson"
     assert Path(result.summary["analysis_chart"]).is_file() and Path(result.summary["report"]).is_file()
     assert result.summary["statistics"]["morans_i"] is not None
 
@@ -228,10 +377,12 @@ def test_constraint_validator_catches_regional_minimum_before_data_tools():
     assert result.summary["conflicts"][0]["minimum_facilities"] == 3
 
 
-def test_reachability_analysis_ranks_the_hardest_tract():
+def test_reachability_analysis_ranks_the_hardest_tract(tmp_path):
     """Matrix diagnostics must identify the largest nearest-candidate time without an LLM."""
-    ctx = Context(); areas = gpd.GeoDataFrame({"GEOID": ["easy", "hard"]},
+    ctx = Context(); ctx.put("config", {"output": {"dir": str(tmp_path)}})
+    areas = gpd.GeoDataFrame({"GEOID": ["easy", "hard"]},
                                                geometry=[Point(0, 0), Point(1, 1)], crs="EPSG:4326")
+    ctx.put("study", {"boundary": areas[["geometry"]].copy()})
     ctx.put("demand", {"areas": areas, "population": np.ones(2),
                        "vulnerable_mask": np.array([False, True])})
     ctx.put("travel", {"matrix": np.array([[4., 7.], [18., 25.]])})
@@ -239,6 +390,39 @@ def test_reachability_analysis_ranks_the_hardest_tract():
                                                       coverage_group="all", limit=2)
     assert result.ok and result.summary["hardest_demand"][0]["demand_id"] == "hard"
     assert result.summary["unserved_demand_ids"] == ["hard"]
+    assert Path(result.summary["map"]).is_file()
+
+
+def test_completed_reachability_review_returns_the_requested_answer():
+    """A successful quick diagnostic must name the hardest tract, not only say completed."""
+    orch = Orchestrator(RecordingLLM([]), {"max_agent_steps": 1})
+    orch.ctx.put("reachability_analysis", {
+        "threshold_minutes": 15,
+        "unserved_demand_ids": ["hard"],
+        "hardest_demand": [{"demand_id": "hard", "nearest_minutes": 18.0,
+                            "reachable_candidates": 0}],
+    })
+    result = orch.run(
+        TaskSpec(place_name="Test City, USA", analysis_goal="reachability_review"),
+        explain=False,
+    )
+    assert result["ok"]
+    assert "Tract hard" in result["message"] and "18.0 minutes" in result["message"]
+
+
+def test_completed_heat_review_returns_the_hottest_tract():
+    """A successful heat diagnostic must name the highest-exposure tract and value."""
+    orch = Orchestrator(RecordingLLM([]), {"max_agent_steps": 1})
+    orch.ctx.put("heat_summary", {
+        "tracts_reviewed": 2,
+        "top_tracts": [{"GEOID": "hot", "heat_exposure": 42.5}],
+    })
+    result = orch.run(
+        TaskSpec(place_name="Test City, USA", analysis_goal="heat_review"),
+        explain=False,
+    )
+    assert result["ok"]
+    assert "Tract hot" in result["message"] and "42.5 C" in result["message"]
 
 
 def test_action_loop_replans_after_a_terminal_observation():
@@ -358,6 +542,77 @@ def test_scenario_comparison_reuses_saved_solver_results():
     result = registry.get("compare_scenarios").fn(ctx=ctx)
     assert result.ok and result.summary["delta"]["threshold_minutes"] == 5
     assert round(result.summary["delta"]["covered_population_ratio"], 6) == .3
+
+
+def test_parser_separates_driving_mode_from_named_value_profiles():
+    llm = RecordingLLM([{
+        "place_name": "Washington, District of Columbia, USA",
+        "analysis_goal": "scenario_comparison", "mobility_scenario": "walking",
+        "n_facilities": 2, "threshold_minutes": 15, "weights": None,
+    }])
+    profiles = {
+        "equity_first": {"label": "Equity first", "weights": ValueWeights().model_dump()},
+        "balanced": {"label": "Balanced", "weights": ValueWeights().model_dump()},
+    }
+    task = Orchestrator(llm, {"value_profiles": profiles}).parse_task(
+        "Apply the driving-first and equity-first profile and compare it with the balanced profile in DC."
+    )
+    assert task.mobility_scenario == "driving"
+    assert task.comparison_profiles == ["equity_first", "balanced"]
+
+
+def test_parser_suggests_registered_efficiency_and_equity_profiles_for_generic_comparison():
+    llm = RecordingLLM([{
+        "place_name": "Phoenix, Arizona, USA", "analysis_goal": "scenario_comparison",
+        "mobility_scenario": "walking", "n_facilities": 10, "threshold_minutes": 15,
+        "weights": None,
+    }])
+    profiles = {
+        "efficiency_first": {"label": "Efficiency first", "weights": ValueWeights().model_dump()},
+        "equity_first": {"label": "Equity first", "weights": ValueWeights().model_dump()},
+        "balanced": {"label": "Balanced", "weights": ValueWeights().model_dump()},
+    }
+    task = Orchestrator(llm, {"value_profiles": profiles}).parse_task(
+        "Compare efficiency and access inequality when selecting 10 candidate cooling facilities in Phoenix within a 15-minute walk."
+    )
+    assert task.comparison_profiles == ["efficiency_first", "equity_first"]
+
+
+def test_tool_name_in_action_kind_is_normalized_to_a_tool_action():
+    llm = RecordingLLM([{"kind": "compare_scenarios", "rationale": "Compare saved results."}])
+    action = Orchestrator(llm, {}).decide_next(
+        TaskSpec(place_name="Washington, District of Columbia, USA",
+                 analysis_goal="scenario_comparison"), [], 1
+    )
+    assert action.kind == "tool" and action.tool == "compare_scenarios"
+
+
+def test_value_profile_comparison_uses_one_shared_travel_baseline():
+    ctx = Context()
+    profiles = {
+        "efficiency_first": {"label": "Efficiency first", "weights": {
+            "population_density": 1, "elderly_ratio": 0, "poverty_rate": 0,
+            "heat_exposure": 0, "environment_burden": 0}},
+        "equity_first": {"label": "Equity first", "weights": {
+            "population_density": .1, "elderly_ratio": .3, "poverty_rate": .3,
+            "heat_exposure": .3, "environment_burden": 0}},
+    }
+    ctx.put("config", {"value_profiles": profiles, "optimization": {"solver_time_limit_s": 10}})
+    ctx.put("task", TaskSpec(place_name="Test City, USA", analysis_goal="scenario_comparison",
+                              comparison_profiles=list(profiles)))
+    ctx.put("demand", {"population": np.array([100., 100.]),
+                       "equity_population": np.array([0., 100.]),
+                       "indicators": {"elderly_ratio": np.array([0., 1.]),
+                                      "poverty_rate": np.array([0., 1.]),
+                                      "heat_exposure": np.array([0., 1.])}})
+    ctx.put("candidates", gpd.GeoDataFrame({"cand_id": ["a", "b"]},
+                                            geometry=[Point(0, 0), Point(1, 1)], crs="EPSG:4326"))
+    ctx.put("travel", {"matrix": np.array([[1., 20.], [20., 1.]])})
+    result = registry.get("compare_value_profiles").fn(
+        ctx=ctx, profiles=list(profiles), n_facilities=1, threshold_minutes=15
+    )
+    assert result.ok and len(result.summary["scenarios"]) == 2
+    assert result.summary["scenarios"][0]["selected_ids"] != result.summary["scenarios"][1]["selected_ids"]
 
 def test_action_loop_handles_a_regional_budget_contradiction_before_spatial_work():
     """The selected validator must turn a generic count contradiction directly into HITL."""

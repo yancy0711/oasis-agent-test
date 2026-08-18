@@ -7,6 +7,9 @@ llm:
   temperature: 0.2
   max_self_correction_rounds: 3
   max_agent_steps: 14
+  # Public visitors may use the fixed OpenAI/OpenRouter endpoints. Add only
+  # administrator-reviewed HTTPS hosts here to enable custom providers remotely.
+  allowed_custom_hosts: []
 
 accessibility:
   mode: walking
@@ -29,6 +32,7 @@ accessibility:
   ors_city_only: false
   ors_max_area_km2: 15000
   ors_max_eligible_pairs: 250000
+  point_route_candidate_limit: 15
   detour_factor: 1.3
   ors_base_url: "https://api.heigit.org/openrouteservice/v2/matrix"
   ors_upper_speed_kmh: 6.0
@@ -50,17 +54,48 @@ accessibility:
 
 optimization:
   value_profile: balanced
-  n_facilities: 8
+  n_facilities: 10
+  facility_capacity: null
   solver_time_limit_s: 120
   pareto_workers: 4
+  pareto_point_time_limit_s: 30
+  pareto_total_time_limit_s: 90
 
 data:
+  streetview:
+    provider: mapillary
+    radius_m: 100
+  census_vintage: 2022
+  source_monitor:
+    ttl_hours: 24
+    update_policy: notify_only
   io_workers: 4
   landsat_probe_workers: 8
   dask_workers: 4
+  landsat_environment_indices:
+    enabled: true
+    resolution_m: 120
+    products: [ndvi, ndbi, broadband_albedo_proxy]
+    processing: same_scenes_same_120m_grid_no_full_scene_download
+  population_grid:
+    enabled: true
+    provider: census_block_group
+    minimum_valid_population_share: 0.8
+    download_if_range_unsupported: true
+    max_download_gb: 2.0
 
 execution:
   default_mode: auto
+
+vulnerability:
+  normalization: percentile
+  priority_quantile: 0.75
+  correlation_warning: 0.90
+  indicators:
+    elderly_ratio: {direction: higher_is_more_vulnerable, missing: median}
+    poverty_rate: {direction: higher_is_more_vulnerable, missing: median}
+    heat_exposure: {direction: higher_is_more_vulnerable, missing: median}
+  weights: {elderly_ratio: 0.333333, poverty_rate: 0.333333, heat_exposure: 0.333334}
 
 output:
   dir: outputs_run

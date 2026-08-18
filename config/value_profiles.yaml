@@ -8,22 +8,22 @@ profiles:
   efficiency_first:
     label: "Efficiency first: maximize total covered population"
     description: "No vulnerability weighting; pure headcount. Serves as baseline."
-    weights: {population_density: 1.0, elderly_ratio: 0.0, poverty_rate: 0.0, heat_exposure: 0.0}
+    weights: {population_density: 1.0, elderly_ratio: 0.0, poverty_rate: 0.0, heat_exposure: 0.0, environment_burden: 0.0}
 
   equity_first:
     label: "Equity first: prioritize underserved, exposed communities"
     description: "Emphasizes poverty x age x heat overlap; may reduce total coverage."
-    weights: {population_density: 0.1, elderly_ratio: 0.3, poverty_rate: 0.3, heat_exposure: 0.3}
+    weights: {population_density: 0.1, elderly_ratio: 0.25, poverty_rate: 0.25, heat_exposure: 0.25, environment_burden: 0.15}
 
   cooling_first:
     label: "Cooling first: prioritize heat-exposed communities"
     description: "Emphasizes heat exposure; may reduce total coverage."
-    weights: {population_density: 0.1, elderly_ratio: 0.2, poverty_rate: 0.2, heat_exposure: 0.5}
+    weights: {population_density: 0.1, elderly_ratio: 0.15, poverty_rate: 0.15, heat_exposure: 0.4, environment_burden: 0.2}
 
   balanced:
     label: "Balanced"
     description: "Default starting point for decision-makers to adjust from."
-    weights: {population_density: 0.4, elderly_ratio: 0.2, poverty_rate: 0.2, heat_exposure: 0.2}
+    weights: {population_density: 0.35, elderly_ratio: 0.15, poverty_rate: 0.15, heat_exposure: 0.2, environment_burden: 0.15}
 
 # Pareto sweep: direct scalarization of the two reported coverage objectives
 pareto_sweep:

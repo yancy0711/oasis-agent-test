@@ -93,7 +93,7 @@ def test_agent_prompts_for_a_missing_place_without_reparsing(monkeypatch):
     result = run_agent({"llm": {"model": "fake", "max_self_correction_rounds": 0}},
                        "site some centers", llm=fake, interactive=True, profile="efficiency_first")
     assert result["ok"] and result["task"].place_name == "DC"
-    assert result["task"].n_facilities == 8 and "place supplied by user" in result["task"].notes
+    assert result["task"].n_facilities == 10 and "place supplied by user" in result["task"].notes
     assert fake.canned == []
 
 
@@ -150,7 +150,8 @@ def test_agent_plan_binds_confirmed_task_arguments():
     assert steps[1].args == {"amenities": task.candidate_amenities}
     assert steps[2].args == {"n_facilities": 8, "threshold_minutes": 15,
                              "weights": task.weights.model_dump(), "coverage_target": None,
-                             "coverage_group": "all"}
+                             "coverage_group": "all", "facility_capacity": None,
+                             "equity_alpha": None}
 
 
 def test_agent_stops_after_unrecoverable_step():
@@ -225,7 +226,7 @@ def test_cli_pipeline_matches_manual_six_tool_chain(monkeypatch, tmp_path):
            "output": {"dir": str(tmp_path / "pipeline")}}
     pipeline = run_pipeline(cfg, "Test County, USA", validate_place=False)
     assert pipeline["ok"] and all((tmp_path / "pipeline" / "test_county_usa" / name).exists()
-                                  for name in ["coverage_map.html", "pareto.png", "report.md"])
+                                  for name in ["coverage_map.geojson", "pareto.png", "report.md"])
 
     task = TaskSpec(place_name="Test County, USA", n_facilities=1, weights=get_weights("balanced"))
     ctx = Context(); ctx.put("config", cfg); ctx.put("task", task)

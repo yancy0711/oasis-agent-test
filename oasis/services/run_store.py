@@ -104,7 +104,8 @@ class RunStore:
         now = _now()
         with self._connect() as connection:
             cursor = connection.execute(
-                "UPDATE runs SET status='interrupted', error=COALESCE(error, ?), updated_at=? "
+                "UPDATE runs SET status='interrupted', progress_json=NULL, "
+                "error=COALESCE(error, ?), updated_at=? "
                 "WHERE status IN ('queued','running','cancelling')",
                 ("Backend restarted; create a revision to resume from durable caches.", now),
             )

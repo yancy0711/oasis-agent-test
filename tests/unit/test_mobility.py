@@ -8,6 +8,8 @@ def test_walk_drive_equity_expands_population_without_double_counting():
         "population": np.array([100.0, 200.0]),
         "no_vehicle_ratio": np.array([0.25, 0.50]),
         "vulnerable_mask": np.array([True, False]),
+        "equity_population": np.array([40.0, 20.0]),
+        "group_population": {"older_adults": np.array([30.0, 50.0])},
         "indicators": {"poverty_rate": np.array([0.4, 0.2])},
     }
     matrices = {
@@ -24,6 +26,8 @@ def test_walk_drive_equity_expands_population_without_double_counting():
         "walking": 125 / 300,
         "driving": 175 / 300,
     }
+    assert np.isclose(result["equity_population"].sum(), 60.0)
+    assert np.isclose(result["group_population"]["older_adults"].sum(), 80.0)
 
 
 def test_single_mode_preserves_original_rows():

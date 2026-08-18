@@ -2,7 +2,7 @@
 
 Triggered when TaskSpec.is_complete() is False, i.e. the LLM identified a
 value-judgment gap. Deliberately lightweight -- CLI/notebook input satisfies
-Phase 1; Streamlit stays optional for the final stage.
+Phase 1; the web interface provides the equivalent interactive workflow.
 
 Design stance: "not sure" is a first-class answer, not an edge case. When the
 human has not yet formed a value judgment, the agent's correct behavior is to

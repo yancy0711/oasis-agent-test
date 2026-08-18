@@ -43,6 +43,9 @@ def compose_demand(
 
     population = np.asarray(demand["population"], dtype=float)
     vulnerable = np.asarray(demand["vulnerable_mask"], dtype=bool)
+    priority = np.asarray(demand.get("priority_mask", vulnerable), dtype=bool)
+    equity_population = np.asarray(demand.get("equity_population", population * vulnerable), dtype=float)
+    groups = {name: np.asarray(values, dtype=float) for name, values in demand.get("group_population", {}).items()}
     indicators = {
         name: np.asarray(values, dtype=float)
         for name, values in demand["indicators"].items()
@@ -57,6 +60,9 @@ def compose_demand(
             "matrix": np.asarray(matrices[modes[0]], dtype=float),
             "population": population,
             "vulnerable_mask": vulnerable,
+            "priority_mask": priority,
+            "equity_population": equity_population,
+            "group_population": groups,
             "indicators": indicators,
             "base_index": np.arange(len(population)),
             "mode": np.full(len(population), modes[0], dtype=object),
@@ -78,6 +84,14 @@ def compose_demand(
         [population[active] * shares[mode][active] for mode, active in rows]
     )
     grouped_vulnerable = np.concatenate([vulnerable[active] for _, active in rows])
+    grouped_priority = np.concatenate([priority[active] for _, active in rows])
+    grouped_equity = np.concatenate([
+        equity_population[active] * shares[mode][active] for mode, active in rows
+    ])
+    grouped_groups = {
+        name: np.concatenate([values[active] * shares[mode][active] for mode, active in rows])
+        for name, values in groups.items()
+    }
     grouped_indicators = {
         name: np.concatenate([values[active] for _, active in rows])
         for name, values in indicators.items()
@@ -97,6 +111,9 @@ def compose_demand(
         "matrix": matrix,
         "population": grouped_population,
         "vulnerable_mask": grouped_vulnerable,
+        "priority_mask": grouped_priority,
+        "equity_population": grouped_equity,
+        "group_population": grouped_groups,
         "indicators": grouped_indicators,
         "base_index": base_index,
         "mode": mode_labels,

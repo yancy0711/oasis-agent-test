@@ -70,7 +70,7 @@ def test_pareto_resume_skips_completed_points(monkeypatch):
     )
     monkeypatch.setattr(
         pareto,
-        "_solve_mclp_selection",
+        "_gini_aware_solve",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("checkpointed solve reran")
         ),
@@ -87,7 +87,7 @@ def test_pareto_resume_skips_completed_points(monkeypatch):
         ),
     )
     assert resumed == completed
-    assert progress == [("Pareto sweep", 3, 3)]
+    assert progress == [("Efficiency--Gini sweep", 3, 3)]
 
 
 def test_pareto_cancel_keeps_the_last_completed_checkpoint():

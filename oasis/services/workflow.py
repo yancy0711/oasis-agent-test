@@ -14,13 +14,16 @@ import pandas as pd
 from oasis.agent.context import Context
 from oasis.contracts.domain import Provenance, TaskSpec, ToolError, ToolResult, ValueWeights
 from oasis.core.outputs.charts import heat_analysis_chart, pareto_chart
-from oasis.core.outputs.maps import coverage_map, heat_exposure_map
+from oasis.core.outputs.maps import comparison_map, coverage_map, heat_exposure_map, reachability_map
 from oasis.core.outputs.report import render_heat_report, render_report
 from oasis.core.cache import scoped_cache
 from oasis.core.cancellation import RunCancelled
-from oasis.core.data.census import derive_indicators, fetch_acs, fetch_county_geometry, fetch_tract_geometry
+from oasis.core.data.census import (derive_indicators, fetch_acs, fetch_block_group_population,
+                                    fetch_county_geometry, fetch_tract_geometry)
 from oasis.core.data.geocoding import AmbiguousPlaceError, resolve_fips, resolve_place
 from oasis.core.data.heat import fetch_heat_exposure
+from oasis.core.data.environment import derive_environment_burden, fetch_environment_indices
+from oasis.core.data.population import population_raster_source
 from oasis.core.data.osm import fetch_candidates
 from oasis.core.data.opening_hours import filter_candidates_by_hours
 from oasis.core.optimization.mobility import compose_demand, scenario_modes
@@ -32,8 +35,10 @@ from oasis.core.spatial.accessibility import (
     haversine_matrix, sparse_network_matrix, validate_travel_matrix,
 )
 from oasis.core.spatial.alignment import centroids, pick_metric_crs
+from oasis.core.vulnerability import (DEFAULT_CONFIG as DEFAULT_VULNERABILITY_CONFIG,
+                                      analyze_feature_relationships, analyze_vulnerability)
 
-TOOL_CHAIN = ["resolve_study_area", "prepare_demand", "fetch_candidate_sites",
+TOOL_CHAIN = ["resolve_study_area", "prepare_demand", "prepare_built_environment", "fetch_candidate_sites",
               "build_travel_matrix", "optimize_sites", "generate_outputs"]
 log = logging.getLogger(__name__)
 
@@ -63,10 +68,15 @@ def _cfg(ctx: Context, section: str) -> dict:
 
 def _decision_inputs(demand: dict, travel: dict) -> tuple[np.ndarray, ...]:
     """Return aligned arrays for either tract or grouped multimodal demand."""
+    population = np.asarray(travel.get("population", demand["population"]), dtype=float)
+    legacy_mask = np.asarray(
+        travel.get("vulnerable_mask", demand.get("vulnerable_mask", np.zeros(len(population), dtype=bool))),
+        dtype=bool,
+    )
     return (
         np.asarray(travel["matrix"], dtype=float),
-        np.asarray(travel.get("population", demand["population"]), dtype=float),
-        np.asarray(travel.get("vulnerable_mask", demand["vulnerable_mask"]), dtype=bool),
+        population,
+        np.asarray(travel.get("equity_population", demand.get("equity_population", population * legacy_mask)), dtype=float),
         travel.get("indicators", demand.get("indicators", {})),
     )
 
@@ -74,12 +84,10 @@ def _decision_inputs(demand: dict, travel: dict) -> tuple[np.ndarray, ...]:
 def _coverage_mask(demand: dict, group: str, travel: dict | None = None) -> np.ndarray:
     """Return the deterministic demand subset named by a public tool argument."""
     population = travel.get("population", demand["population"]) if travel else demand["population"]
-    vulnerable = (
-        travel.get("vulnerable_mask", demand["vulnerable_mask"])
-        if travel else demand["vulnerable_mask"]
-    )
+    fallback = demand.get("priority_mask", demand.get("vulnerable_mask", np.zeros(len(population), dtype=bool)))
+    priority = travel.get("priority_mask", travel.get("vulnerable_mask", fallback)) if travel else fallback
     if group == "all": return np.ones(len(population), dtype=bool)
-    if group == "vulnerable": return np.asarray(vulnerable, dtype=bool)
+    if group == "vulnerable": return np.asarray(priority, dtype=bool)
     raise ValueError(f"Unsupported demand group: {group}")
 
 
@@ -90,7 +98,7 @@ def _filter_candidate_hours(ctx: Context, candidates: gpd.GeoDataFrame) -> tuple
         candidates, getattr(task, "operating_window", None)
     )
     if filtered.empty:
-        raise ValueError("No candidate sites remain under the confirmed operating-hours policy")
+        raise ValueError("No candidate facilities remain under the confirmed operating-hours policy")
     quality = ctx.get("quality", {})
     quality["operating_hours"] = summary
     ctx.put("quality", quality)
@@ -106,31 +114,80 @@ def _candidate_label(row: pd.Series) -> str:
     return f"Candidate {row['cand_id']}"
 
 
+def _candidate_capacities(
+    candidates: gpd.GeoDataFrame,
+    default_capacity: float | None,
+) -> tuple[np.ndarray | None, dict]:
+    """Resolve hard people capacities without treating size proxies as people."""
+    source_column = (
+        "capacity_observed_people" if "capacity_observed_people" in candidates
+        else "capacity" if "capacity" in candidates else None
+    )
+    observed = (
+        pd.to_numeric(candidates[source_column], errors="coerce").to_numpy(float)
+        if source_column else np.full(len(candidates), np.nan)
+    )
+    valid = np.isfinite(observed) & (observed > 0)
+    evidence = {
+        "observed_capacity_sites": int(valid.sum()),
+        "missing_capacity_sites": int((~valid).sum()),
+        "source_column": source_column,
+        "relative_floor_area_proxy_sites": int(candidates.get(
+            "gross_floor_area_proxy_m2", pd.Series(dtype=float)
+        ).notna().sum()),
+    }
+    if default_capacity is not None:
+        capacities = np.where(valid, observed, float(default_capacity))
+        evidence.update({"enabled": True, "method": "observed_with_user_default"})
+        return capacities, evidence
+    if len(candidates) and valid.all():
+        evidence.update({"enabled": True, "method": "observed_people_capacity"})
+        return observed, evidence
+    evidence.update({
+        "enabled": False,
+        "method": "disabled_incomplete_absolute_capacity",
+        "reason": (
+            "Hard capacity was not enabled because absolute people capacity is incomplete. "
+            "Floor area remains a relative diagnostic only."
+        ),
+    })
+    return None, evidence
+
+
 def _filter_candidate_access(
     candidates: gpd.GeoDataFrame,
 ) -> tuple[gpd.GeoDataFrame, dict]:
-    """Exclude explicitly restricted facilities while preserving unknown access as evidence."""
+    """Exclude explicitly restricted or paid facilities and retain auditable unknowns."""
     access = (
         candidates["access"].fillna("").astype(str).str.strip().str.lower()
         if "access" in candidates
         else pd.Series("", index=candidates.index, dtype=str)
     )
-    restricted_values = {"no", "private", "customers", "members", "permit"}
-    restricted = access.isin(restricted_values)
-    result = candidates.loc[~restricted].copy().reset_index(drop=True)
-    retained_access = access.loc[~restricted].reset_index(drop=True)
+    fee = (candidates["fee"].fillna("").astype(str).str.strip().str.lower()
+           if "fee" in candidates else pd.Series("", index=candidates.index, dtype=str))
+    charge = (candidates["charge"].fillna("").astype(str).str.strip().str.lower()
+              if "charge" in candidates else pd.Series("", index=candidates.index, dtype=str))
+    access_restricted = access.isin({"no", "private", "customers", "members", "permit"})
+    fee_required = fee.isin({"yes", "admission", "ticket"}) | (~charge.isin({"", "0", "no", "free"}))
+    excluded = access_restricted | fee_required
+    result = candidates.loc[~excluded].copy().reset_index(drop=True)
+    retained_access = access.loc[~excluded].reset_index(drop=True)
+    retained_fee = fee.loc[~excluded].reset_index(drop=True)
     result["public_access_status"] = np.select(
         [retained_access.isin({"yes", "permissive"}), retained_access.eq("")],
         ["osm_public", "unknown"],
         default="conditional",
     )
+    result["fee_status"] = np.where(retained_fee.eq("no"), "free", "unknown")
     if "cooling_service_status" not in result:
         result["cooling_service_status"] = "unverified"
     summary = {
         "potential_candidates": len(candidates),
         "retained_candidates": len(result),
-        "restricted_candidates": int(restricted.sum()),
+        "restricted_candidates": int(access_restricted.sum()),
+        "fee_required_candidates": int((fee_required & ~access_restricted).sum()),
         "unknown_access_candidates": int(retained_access.eq("").sum()),
+        "unknown_fee_candidates": int(retained_fee.eq("").sum()),
     }
     return result, summary
 
@@ -172,6 +229,8 @@ def _fetch_county_part(
                 )
             if kind == "tracts":
                 return fetch_tract_geometry(state, county, year)
+            if kind == "block_groups":
+                return fetch_block_group_population(state, county, year)
         raise ValueError(f"Unknown county source: {kind}")
     except Exception as exc:
         raise RuntimeError(
@@ -202,8 +261,9 @@ def validate_constraints(ctx: Context) -> ToolResult:
 @registry.register("resolve_study_area", "Resolve a US place to a boundary and state/county FIPS.",
                    {"place_name": {"type": "string"}})
 @_guard("resolve_study_area")
-def resolve_study_area(ctx: Context, place_name: str, year: int = 2022) -> ToolResult:
+def resolve_study_area(ctx: Context, place_name: str, year: int | None = None) -> ToolResult:
     """Resolve a place boundary and its state/county FIPS identifiers."""
+    year = int(year or _cfg(ctx, "data").get("census_vintage", 2022))
     expect_level = 6 if "county" in place_name.lower() else None
     boundary = resolve_place(place_name, expect_level)
     canonical_name = boundary.attrs.get("canonical_name") or boundary.attrs.get("display_name") or place_name
@@ -244,11 +304,13 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
     data_cfg = _cfg(ctx, "data")
     ctx.check_cancelled()
 
-    parts = {
-        "acs": [None] * len(counties),
-        "tracts": [None] * len(counties),
-    }
-    total_tasks = 2 * len(counties)
+    population_source = (
+        population_raster_source(year, data_cfg["population_grid"])
+        if "population_grid" in data_cfg else None
+    )
+    kinds = ["acs", "tracts"] + (["block_groups"] if population_source and population_source["provider"] == "census_block_group" else [])
+    parts = {kind: [None] * len(counties) for kind in kinds}
+    total_tasks = len(kinds) * len(counties)
     worker_count = min(4, max(1, int(data_cfg.get("io_workers", 4))), total_tasks)
     with ThreadPoolExecutor(
         max_workers=worker_count,
@@ -264,7 +326,7 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
                 year,
             ): (kind, index)
             for index, county in enumerate(counties)
-            for kind in ("acs", "tracts")
+            for kind in kinds
         }
         completed = 0
         try:
@@ -280,7 +342,7 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
 
     raw_parts = parts["acs"]
     tract_parts = parts["tracts"]
-    if any(part is None for part in raw_parts + tract_parts):
+    if any(part is None for kind in kinds for part in parts[kind]):
         raise RuntimeError("County data acquisition finished incompletely")
     raw = pd.concat(raw_parts, ignore_index=True)
     tracts = gpd.GeoDataFrame(
@@ -295,6 +357,13 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
         inside = centroids(areas).geometry.within(study["boundary"].geometry.union_all())
         areas = areas.loc[inside].reset_index(drop=True)
     if areas.empty: raise ValueError("No county tracts have centroids inside the requested boundary")
+    population_areas = None
+    if "block_groups" in parts:
+        population_areas = gpd.GeoDataFrame(
+            pd.concat(parts["block_groups"], ignore_index=True), geometry="geometry",
+            crs=parts["block_groups"][0].crs,
+        )
+    heat_error = None
     try:
         with scoped_cache(study["cache_scope"]):
             heat, heat_prov = fetch_heat_exposure(
@@ -303,25 +372,67 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
                 end_date,
                 readable_workers=data_cfg.get("landsat_probe_workers", 8),
                 dask_workers=data_cfg.get("dask_workers", 4),
+                progress_callback=lambda label, done, total: ctx.progress(
+                    label, done, total, unit="stages"
+                ),
                 cancel_check=ctx.check_cancelled,
+                population_source=population_source,
+                tract_population=areas["total_population"].to_numpy(float),
+                population_areas=population_areas,
             )
     except RunCancelled:
         raise
     except Exception as exc:
-        raise RuntimeError(f"Landsat heat exposure acquisition failed: {exc}") from exc
+        if getattr(ctx.get("task", None), "analysis_goal", None) == "heat_review":
+            raise RuntimeError(f"Landsat heat exposure acquisition failed: {exc}") from exc
+        heat_error = f"{type(exc).__name__}: {exc}"
+        log.warning("Landsat heat unavailable; continuing with a neutral non-temperature indicator: %s", exc)
+        heat = pd.DataFrame({
+            "GEOID": areas["GEOID"].astype("string"), "mean_lst": np.nan,
+            "population_weighted_lst": np.nan, "exposure_gap": np.nan,
+            "valid_lst_population_share": np.nan,
+        })
+        heat_prov = Provenance(
+            source="Landsat 8/9 Collection 2 Level-2 via Microsoft Planetary Computer",
+            tier="live", record_count=0, crs="none",
+            notes=f"unavailable; neutral heat indicator used for non-heat analysis; {heat_error}",
+        )
     ctx.check_cancelled()
     areas = areas.merge(heat, on="GEOID", how="left", validate="one_to_one")
-    missing_heat = int(areas["mean_lst"].isna().sum())
-    areas["heat_exposure"] = areas["mean_lst"].fillna(areas["mean_lst"].median())
+    minimum_share = float((population_source or {}).get("minimum_valid_population_share", .8))
+    weighted = areas.get("population_weighted_lst", pd.Series(np.nan, index=areas.index))
+    valid_share = areas.get("valid_lst_population_share", pd.Series(np.nan, index=areas.index))
+    weighted_ok = weighted.notna() & valid_share.ge(minimum_share)
+    areas["heat_exposure"] = weighted.where(weighted_ok, areas["mean_lst"])
+    weighted_method = (
+        "population_weighted_block_group"
+        if population_source and population_source.get("provider") == "census_block_group"
+        else "population_weighted_grid"
+    )
+    areas["heat_exposure_method"] = (
+        "unavailable_neutral" if heat_error else
+        np.where(weighted_ok, weighted_method, "tract_mean_fallback")
+    )
+    missing_heat = int(areas["heat_exposure"].isna().sum())
+    heat_median = areas["heat_exposure"].median()
+    areas["heat_exposure"] = areas["heat_exposure"].fillna(
+        float(heat_median) if np.isfinite(heat_median) else 0.0
+    )
     quality = ctx.get("quality", {})
     quality["heat"] = {"missing_tracts": missing_heat, "total_tracts": len(areas),
-                       "imputation": "median" if missing_heat else "none"}
+                       "population_weighted_tracts": int(weighted_ok.sum()),
+                       "tract_mean_fallbacks": int((~weighted_ok).sum()),
+                       "minimum_valid_population_share": minimum_share,
+                       "population_grid": population_source,
+                       "status": "unavailable" if heat_error else "ready",
+                       "error": heat_error,
+                       "imputation": ("neutral constant; not interpretable as temperature" if heat_error
+                                      else "median" if missing_heat else "none")}
     ctx.put("quality", quality)
     metric_crs = pick_metric_crs(areas)
     areas["population_density"] = areas["total_population"].astype(float) / _land_area_km2(areas).replace(0, np.nan)
-    areas = areas.loc[areas["total_population"].fillna(0).gt(0) & areas["elderly_ratio"].notna()].reset_index(drop=True)
+    areas = areas.loc[areas["total_population"].fillna(0).gt(0)].reset_index(drop=True)
     points, population = centroids(areas).reset_index(drop=True), areas["total_population"].to_numpy(float)
-    poverty = areas["poverty_rate"].fillna(areas["poverty_rate"].median()).to_numpy(float)
     if "no_vehicle_ratio" not in areas:
         areas["no_vehicle_ratio"] = np.nan
     vehicle_missing = int(areas["no_vehicle_ratio"].isna().sum())
@@ -336,19 +447,196 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
         "imputation": "median" if vehicle_missing else "none",
         "interpretation": "tract-level household proxy, not individual travel behavior",
     }
-    indicators = {name: areas[name].fillna(areas[name].median()).to_numpy(float) for name in
+    vulnerability_cfg = _cfg(ctx, "vulnerability") or DEFAULT_VULNERABILITY_CONFIG
+    custom_vulnerability_weights = None
+    task_weights = getattr(ctx.get("task", None), "weights", None)
+    if task_weights:
+        public_weights = task_weights.normalized().model_dump()
+        custom_vulnerability_weights = {
+            name: public_weights.get(name, 0.0)
+            for name in vulnerability_cfg.get("indicators", {})
+        }
+    areas, vulnerability_score, priority_mask, vulnerability = analyze_vulnerability(
+        areas, vulnerability_cfg, custom_vulnerability_weights,
+        progress=lambda label, done, total: ctx.progress(label, done, total, unit="stages"),
+    )
+    quality["vulnerability"] = vulnerability
+    ctx.put("quality", quality)
+    vulnerability_missing = ",".join(
+        f"{item['indicator']}:{item['missing_count']}/{len(areas)}"
+        for item in vulnerability["missingness"]
+    )
+    ctx.put("vulnerability_analysis", vulnerability, Provenance(
+        source="Configured vulnerability preprocessing", tier="live",
+        record_count=len(areas), crs=str(areas.crs or "none"),
+        notes=(f"normalization={vulnerability['normalization']}; "
+               f"active_scheme={vulnerability['active_scheme']}; "
+               f"priority={vulnerability['priority_definition']}; "
+               f"missing={vulnerability_missing}; "
+               "directions and missing-value policies are explicit in config/settings.yaml"),
+    ))
+    indicators = {name: areas[name].to_numpy(float) for name in
                   ["population_density", "elderly_ratio", "poverty_rate", "heat_exposure"]}
+    indicators["vulnerability_score"] = vulnerability_score
+    elderly_population = areas.get(
+        "elderly_population", areas["elderly_ratio"].fillna(0) * areas["total_population"]
+    )
+    below_poverty = areas.get(
+        "below_poverty", areas["poverty_rate"].fillna(0) * areas["total_population"]
+    )
+    no_vehicle_households = areas.get(
+        "no_vehicle_households", areas["no_vehicle_ratio"].fillna(0) * areas["total_population"]
+    )
+    group_population = {
+        "all": population,
+        "older_adults": elderly_population.fillna(0).to_numpy(float),
+        "below_poverty": below_poverty.fillna(0).to_numpy(float),
+        "no_vehicle_households": no_vehicle_households.fillna(0).to_numpy(float),
+        "vulnerability_priority": population * priority_mask,
+    }
     demand = {"areas": areas, "points": points, "population": population,
               "no_vehicle_ratio": areas["no_vehicle_ratio"].to_numpy(float),
-              "vulnerable_mask": poverty >= np.quantile(poverty, .75), "indicators": indicators}
+              "group_population": group_population,
+              "equity_population": group_population["vulnerability_priority"],
+              "priority_mask": priority_mask,
+              "vulnerable_mask": priority_mask, "indicators": indicators}
     provenance = [Provenance(source=f"US Census ACS {year} 5-year", record_count=len(demographics), crs="none"),
-                  Provenance(source=f"US Census TIGER/Line {year}", record_count=len(tracts)), heat_prov]
+                  Provenance(source=f"US Census TIGER/Line {year}", record_count=len(tracts))]
+    if population_source:
+        provenance.append(Provenance(
+            source=(f"US Census ACS {year} 5-year block-group population + TIGER/Line {year}"
+                    if population_source["provider"] == "census_block_group" else
+                    f"WorldPop Global2 {year} constrained population grid"),
+            tier="cache" if heat_prov.tier == "cache" else "live",
+            record_count=(len(population_areas) if population_areas is not None else int(weighted_ok.sum())),
+            crs="EPSG:4326",
+            notes=(
+                f"resolution={population_source.get('resolution')}; "
+                f"ACS tract total calibration; weighted_tracts={int(weighted_ok.sum())}; "
+                f"fallback_tracts={int((~weighted_ok).sum())}; source={population_source.get('url')}"
+            ),
+        ))
+    provenance.append(heat_prov)
     ctx.put("demand", demand, provenance)
     return ToolResult(ok=True, tool="prepare_demand", handle="demand", provenance=heat_prov,
-                      summary={"tracts": len(areas), "vulnerable_tracts": int(demand["vulnerable_mask"].sum()),
+                      summary={"tracts": len(areas), "vulnerability_priority_tracts": int(priority_mask.sum()),
+                               "vulnerability_definition": vulnerability["priority_definition"],
+                               "equity_group": "population_in_composite_vulnerability_priority_tracts",
+                               "population_weighted_heat_tracts": int(weighted_ok.sum()),
                                "heat_missing_tracts": missing_heat, "heat_imputation": quality["heat"]["imputation"],
                                "vehicle_missing_tracts": vehicle_missing,
                                "mean_no_vehicle_household_ratio": float(areas["no_vehicle_ratio"].mean())})
+
+
+@registry.register(
+    "prepare_built_environment",
+    "Derive Landsat tract indices and a user-weightable passive environment burden.",
+)
+@_guard("prepare_built_environment")
+def prepare_built_environment(
+    ctx: Context,
+    demand_handle: str = "demand",
+    start_date: str = "2022-06-01",
+    end_date: str = "2022-08-31",
+) -> ToolResult:
+    """Attach built-environment diagnostics and a transparent optimization indicator."""
+    demand = ctx.get(demand_handle)
+    cfg = _cfg(ctx, "data")
+    settings = cfg.get("landsat_environment_indices", {})
+    if not settings.get("enabled", True):
+        summary = {"status": "skipped", "reason": "disabled for this execution phase"}
+        ctx.put("built_environment", summary)
+        return ToolResult(ok=True, tool="prepare_built_environment", handle="built_environment", summary=summary)
+    study = ctx.get("study")
+    try:
+        with scoped_cache(study["cache_scope"]):
+            indices, provenance = fetch_environment_indices(
+                demand["areas"][["GEOID", "geometry"]], start_date, end_date,
+                resolution=settings.get("resolution_m", 120),
+                dask_workers=cfg.get("dask_workers", 4),
+                cancel_check=ctx.check_cancelled,
+                progress_callback=lambda label, done, total: ctx.progress(
+                    label, done, total, unit="stages"
+                ),
+            )
+    except RunCancelled:
+        raise
+    except Exception as exc:
+        areas = demand["areas"].copy()
+        for name in ("mean_ndvi", "mean_ndbi", "mean_albedo"):
+            areas[name] = np.nan
+        areas["environment_components_available"] = 0
+        areas["environment_burden"] = 0.5
+        indicators = dict(demand["indicators"])
+        indicators["environment_burden"] = np.full(len(areas), 0.5)
+        demand = {**demand, "areas": areas, "indicators": indicators}
+        summary = {
+            "status": "unavailable",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "role": "neutral_constant_not_interpretable_as_environmental_difference",
+            "path_heat_exposure": "not_in_objective_without_real_route_geometry_for_each_demand_site_pair",
+        }
+        provenance = Provenance(
+            source="Landsat 8/9 Collection 2 Level-2 surface reflectance",
+            tier="live", record_count=0, crs="none",
+            notes=f"NDVI, NDBI, and albedo unavailable; neutral burden used; {summary['reason']}",
+        )
+        ctx.put("demand", demand, provenance)
+        ctx.put("built_environment", summary, provenance)
+        quality = ctx.get("quality", {}); quality["built_environment"] = summary
+        ctx.put("quality", quality)
+        return ToolResult(ok=True, tool="prepare_built_environment",
+                          handle="built_environment", provenance=provenance, summary=summary)
+    areas = demand["areas"].drop(
+        columns=[name for name in ("mean_ndvi", "mean_ndbi", "mean_albedo", "environment_valid_pixel_count")
+                 if name in demand["areas"]]
+    ).merge(indices, on="GEOID", how="left", validate="one_to_one")
+    burden = derive_environment_burden(areas)
+    for name in burden:
+        areas[name] = burden[name]
+    indicators = dict(demand["indicators"])
+    indicators["environment_burden"] = areas["environment_burden"].to_numpy(float)
+    demand = {**demand, "areas": areas, "indicators": indicators}
+    fields = ["mean_ndvi", "mean_ndbi", "mean_albedo"]
+    relationships = analyze_feature_relationships(areas, {
+        "elderly_ratio": "vulnerability input",
+        "poverty_rate": "vulnerability input",
+        "heat_exposure": "vulnerability input and temperature exposure",
+        "vulnerability_score": "derived composite score",
+        "mean_ndvi": "passive environment component: higher is protective",
+        "mean_ndbi": "passive environment component: higher increases burden",
+        "mean_albedo": "passive environment component: higher is protective",
+        "environment_burden": "user-weightable passive environment objective indicator",
+    })
+    summary = {
+        "status": "ready", "role": "optimization_indicator_when_confirmed_weight_is_positive",
+        "available_tracts": {name: int(areas[name].notna().sum()) for name in fields},
+        "formulas": {
+            "mean_ndvi": "(NIR - red) / (NIR + red)",
+            "mean_ndbi": "(SWIR1 - NIR) / (SWIR1 + NIR)",
+            "mean_albedo": "broadband albedo proxy from blue, red, NIR, SWIR1, and SWIR2",
+            "environment_burden": "mean(percentile(NDBI), 1-percentile(NDVI), 1-percentile(albedo))",
+        },
+        "environment_burden": {
+            "minimum": float(areas["environment_burden"].min()),
+            "maximum": float(areas["environment_burden"].max()),
+            "median": float(areas["environment_burden"].median()),
+            "all_components_tracts": int((areas["environment_components_available"] == 3).sum()),
+            "direction": "higher_is_more_burdened",
+        },
+        "path_heat_exposure": "not_in_objective_without_real_route_geometry_for_each_demand_site_pair",
+        "feature_relationships": relationships,
+    }
+    vulnerability = dict(ctx.get("vulnerability_analysis", {}))
+    vulnerability["diagnostic_correlation"] = relationships
+    ctx.put("vulnerability_analysis", vulnerability)
+    quality = ctx.get("quality", {})
+    quality["built_environment"] = summary
+    ctx.put("quality", quality)
+    ctx.put("demand", demand, provenance)
+    ctx.put("built_environment", summary)
+    return ToolResult(ok=True, tool="prepare_built_environment", handle="built_environment",
+                      provenance=provenance, summary=summary)
 
 
 @registry.register("fetch_candidate_sites", "Fetch OSM candidate facilities inside the study boundary.",
@@ -357,25 +645,44 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
 def fetch_candidate_sites(ctx: Context, amenities: list[str], study_handle: str = "study") -> ToolResult:
     """Fetch candidate facility points for the requested OSM amenities."""
     study = ctx.get(study_handle)
+    ctx.progress("Candidate facilities: reading OpenStreetMap data", 0, 2, unit="stages")
     with scoped_cache(study["cache_scope"]): candidates, error = fetch_candidates(study["boundary"], amenities)
     if error: return ToolResult(ok=False, tool="fetch_candidate_sites", error=error)
+    ctx.progress("Candidate facilities: checking access and opening hours", 1, 2, unit="stages")
     potential = len(candidates)
     candidates, access = _filter_candidate_access(candidates)
     candidates, hours = _filter_candidate_hours(ctx, candidates)
+    capacity_summary = {
+        "observed_capacity_sites": int(candidates.get(
+            "capacity_observed_people", pd.Series(dtype=float)
+        ).notna().sum()),
+        "relative_floor_area_proxy_sites": int(candidates.get(
+            "gross_floor_area_proxy_m2", pd.Series(dtype=float)
+        ).notna().sum()),
+        "policy": (
+            "Only observed OSM/CSV people capacities become hard constraints. "
+            "Floor area is reported as relative evidence and is not auto-converted to people."
+        ),
+    }
     quality = ctx.get("quality", {})
     quality["public_access"] = access
     ctx.put("quality", quality)
     prov = Provenance(
-        source="OpenStreetMap amenities, access, and opening_hours",
+        source="OpenStreetMap candidate facilities, access, opening hours, and fee tags",
         record_count=len(candidates),
-        notes=(f"potential={potential}; available={len(candidates)}; "
-               f"access_restricted={access['restricted_candidates']}; "
-               f"hours_unknown={hours.get('unknown_candidates', 0)}"),
+        notes=(f"potential facilities: {potential}; retained: {len(candidates)}; "
+               f"restricted access: {access['restricted_candidates']}; "
+               f"fee required: {access['fee_required_candidates']}; "
+               f"hours unknown: {hours.get('unknown_candidates', 0)}; "
+               f"observed capacity: {capacity_summary['observed_capacity_sites']}; "
+               f"floor area proxy: {capacity_summary['relative_floor_area_proxy_sites']}"),
     )
     ctx.put("candidates", candidates, prov)
+    ctx.progress("Candidate facilities: ready", 2, 2, unit="stages")
     return ToolResult(ok=True, tool="fetch_candidate_sites", handle="candidates", provenance=prov,
                       summary={"candidates": len(candidates), "amenities": amenities,
-                               "public_access": access, "operating_hours": hours})
+                               "public_access": access, "operating_hours": hours,
+                               "capacity_evidence": capacity_summary})
 
 
 @registry.register("load_candidate_sites", "Load user-supplied candidate points from a CSV with latitude and longitude columns.",
@@ -404,9 +711,10 @@ def load_candidate_sites(ctx: Context, candidate_file: str | None) -> ToolResult
     prov = Provenance(
         source=f"User candidate CSV: {path.name}",
         record_count=len(candidates),
-        notes=(f"potential={potential}; available={len(candidates)}; "
-               f"access_restricted={access['restricted_candidates']}; "
-               f"hours_unknown={hours.get('unknown_candidates', 0)}"),
+        notes=(f"potential facilities: {potential}; retained: {len(candidates)}; "
+               f"restricted access: {access['restricted_candidates']}; "
+               f"fee required: {access['fee_required_candidates']}; "
+               f"hours unknown: {hours.get('unknown_candidates', 0)}"),
     )
     ctx.put("candidates", candidates, prov)
     return ToolResult(ok=True, tool="load_candidate_sites", handle="candidates", provenance=prov,
@@ -423,7 +731,7 @@ def summarize_heat_exposure(ctx: Context, limit: int = 10) -> ToolResult:
     hottest = areas.nlargest(max(1, limit), "heat_exposure")[["GEOID", "heat_exposure"]]
     out = Path(_cfg(ctx, "output").get("dir", "outputs_run")) / study["cache_scope"]
     out.mkdir(parents=True, exist_ok=True)
-    map_path, chart_path, report_path = (str(out / "heat_exposure_map.html"),
+    map_path, chart_path, report_path = (str(out / "heat_exposure_map.geojson"),
                                          str(out / "heat_analysis.png"), str(out / "heat_report.md"))
     heat_exposure_map(areas, map_path, study["boundary"])
     statistics = heat_analysis_chart(areas, chart_path)
@@ -475,6 +783,18 @@ def build_travel_matrix(ctx: Context, demand_handle: str = "demand",
     if reason:
         log.warning("ORS routing unavailable (%s); using Haversine", reason)
 
+    upper_speeds = cfg.get("ors_upper_speeds_kmh", {})
+    pruning_margin = cfg.get("ors_pruning_margin", 1.5)
+    eligible_masks = {}
+    for mode in modes:
+        lower_bound = haversine_matrix(
+            demand["points"],
+            candidates,
+            upper_speeds.get(mode, cfg.get("ors_upper_speed_kmh", 6.0)),
+            1.0,
+        )
+        eligible_masks[mode] = lower_bound <= policy_minutes * pruning_margin
+
     matrices: dict[str, np.ndarray] = {}
     mode_reports: dict[str, dict] = {}
     if not requested or reason:
@@ -485,18 +805,13 @@ def build_travel_matrix(ctx: Context, demand_handle: str = "demand",
                 "tier": "fallback" if reason else "approximate",
                 "reason": reason or "quick preview",
                 "total_pairs": int(fallbacks[mode].size),
+                "eligible_pairs": int(eligible_masks[mode].sum()),
+                "pruned_pairs": int((~eligible_masks[mode]).sum()),
             }
     else:
-        upper_speeds = cfg.get("ors_upper_speeds_kmh", {})
         with scoped_cache(cache_scope):
             for mode in modes:
-                lower_bound = haversine_matrix(
-                    demand["points"],
-                    candidates,
-                    upper_speeds.get(mode, cfg.get("ors_upper_speed_kmh", 6.0)),
-                    1.0,
-                )
-                eligible = lower_bound <= policy_minutes * cfg.get("ors_pruning_margin", 1.5)
+                eligible = eligible_masks[mode]
                 eligible_pairs = int(eligible.sum())
                 if eligible_pairs > cfg.get("ors_max_eligible_pairs", 250000):
                     matrices[mode] = fallbacks[mode]
@@ -602,15 +917,24 @@ def build_travel_matrix(ctx: Context, demand_handle: str = "demand",
 @registry.register("optimize_sites", "Maximize coverage for a fixed facility budget and threshold.",
                    {"n_facilities": {"type": "integer"}, "threshold_minutes": {"type": "number"},
                     "weights": {"type": ["object", "null"]}, "coverage_target": {"type": ["number", "null"]},
-                    "coverage_group": {"type": "string", "enum": ["all", "vulnerable"]}})
+                    "coverage_group": {"type": "string", "enum": ["all", "vulnerable"]},
+                    "facility_capacity": {"type": ["number", "null"]},
+                    "equity_alpha": {"type": ["number", "null"]}})
 @_guard("optimize_sites")
-def optimize_sites(ctx: Context, n_facilities: int = 8, threshold_minutes: float = 15,
+def optimize_sites(ctx: Context, n_facilities: int = 10, threshold_minutes: float = 15,
                    weights: dict | ValueWeights | None = None, coverage_target: float | None = None,
-                   coverage_group: str = "all") -> ToolResult:
-    """Solve the requested profile with any confirmed tract-coverage constraint."""
+                   coverage_group: str = "all",
+                   facility_capacity: float | None = None,
+                   equity_alpha: float | None = None) -> ToolResult:
+    """Solve gradual coverage with optional capacity and explicit assignment."""
     demand, candidates, travel = ctx.get("demand"), ctx.get("candidates"), ctx.get("travel")
     matrix, population, vulnerable, indicators = _decision_inputs(demand, travel)
     candidate_ids = candidates["cand_id"].astype(str).tolist(); candidate_count = len(candidate_ids)
+    if facility_capacity is not None and facility_capacity <= 0:
+        raise ValueError("facility_capacity must be positive")
+    if equity_alpha is not None and not 0 <= equity_alpha <= 1:
+        raise ValueError("equity_alpha must be between zero and one")
+    capacities, capacity_evidence = _candidate_capacities(candidates, facility_capacity)
     target_mask = _coverage_mask(demand, coverage_group, travel)
     if n_facilities > candidate_count:
         summary = {"requested_facilities": n_facilities, "candidate_count": candidate_count,
@@ -627,6 +951,7 @@ def optimize_sites(ctx: Context, n_facilities: int = 8, threshold_minutes: float
         id(vulnerable),
         n_facilities,
         float(threshold_minutes),
+        None if capacities is None else tuple(np.round(capacities, 6)),
         11,
     )
     checkpoints = ctx.get("_pareto_checkpoints", {})
@@ -641,7 +966,7 @@ def optimize_sites(ctx: Context, n_facilities: int = 8, threshold_minutes: float
     def pareto_progress(label, done, total):
         ctx.progress(label, done, total, solve_time_limit_seconds=solver_time_limit)
 
-    pareto_progress("Pareto sweep", 0, 11)
+    pareto_progress("Pareto efficiency baseline", 0, 1)
     points = coverage_pareto_sweep(
         matrix,
         population,
@@ -651,23 +976,31 @@ def optimize_sites(ctx: Context, n_facilities: int = 8, threshold_minutes: float
         threshold_minutes,
         progress_callback=pareto_progress,
         max_workers=optimization_cfg.get("pareto_workers", 4),
-        time_limit_s=solver_time_limit,
+        time_limit_s=optimization_cfg.get("pareto_point_time_limit_s", 30),
+        total_time_limit_s=optimization_cfg.get("pareto_total_time_limit_s", 90),
         cancel_check=ctx.check_cancelled,
         checkpoint_callback=checkpoint,
         completed_points=completed_points,
+        facility_capacities=capacities,
     )
     value_weights = weights if isinstance(weights, ValueWeights) else (ValueWeights(**weights) if weights else None)
-    if value_weights is None and coverage_target is None:
+    selected_alpha = None
+    if equity_alpha is not None:
+        selected_point = min(points, key=lambda point: (abs(point.alpha - equity_alpha), point.alpha))
+        solution = selected_point.solution
+        selected_alpha = selected_point.alpha
+    elif value_weights is None and coverage_target is None:
         solution = points[0].solution
     else:
         objective = (build_demand_weights(indicators, population, value_weights)
                      if value_weights else population / max(population.sum(), 1))
-        ctx.progress("Requested MCLP", 0, 1)
+        ctx.progress("Requested gradual coverage", 0, 1)
         solution = solve_mclp(matrix, objective, population, vulnerable,
                               n_facilities, threshold_minutes, candidate_ids, "requested", value_weights,
                               optimization_cfg.get("solver_time_limit_s", 120),
-                              coverage_target=coverage_target, coverage_mask=target_mask)
-        ctx.progress("Requested MCLP", 1, 1)
+                              coverage_target=coverage_target, coverage_mask=target_mask,
+                              facility_capacities=capacities)
+        ctx.progress("Requested gradual coverage", 1, 1)
     reachable = matrix <= threshold_minutes
     max_tract_coverage = float(reachable[target_mask].any(axis=1).mean()) if target_mask.any() else 0.0
     nearest = np.min(matrix, axis=1) if len(reachable) else np.array([])
@@ -675,6 +1008,17 @@ def optimize_sites(ctx: Context, n_facilities: int = 8, threshold_minutes: float
     minimum_full_threshold = float(target_nearest.max()) if len(target_nearest) and np.isfinite(target_nearest).all() else None
     diagnostics = {"requested_facilities": n_facilities, "candidate_count": candidate_count,
                    "coverage_target": coverage_target, "coverage_group": coverage_group,
+                   "coverage_model": "linear_gradual_assignment",
+                   "capacity_enabled": capacities is not None,
+                   "capacity_evidence": capacity_evidence,
+                   "facility_capacity_default": facility_capacity,
+                   "requested_equity_alpha": equity_alpha,
+                   "selected_frontier_alpha": selected_alpha,
+                   "pareto_completed_points": len(points),
+                   "pareto_requested_points": 11,
+                   "pareto_complete": len(points) == 11,
+                   "final_solution_basis": ("efficiency_gini_frontier" if selected_alpha is not None
+                                            else "confirmed_value_profile" if value_weights else "population_efficiency"),
                    "max_tract_coverage_at_threshold": max_tract_coverage,
                    "minimum_threshold_with_all_candidates": minimum_full_threshold}
     if solution.solver_status not in {"Optimal", "Feasible"}:
@@ -706,6 +1050,11 @@ def optimize_sites(ctx: Context, n_facilities: int = 8, threshold_minutes: float
                 "candidate_count": candidate_count, "selected_count": len(solution.selected_ids),
                 "covered_population_ratio": solution.covered_ratio,
                 "vulnerable_covered_ratio": solution.vulnerable_covered_ratio,
+                "population_weighted_access_gini": solution.population_weighted_access_gini,
+                "mean_access_score": solution.mean_access_score,
+                "gradual_coverage_ratio": solution.gradual_coverage_ratio,
+                "assigned_population": solution.assigned_population,
+                "maximum_capacity_utilization": solution.maximum_capacity_utilization,
                 "covered_tract_ratio": covered_tract_ratio, "all_tract_ratio": all_tract_ratio}
     scenarios = list(ctx.get("scenario_results", [])); scenarios.append(scenario); ctx.put("scenario_results", scenarios)
     chosen = candidates[candidates["cand_id"].astype(str).isin(map(str, solution.selected_ids))]
@@ -717,6 +1066,13 @@ def optimize_sites(ctx: Context, n_facilities: int = 8, threshold_minutes: float
                       summary={"selected_ids": solution.selected_ids, "selected_sites": selected_sites,
                                "covered_ratio": solution.covered_ratio,
                                "vulnerable_covered_ratio": solution.vulnerable_covered_ratio,
+                               "population_weighted_access_gini": solution.population_weighted_access_gini,
+                               "mean_access_score": solution.mean_access_score,
+                               "gradual_coverage_ratio": solution.gradual_coverage_ratio,
+                               "assigned_population": solution.assigned_population,
+                               "facility_loads": solution.facility_loads,
+                               "facility_capacities": solution.facility_capacities,
+                               "maximum_capacity_utilization": solution.maximum_capacity_utilization,
                                "covered_tract_ratio": covered_tract_ratio, "all_tract_ratio": all_tract_ratio,
                                "frontier_points": len(analysis["frontier"]), **diagnostics})
 
@@ -746,7 +1102,7 @@ def find_minimum_facilities(ctx: Context, threshold_minutes: float = 15,
     study = ctx.get("study", {})
     if feasible and study and "areas" in demand:
         out = Path(_cfg(ctx, "output").get("dir", "outputs_run")) / study["cache_scope"]
-        out.mkdir(parents=True, exist_ok=True); summary["map"] = str(out / "minimum_facilities_map.html")
+        out.mkdir(parents=True, exist_ok=True); summary["map"] = str(out / "minimum_facilities_map.geojson")
         coverage_map(
             demand["areas"], candidates, solution, "heat_exposure", summary["map"],
             study.get("boundary"), task=ctx.get("task", None),
@@ -759,7 +1115,7 @@ def find_minimum_facilities(ctx: Context, threshold_minutes: float = 15,
                    {"n_facilities": {"type": "integer"}, "coverage_target": {"type": "number"},
                     "coverage_group": {"type": "string", "enum": ["all", "vulnerable"]}})
 @_guard("find_minimum_threshold")
-def find_minimum_threshold(ctx: Context, n_facilities: int = 8,
+def find_minimum_threshold(ctx: Context, n_facilities: int = 10,
                            coverage_target: float = 1.0, coverage_group: str = "all") -> ToolResult:
     """Search exact observed travel times for the minimum feasible threshold."""
     demand, candidates, travel = ctx.get("demand"), ctx.get("candidates"), ctx.get("travel")
@@ -778,7 +1134,7 @@ def find_minimum_threshold(ctx: Context, n_facilities: int = 8,
     study = ctx.get("study", {})
     if solution and threshold is not None and study and "areas" in demand:
         out = Path(_cfg(ctx, "output").get("dir", "outputs_run")) / study["cache_scope"]
-        out.mkdir(parents=True, exist_ok=True); summary["map"] = str(out / "minimum_threshold_map.html")
+        out.mkdir(parents=True, exist_ok=True); summary["map"] = str(out / "minimum_threshold_map.geojson")
         coverage_map(
             demand["areas"], candidates, solution, "heat_exposure", summary["map"],
             study.get("boundary"), task=ctx.get("task", None),
@@ -812,11 +1168,29 @@ def analyze_reachability(ctx: Context, threshold_minutes: float = 15,
              "reachable_candidates": int(reachable_count[index])}
             for index in np.flatnonzero(mask)]
     rows.sort(key=lambda row: float("inf") if row["nearest_minutes"] is None else row["nearest_minutes"], reverse=True)
+    areas_wgs84 = demand["areas"].to_crs("EPSG:4326")
+    locations = {}
+    for _, area in areas_wgs84.iterrows():
+        geometry = area.geometry
+        if geometry is None or geometry.is_empty:
+            continue
+        point = geometry.representative_point()
+        locations[str(area.get("GEOID", ""))] = {
+            "longitude": float(point.x), "latitude": float(point.y),
+        }
+    for rank, row in enumerate(rows, start=1):
+        geoid = str(row["demand_id"]).split(":", 1)[0]
+        row.update({"GEOID": geoid, "rank": rank, **locations.get(geoid, {})})
+    study = ctx.get("study")
+    out = Path(_cfg(ctx, "output").get("dir", "outputs_run"))
+    out.mkdir(parents=True, exist_ok=True)
+    map_path = str(out / "reachability_map.geojson")
+    reachability_map(demand["areas"], rows, map_path, study.get("boundary"))
     summary = {"coverage_group": coverage_group, "threshold_minutes": threshold_minutes,
                "maximum_tract_coverage": float((reachable_count[mask] > 0).mean()),
                "unserved_demand_ids": [ids[index] for index in np.flatnonzero(mask & (reachable_count == 0))],
                "structurally_unreachable_ids": [ids[index] for index in np.flatnonzero(mask & ~np.isfinite(nearest))],
-               "hardest_demand": rows[:max(1, limit)]}
+               "hardest_demand": rows[:max(1, limit)], "map": map_path}
     ctx.put("reachability_analysis", summary)
     return ToolResult(ok=True, tool="analyze_reachability", handle="reachability_analysis", summary=summary)
 
@@ -827,7 +1201,8 @@ def analyze_reachability(ctx: Context, threshold_minutes: float = 15,
     {"threshold_minutes": {"type": "array", "items": {"type": "number"}},
      "facility_counts": {"type": "array", "items": {"type": "integer"}},
      "weights": {"type": ["object", "null"]},
-     "coverage_group": {"type": "string", "enum": ["all", "vulnerable"]}},
+     "coverage_group": {"type": "string", "enum": ["all", "vulnerable"]},
+     "facility_capacity": {"type": ["number", "null"]}},
 )
 @_guard("run_sensitivity_analysis")
 def run_sensitivity_analysis(
@@ -836,6 +1211,7 @@ def run_sensitivity_analysis(
     facility_counts: list[int],
     weights: dict | ValueWeights | None = None,
     coverage_group: str = "all",
+    facility_capacity: float | None = None,
 ) -> ToolResult:
     """Run a bounded, deterministic what-if grid without changing the confirmed baseline."""
     thresholds = list(dict.fromkeys(float(value) for value in threshold_minutes))
@@ -850,6 +1226,9 @@ def run_sensitivity_analysis(
     demand, candidates, travel = ctx.get("demand"), ctx.get("candidates"), ctx.get("travel")
     matrix, population, vulnerable, indicators = _decision_inputs(demand, travel)
     candidate_ids = candidates["cand_id"].astype(str).tolist()
+    if facility_capacity is not None and facility_capacity <= 0:
+        raise ValueError("facility_capacity must be positive")
+    capacities, _ = _candidate_capacities(candidates, facility_capacity)
     if any(value < 1 or value > len(candidate_ids) for value in counts):
         raise ValueError(f"Facility counts must be between 1 and {len(candidate_ids)}")
     task = ctx.get("task", None)
@@ -880,6 +1259,7 @@ def run_sensitivity_analysis(
         solution = solve_mclp(
             matrix, objective, population, vulnerable, count, threshold,
             candidate_ids, "sensitivity", value_weights, time_limit,
+            facility_capacities=capacities,
         )
         selected = {candidate_id: position for position, candidate_id in enumerate(candidate_ids)}
         columns = [selected[item] for item in solution.selected_ids if item in selected]
@@ -894,6 +1274,10 @@ def run_sensitivity_analysis(
             "selected_ids": solution.selected_ids,
             "covered_population_ratio": solution.covered_ratio,
             "vulnerable_covered_ratio": solution.vulnerable_covered_ratio,
+            "population_weighted_access_gini": solution.population_weighted_access_gini,
+            "mean_access_score": solution.mean_access_score,
+            "assigned_population": solution.assigned_population,
+            "maximum_capacity_utilization": solution.maximum_capacity_utilization,
             "covered_tract_ratio": float(covered[target_mask].mean()) if target_mask.any() else 0.0,
             "mean_travel_minutes": solution.mean_travel_minutes,
         })
@@ -935,7 +1319,99 @@ def compare_scenarios(ctx: Context) -> ToolResult:
     ctx.put("scenario_comparison", summary)
     return ToolResult(ok=True, tool="compare_scenarios", handle="scenario_comparison", summary=summary)
 
-@registry.register("generate_outputs", "Write coverage HTML, Pareto PNG, and Markdown report.")
+
+@registry.register(
+    "compare_value_profiles",
+    "Solve two or more confirmed value profiles against one shared candidate and travel baseline.",
+    {"profiles": {"type": "array", "items": {"type": "string"}},
+     "n_facilities": {"type": "integer"}, "threshold_minutes": {"type": "number"},
+     "facility_capacity": {"type": ["number", "null"]}},
+)
+@_guard("compare_value_profiles")
+def compare_value_profiles(
+    ctx: Context, profiles: list[str], n_facilities: int = 10,
+    threshold_minutes: float = 15, facility_capacity: float | None = None,
+) -> ToolResult:
+    """Compare confirmed normative profiles without changing the shared spatial inputs."""
+    names = list(dict.fromkeys(profiles))
+    configured = _cfg(ctx, "value_profiles")
+    if len(names) < 2:
+        raise ValueError("Choose at least two registered value profiles to compare")
+    unknown = [name for name in names if name not in configured]
+    if unknown:
+        raise ValueError(f"Unknown value profile(s): {', '.join(unknown)}")
+    demand, candidates, travel = ctx.get("demand"), ctx.get("candidates"), ctx.get("travel")
+    matrix, population, vulnerable, indicators = _decision_inputs(demand, travel)
+    candidate_ids = candidates["cand_id"].astype(str).tolist()
+    capacities, capacity_evidence = _candidate_capacities(candidates, facility_capacity)
+    time_limit = _cfg(ctx, "optimization").get("solver_time_limit_s", 120)
+    scenarios = []
+    scenario_solutions = []
+    for index, name in enumerate(names):
+        ctx.progress("Value-profile comparison", index, len(names), unit="profiles")
+        weights = ValueWeights(**configured[name]["weights"])
+        objective = build_demand_weights(indicators, population, weights)
+        solution = solve_mclp(
+            matrix, objective, population, vulnerable, n_facilities,
+            threshold_minutes, candidate_ids, name, weights, time_limit,
+            facility_capacities=capacities,
+        )
+        if solution.solver_status not in {"Optimal", "Feasible"}:
+            raise ValueError(f"Profile {name} produced solver status {solution.solver_status}")
+        scenario_solutions.append(solution)
+        scenarios.append({
+            "profile": name, "profile_label": configured[name].get("label", name),
+            "selected_ids": solution.selected_ids,
+            "covered_population_ratio": solution.covered_ratio,
+            "vulnerable_covered_ratio": solution.vulnerable_covered_ratio,
+            "gradual_coverage_ratio": solution.gradual_coverage_ratio,
+            "population_weighted_access_gini": solution.population_weighted_access_gini,
+            "mean_access_score": solution.mean_access_score,
+            "mean_travel_minutes": solution.mean_travel_minutes,
+        })
+    ctx.progress("Value-profile comparison", len(names), len(names), unit="profiles")
+    baseline = scenarios[0]
+    comparisons = []
+    for alternative in scenarios[1:]:
+        base_sites, alternative_sites = set(baseline["selected_ids"]), set(alternative["selected_ids"])
+        union = base_sites | alternative_sites
+        comparisons.append({
+            "baseline": baseline["profile"], "alternative": alternative["profile"],
+            "coverage_change": alternative["covered_population_ratio"] - baseline["covered_population_ratio"],
+            "vulnerable_coverage_change": alternative["vulnerable_covered_ratio"] - baseline["vulnerable_covered_ratio"],
+            "gini_change": (
+                alternative["population_weighted_access_gini"] - baseline["population_weighted_access_gini"]
+                if alternative["population_weighted_access_gini"] is not None
+                and baseline["population_weighted_access_gini"] is not None else None
+            ),
+            "shared_site_ratio": len(base_sites & alternative_sites) / len(union) if union else 1.0,
+            "replaced_facilities": len(base_sites - alternative_sites),
+        })
+    summary = {
+        "shared_baseline": {"n_facilities": n_facilities,
+                            "threshold_minutes": threshold_minutes,
+                            "mobility_scenario": getattr(ctx.get("task", None), "mobility_scenario", "unknown"),
+                            "capacity": capacity_evidence},
+        "scenarios": scenarios, "comparisons": comparisons,
+    }
+    study = ctx.get("study", {})
+    if study and "areas" in demand:
+        out = Path(_cfg(ctx, "output").get("dir", "outputs_run")) / study["cache_scope"]
+        out.mkdir(parents=True, exist_ok=True)
+        map_path = str(out / "profile_comparison_map.geojson")
+        selections = {
+            "baseline": (scenarios[0]["profile_label"], scenario_solutions[0].selected_ids),
+            "alternative": (scenarios[1]["profile_label"], scenario_solutions[1].selected_ids),
+        }
+        comparison_map(
+            demand["areas"], candidates, selections, map_path,
+            study.get("boundary"), task=ctx.get("task", None),
+        )
+        summary["map"] = map_path
+    ctx.put("scenario_comparison", summary)
+    return ToolResult(ok=True, tool="compare_value_profiles", handle="scenario_comparison", summary=summary)
+
+@registry.register("generate_outputs", "Write MapLibre GeoJSON, Pareto PNG, and Markdown report.")
 @_guard("generate_outputs")
 def generate_outputs(ctx: Context, output_dir: str | None = None, indicator: str = "heat_exposure") -> ToolResult:
     """Write the coverage map, Pareto chart, and Markdown report."""
@@ -944,13 +1420,27 @@ def generate_outputs(ctx: Context, output_dir: str | None = None, indicator: str
                                     threshold_minutes=analysis["threshold_minutes"], weights=analysis["solution"].weights_used))
     base = Path(output_dir or _cfg(ctx, "output").get("dir", "outputs_run"))
     out = base if output_dir else base / study["cache_scope"]; out.mkdir(parents=True, exist_ok=True)
-    paths = {"map": str(out / "coverage_map.html"), "pareto": str(out / "pareto.png"), "report": str(out / "report.md")}
+    paths = {"map": str(out / "coverage_map.geojson"), "pareto": str(out / "pareto.png"), "report": str(out / "report.md")}
+    ctx.progress("Outputs: writing interactive map", 0, 3, unit="artifacts")
     coverage_map(
         demand["areas"], candidates, analysis["solution"], indicator, paths["map"],
         study["boundary"], task=task,
     )
+    ctx.progress("Outputs: rendering Pareto chart", 1, 3, unit="artifacts")
     pareto_chart(analysis["points"], analysis["frontier"], paths["pareto"])
-    Path(paths["report"]).write_text(render_report(task, analysis["solution"], analysis["frontier"], ctx.lineage), encoding="utf-8")
+    ctx.progress("Outputs: writing method report", 2, 3, unit="artifacts")
+    Path(paths["report"]).write_text(render_report(
+        task, analysis["solution"], analysis["frontier"], ctx.lineage,
+        model_context={
+            "capacity_evidence": analysis.get("diagnostics", {}).get("capacity_evidence", {}),
+            "built_environment": ctx.get("built_environment", {"status": "not_run"}),
+            "population_weighting_threshold": ctx.get("quality", {}).get("heat", {}).get(
+                "minimum_valid_population_share", .8
+            ),
+            "vulnerability": ctx.get("vulnerability_analysis", {}),
+        },
+    ), encoding="utf-8")
+    ctx.progress("Outputs ready", 3, 3, unit="artifacts")
     ctx.put("outputs", paths)
     return ToolResult(ok=True, tool="generate_outputs", handle="outputs", summary=paths)
 
@@ -961,11 +1451,14 @@ def run_tool_chain(cfg: dict, task: TaskSpec, output_dir: str | None = None, ctx
     calls = [
         ("resolve_study_area", {"place_name": task.place_name}),
         ("prepare_demand", {}),
+        ("prepare_built_environment", {}),
         ("fetch_candidate_sites", {"amenities": task.candidate_amenities}),
         ("build_travel_matrix", {}),
         ("optimize_sites", {"n_facilities": task.n_facilities, "threshold_minutes": task.threshold_minutes,
                             "weights": task.weights.model_dump() if task.weights else None,
-                            "coverage_target": task.coverage_target, "coverage_group": task.coverage_group}),
+                            "coverage_target": task.coverage_target, "coverage_group": task.coverage_group,
+                            "facility_capacity": task.facility_capacity,
+                            "equity_alpha": task.equity_alpha}),
         ("generate_outputs", {"output_dir": output_dir}),
     ]
     results = []

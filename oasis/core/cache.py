@@ -7,6 +7,7 @@ import os
 import pathlib
 import re
 import tempfile
+import time
 import unicodedata
 from contextlib import contextmanager
 from typing import Iterator
@@ -62,7 +63,22 @@ def atomic_target(path: str | pathlib.Path) -> Iterator[pathlib.Path]:
     temp.unlink(missing_ok=True)
     try:
         yield temp
-        os.replace(temp, target)
+        last_error: PermissionError | None = None
+        for delay in (0.0, .025, .05, .1, .2, .4):
+            if delay:
+                time.sleep(delay)
+            try:
+                os.replace(temp, target)
+                last_error = None
+                break
+            except PermissionError as exc:
+                last_error = exc
+        if last_error is not None:
+            # Windows may lock a cache file while another run reads or publishes
+            # the same content-addressed target. A non-empty winner is usable.
+            if target.is_file() and target.stat().st_size > 0:
+                return
+            raise last_error
     finally:
         temp.unlink(missing_ok=True)
 

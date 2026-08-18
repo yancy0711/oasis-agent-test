@@ -1,149 +1,164 @@
 # OASIS Agent
 
-OASIS is a GeoAI decision-support agent for equity-aware public-health facility siting in the United States. It resolves a city or county, prepares Census, OpenStreetMap, and heat-exposure data, estimates walking access, solves location models, and produces an interactive map, a Pareto chart, and a provenance report.
+OASIS is an auditable autonomous GIS and LLM-GIS decision-support agent for evaluating access to existing cooling-facility candidates in the United States.
 
-Two execution modes share the same deterministic geospatial core:
+## Intended users and purpose
 
-- `pipeline`: runs the fixed six-stage workflow without an LLM.
-- `agent`: uses an LLM to parse intent and choose the next registered action from observed results. Deterministic tools still perform geocoding, routing, validation, MCLP/LSCP solving, threshold search, and output generation.
+- Policy analysts and planners: compare candidate-facility portfolios under budget, travel-time, capacity, and equity constraints.
+- Public-health teams: inspect population-weighted heat exposure, vulnerable-population coverage, and hard-to-reach areas.
+- Academic researchers: run reproducible efficiency-Gini, mobility, vulnerability, and threshold sensitivity analyses with provenance.
 
-## Architecture
+OASIS is not a consumer navigation service. It does not verify which facility is open right now, provide emergency advice, search vacant land, or make zoning decisions.
+
+## Main capabilities
+
+- Natural-language routing: full analysis, quick diagnostic, clarification, or out of scope.
+- US city/county resolution with explicit confirmation.
+- ACS/TIGER demand data, population-weighted Landsat LST, environmental diagnostics, and OSM/uploaded candidate facilities.
+- Walking, cycling, and driving accessibility using ORS, with bounded Haversine preview/fallback.
+- Gradual coverage, explicit assignment, optional capacity, population-weighted Gini, and interactive Pareto solutions.
+- Vulnerability preprocessing: missingness, direction, normalization, correlation, VIF, PCA, alternative weights, and robustness scans.
+- MapLibre maps, point/address route planning, route heat audit, and optional Mapillary imagery.
+- Reports, charts, provenance, and notify-only source-version checks.
+- OpenAI-compatible BYOK for OpenAI, OpenRouter, approved custom endpoints, and local Ollama/vLLM.
+
+Candidate facilities are possible existing service locations, not confirmed cooling centers. Unknown opening hours, fees, access, capacity, and official status remain explicit.
+
+## Code layout
 
 ```text
+React UI -> FastAPI -> OasisService -> bounded LLM orchestration
+                                  -> deterministic GIS tools
+                                  -> data, optimization, maps, reports, provenance
+
 oasis-agent/
-|-- oasis/                         # Framework-independent application package
-|   |-- contracts/                 # Shared Pydantic domain contracts
-|   |-- agent/                     # Context, prompts, and observation-action orchestration
-|   |-- core/
-|   |   |-- data/                  # Census, geocoding, Landsat, and OSM acquisition
-|   |   |-- spatial/               # CRS alignment and walking-access matrices
-|   |   |-- optimization/          # MCLP, LSCP, threshold search, and Pareto analysis
-|   |   `-- outputs/               # Folium maps, charts, and Markdown reports
-|   |-- services/                  # Registered tools, use cases, jobs, and artifacts
-|   `-- settings.py                # Runtime settings and value profiles
-|-- api/                           # FastAPI routes and HTTP schemas
-|-- ui/                            # Streamlit presentation and API client
-|-- cli/                           # Pipeline/agent commands and terminal HITL
-|-- config/                        # YAML settings and value profiles
-|-- data/samples/                  # Small committed input examples
-|-- experiments/                   # Live agent-behavior evaluation
-|-- tests/                         # Unit, integration, and Streamlit acceptance tests
-|-- notebooks/                     # Research exploration, not production state
-|-- Dockerfile                     # Shared backend/frontend container image
-`-- docker-compose.yml             # Starts FastAPI and Streamlit together
+|-- api/                 # FastAPI routes and HTTP schemas
+|-- cli/                 # Command-line entry and terminal confirmation
+|-- config/              # Runtime settings and value profiles
+|-- oasis/
+|   |-- agent/           # Scope routing and bounded LLM orchestration
+|   |-- contracts/       # Shared typed domain models
+|   |-- core/            # Data, spatial, optimization, vulnerability, outputs
+|   `-- services/        # Tool registry, workflows, run service, SQLite state
+|-- frontend/
+|   `-- src/
+|       |-- api/         # API client and generated OpenAPI types
+|       |-- components/  # Shared UI controls
+|       |-- features/    # Task, run, result, and comparison interfaces
+|       |-- store/       # Browser-session state
+|       `-- styles/      # Global responsive styling
+|-- tests/               # Unit and integration tests
+|-- experiments/         # Research evaluation scripts
 ```
 
-Runtime flow:
-
-```text
-Streamlit UI -> FastAPI service -> OASIS services -> agent + deterministic core
-                                              -> cache, outputs, and provenance
-```
-
-Web execution keeps API keys and filesystem paths in the backend. Streamlit exchanges typed tasks, opaque IDs, progress, summaries, and allow-listed artifacts through `/v1`. Uvicorn currently uses one worker because run state is in memory; caches and outputs remain on disk.
+See [PIPELINE.md](PIPELINE.md) for the computational workflow.
 
 ## Requirements
 
 - Python 3.11
+- Node.js 22+
 - GDAL-compatible geospatial libraries
 - CBC solver for PuLP
-- Internet access for live geocoding and data acquisition
+- Internet access for live data and routing
 
-Important Python packages include GeoPandas, Shapely, OSMnx, PyGRIS, Planetary Computer, Rasterio, PuLP, Pydantic, Folium, Matplotlib, FastAPI, Uvicorn, HTTPX, and Streamlit. Exact constraints are in `requirements.txt`.
-
-## API keys
-
-Copy the example environment file on Windows PowerShell:
+Copy the environment template:
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-On macOS or Linux:
+Relevant keys:
 
-```bash
-cp .env.example .env
+```dotenv
+OPENROUTER_API_KEY=
+ORS_API_KEY=
+CENSUS_API_KEY=
+MAPILLARY_ACCESS_TOKEN=
 ```
 
-- `OPENROUTER_API_KEY`: required for agent mode.
-- `ORS_API_KEY`: required for OpenRouteService walking matrices.
-- `CENSUS_API_KEY`: recommended for reliable Census API access.
-- `OPENROUTER_SITE_URL` and `OPENROUTER_APP_NAME`: optional OpenRouter metadata.
+Mapillary is optional. Register an application at https://www.mapillary.com/dashboard/developers and copy its client access token. Never commit the populated `.env`.
 
-The deterministic pipeline can run without OpenRouter. Never commit the populated `.env` file.
-
-## Install and test
-
-The commands below are the same on Windows, macOS, and Linux once Conda is installed:
+## Install
 
 ```powershell
 conda create -n oasis-agent python=3.11
 conda activate oasis-agent
 pip install -r requirements.txt
-python -m pytest tests -q
+
+cd frontend
+npm install
+cd ..
 ```
-
-Docker is preferred for macOS because the image supplies Linux GDAL and CBC without requiring separate Homebrew packages. Native macOS installation may require Xcode Command Line Tools when a dependency has no compatible wheel.
-
-## Run from the command line
-
-Deterministic pipeline:
-
-```powershell
-python -m cli.main --mode pipeline --place "New York City" --n-facilities 12 --threshold-minutes 10 --profile equity_first
-```
-
-Agent mode:
-
-```powershell
-python -m cli.main --mode agent --prompt "Site 8 cooling centers in Washington, DC within a 15-minute walking threshold and maximize population coverage."
-```
-
-Diagnostic examples:
-
-```powershell
-python -m cli.main --mode agent --prompt "At a strict 15-minute threshold, what is the minimum number of Phoenix cooling centers needed to cover every tract?"
-python -m cli.main --mode agent --prompt "With exactly 2 Phoenix cooling centers, what is the smallest threshold that covers every tract?"
-python -m cli.main --mode agent --prompt "Which Phoenix tracts are hardest to serve within 15 minutes?"
-```
-
-The profiles are `balanced`, `efficiency_first`, `equity_first`, and `cooling_first`. CLI arguments can override parsed facility count, threshold, and profile. Ambiguous places require confirmation; repeated names resolve to the same canonical cache identity.
-
-CLI runs write to `outputs_run/<place>/`; web runs use `outputs_run/api_runs/<run_id>/<place>/`. A successful siting run produces `coverage_map.html`, `pareto.png`, and `report.md`. A heat-only review produces `heat_exposure_map.html`, `heat_analysis.png`, and `heat_report.md`.
 
 ## Run the web application
 
-Start FastAPI in one terminal:
+Terminal 1:
 
 ```powershell
-uvicorn api.main:app --host 127.0.0.1 --port 8000 --workers 1
+python -m uvicorn api.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-Start Streamlit in another terminal:
+Terminal 2:
 
 ```powershell
-streamlit run ui/streamlit_app.py
+cd frontend
+npm run dev
 ```
 
-Open `http://127.0.0.1:8501`. Health and API documentation are available at `http://127.0.0.1:8000/health` and `http://127.0.0.1:8000/docs`. Set `OASIS_API_URL` only when the services run on different hosts.
+Open http://127.0.0.1:5173.
 
+Basic workflow:
 
-## Run with Docker Compose
+1. Optionally connect and test a visitor-provided language model.
+2. Describe a supported city/county analysis question.
+3. Confirm the interpreted task and place.
+4. Review candidate types, travel mode, threshold, weights, and optional constraints.
+5. Run and inspect Map, Analysis, Pareto, Compare, Report, and Provenance.
 
-Docker Compose is the recommended tester package because it supplies the same Python, GDAL, CBC, API, and UI environment on Windows, macOS, and Linux.
+Example requests:
 
-Windows PowerShell:
+```text
+Select 10 candidate cooling facilities in Phoenix within a 15-minute walk.
+Compare efficiency and access inequality for 10 candidate facilities in Phoenix.
+Which Phoenix tracts have the highest population-weighted heat exposure?
+Which tracts are hardest to serve within 15 minutes?
+I'm at the Lincoln Memorial. How can I find the nearest cooling facility?
+```
+
+Requests such as “Which NYC cooling centers are open right now?” are rejected with an official-directory or 311 alternative.
+
+For Mapillary previews, add `MAPILLARY_ACCESS_TOKEN`, restart the backend, run an analysis, then click a selected facility. The backend endpoint is:
+
+```text
+/api/streetview?lat=<latitude>&lon=<longitude>&radius_m=100
+```
+
+## Command line
 
 ```powershell
-Copy-Item .env.example .env
+python -m cli.main --mode pipeline --place "New York City" --n-facilities 12 --threshold-minutes 10 --profile equity_first
+python -m cli.main --mode agent --prompt "Select 10 candidate cooling facilities in Phoenix within a 15-minute walk."
+```
+
+## Outputs
+
+Web runs are stored under `outputs_run/api_runs/<run_id>/`. Outputs include MapLibre GeoJSON, charts, Markdown reports, provenance, progress, and run records.
+
+## Deployment and mobile
+
+```powershell
 docker compose up --build
 ```
 
-macOS or Linux:
+A phone is a browser client; data processing, optimization, API keys, and optional local models remain on a reachable backend. Local mobile testing requires the computer to stay on and be reachable over LAN or a secure tunnel. Public use requires a hosted backend/frontend.
 
-```bash
-cp .env.example .env
-docker compose up --build
+## Verify
+
+```powershell
+python -m pytest tests -q
+
+cd frontend
+npm test
+npm run build
+npm run lint
 ```
-
-Open `http://localhost:8501`; stop with `docker compose down`. `data/cache` and `outputs_run` are mounted from the host. For the tool sequence and manual equivalence checks, see `PIPELINE.md`.

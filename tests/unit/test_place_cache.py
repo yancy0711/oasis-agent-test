@@ -35,6 +35,16 @@ def test_cache_scope_separates_places(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="Cache scope is not set"): cache.cache_dir("heat")
 
 
+def test_atomic_cache_publish_accepts_existing_winner_after_windows_lock(monkeypatch, tmp_path):
+    target = tmp_path / "candidates.json"
+    target.write_text("existing", encoding="utf-8")
+    monkeypatch.setattr(cache.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(cache.os, "replace", lambda *_args: (_ for _ in ()).throw(PermissionError(5, "Access is denied")))
+    cache.atomic_write_text(target, "new")
+    assert target.read_text(encoding="utf-8") == "existing"
+    assert not list(tmp_path.glob(".candidates.*.json"))
+
+
 def test_usa_suffix_is_optional_and_queries_are_us_only():
     """Verify US suffix variants share a query key and Nominatim is US-only."""
     full, short = "San Francisco, California, USA", "San Francisco, California"
@@ -42,6 +52,184 @@ def test_usa_suffix_is_optional_and_queries_are_us_only():
     assert geocoding._candidate_filename(full) == geocoding._candidate_filename(short)
     assert geocoding._candidate_filename("NYC") == geocoding._candidate_filename("nyc")
     assert geocoding._candidate_params(full, 5)["countrycodes"] == "us"
+
+
+def test_route_origin_infers_smallest_supported_parent_city(monkeypatch):
+    row = {
+        "display_name": "Lincoln Memorial, Washington, District of Columbia, United States",
+        "address": {
+            "tourism": "Lincoln Memorial", "city": "Washington",
+            "state": "District of Columbia", "country_code": "us",
+        },
+    }
+    monkeypatch.setattr(geocoding, "search_origin_candidates", lambda query, limit=8: [row])
+    label, place = geocoding.infer_route_study_area("Lincoln Memorial")
+    assert label.startswith("Lincoln Memorial")
+    assert place == "Washington, District of Columbia, USA"
+
+
+def test_route_origin_cache_is_available_before_study_scope(monkeypatch, tmp_path):
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return [{"display_name": "Papago Park"}]
+
+    monkeypatch.setattr(geocoding, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(geocoding.requests, "get", lambda *args, **kwargs: Response())
+    rows = geocoding.search_origin_candidates("Papago Park")
+    assert rows == [{"display_name": "Papago Park"}]
+    assert list((tmp_path / "shared" / "nominatim_route_origins").rglob("origin_*.json"))
+
+
+def test_route_origin_options_expose_point_and_admin_interpretations(monkeypatch):
+    """A vague name must expose plausible point and administrative meanings."""
+    town = _candidate("Disney, Oklahoma, United States", "town", "Oklahoma")
+    park = {
+        "display_name": "Walt Disney World, Bay Lake, Florida, United States",
+        "addresstype": "theme_park", "lat": "28.385", "lon": "-81.564",
+        "address": {"city": "Bay Lake", "state": "Florida", "country_code": "us"},
+    }
+    monkeypatch.setattr(geocoding, "search_origin_candidates", lambda _query, limit=8: [town, park])
+    choices, administrative = geocoding.route_origin_options("Disney")
+    assert administrative is False
+    assert [(choice["administrative"], choice["place_name"]) for choice in choices] == [
+        (True, "Disney, Oklahoma, USA"), (False, "Bay Lake, Florida, USA"),
+    ]
+
+
+def test_short_administrative_route_query_becomes_study_area(monkeypatch):
+    """A short administrative alias such as DC is not treated as an exact origin."""
+    city = _candidate("Washington, District of Columbia, United States", "city", "District of Columbia")
+    monkeypatch.setattr(geocoding, "search_origin_candidates", lambda _query, limit=8: [city])
+    choices, administrative = geocoding.route_origin_options("DC")
+    assert choices[0]["administrative"] is True
+    assert administrative is True
+
+
+def test_route_origin_reverse_geocodes_parent_for_cross_county_landmark(monkeypatch):
+    """A resolved landmark without an address county remains a usable route origin."""
+    park = {
+        "display_name": "Yellowstone National Park, Wyoming, United States",
+        "addresstype": "nature_reserve", "lat": "44.6200885", "lon": "-110.5606893",
+        "address": {"state": "Wyoming", "country_code": "us"},
+    }
+    monkeypatch.setattr(geocoding, "search_origin_candidates", lambda _query, limit=8: [park])
+    monkeypatch.setattr(
+        geocoding, "reverse_origin_address",
+        lambda _latitude, _longitude: {"county": "Park County", "state": "Wyoming"},
+    )
+    choices, administrative = geocoding.route_origin_options("Yellowstone National Park")
+    assert administrative is False
+    assert choices[0]["place_name"] == "Park County, Wyoming, USA"
+    assert choices[0]["display_name"].startswith("Yellowstone National Park")
+
+
+def test_specific_address_falls_back_through_landmark_context(monkeypatch):
+    """An unrecognized POI-qualified address uses its inferred state without guessing."""
+    park = {
+        "display_name": "Yellowstone National Park, Wyoming, United States",
+        "addresstype": "nature_reserve", "lat": "44.62", "lon": "-110.56",
+        "address": {"state": "Wyoming", "country_code": "us"},
+    }
+    northeast = {
+        "display_name": "20, Northeast Entrance Road, Park County, Wyoming, 82190, United States",
+        "addresstype": "place", "lat": "45.0", "lon": "-110.7",
+        "address": {"county": "Park County", "state": "Wyoming", "country_code": "us"},
+    }
+    south = {
+        "display_name": "20, South Entrance Road, Teton County, Wyoming, United States",
+        "addresstype": "place", "lat": "44.1", "lon": "-110.7",
+        "address": {"county": "Teton County", "state": "Wyoming", "country_code": "us"},
+    }
+    responses = {
+        "20 Entrance Road, Yellowstone National Park": [],
+        "Yellowstone National Park": [park],
+        "20 Entrance Road, Wyoming": [northeast, south],
+    }
+    monkeypatch.setattr(
+        geocoding, "search_origin_candidates",
+        lambda query, limit=8: responses.get(query, []),
+    )
+    choices, administrative = geocoding.route_origin_options(
+        "20 Entrance Road, Yellowstone National Park", fallback_language=True
+    )
+    assert administrative is False
+    assert [choice["place_name"] for choice in choices] == [
+        "Park County, Wyoming, USA", "Teton County, Wyoming, USA",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_search"),
+    [
+        ("the entrance of central park in nyc", "central park, nyc"),
+        ("the entrance of yellow stone park", "yellowstone park"),
+    ],
+)
+def test_conversational_park_entrance_falls_back_to_landmark(
+    monkeypatch, query, expected_search
+):
+    """Entrance wording returns a park representative candidate for confirmation."""
+    calls = []
+    park = {
+        "display_name": "Matched Park, New York, United States",
+        "type": "park", "addresstype": "park", "lat": "40.7", "lon": "-73.9",
+        "address": {"country_code": "us", "city": "New York", "state": "New York"},
+    }
+
+    def fake_search(value, limit=8):
+        calls.append(value.casefold())
+        return [park] if value.casefold() == expected_search else []
+
+    monkeypatch.setattr(geocoding, "search_origin_candidates", fake_search)
+    choices, administrative = geocoding.route_origin_options(
+        query, fallback_language=True
+    )
+    assert calls[-1] == expected_search
+    assert choices[0]["display_name"] == park["display_name"]
+    assert administrative is False
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("the eastern gate of Central Park in NYC", "Central Park, NYC"),
+        ("D exit of Grand Central Terminal in NYC", "Grand Central Terminal, NYC"),
+        ("exit D of Grand Central Terminal in NYC", "Grand Central Terminal, NYC"),
+        ("at the western entrance to 350 Fifth Avenue, New York", "350 Fifth Avenue, New York"),
+        ("rear access point to Phoenix Convention Center", "Phoenix Convention Center"),
+    ],
+)
+def test_direction_and_access_labels_are_not_treated_as_landmark_names(query, expected):
+    """Directional and lettered access labels are removed only from phrase starts."""
+    variants = geocoding._landmark_query_variants(query)
+    assert expected in variants
+
+
+def test_structured_origin_search_relaxes_to_context_only_after_entity_fails(monkeypatch):
+    """Deterministic search preserves hints and exposes the context as a last HITL option."""
+    calls = []
+    context_row = {
+        "display_name": "Wyoming, United States", "type": "state",
+        "addresstype": "state", "lat": "43", "lon": "-107",
+        "address": {"country_code": "us", "state": "Wyoming"},
+    }
+    def fake_search(query, limit=8):
+        calls.append(query)
+        return [context_row] if query == "Wyoming" else []
+    monkeypatch.setattr(geocoding, "search_origin_candidates", fake_search)
+    choices, administrative = geocoding.route_origin_options(
+        "Unknown landmark", "Wyoming", "eastern entrance"
+    )
+    assert calls == ["Unknown landmark, Wyoming", "Unknown landmark", "Wyoming"]
+    assert choices[0]["positional_hint"] == "eastern entrance"
+    assert administrative is True
 
 
 def test_nyc_stays_city_without_canonical_state_expansion(monkeypatch):
@@ -127,6 +315,31 @@ def test_county_boundary_can_reach_sparse_ors(monkeypatch):
     monkeypatch.setattr(workflow, "sparse_network_matrix", fake_sparse)
     result = registry.get("build_travel_matrix").fn(ctx=ctx)
     assert result.ok and result.summary["router"] == "ors_sparse" and called
+
+
+def test_quick_routing_reports_distance_pruned_eligible_pairs():
+    demand = gpd.GeoDataFrame(
+        geometry=[Point(-112.07, 33.45), Point(-111.0, 34.4)], crs="EPSG:4326"
+    )
+    candidates = gpd.GeoDataFrame(
+        {"cand_id": ["near", "far"]},
+        geometry=[Point(-112.071, 33.451), Point(-110.0, 35.0)],
+        crs="EPSG:4326",
+    )
+    ctx = Context()
+    ctx.put("config", {"accessibility": {
+        "router": "haversine", "mode_speeds_kmh": {"walking": 4.8},
+        "ors_upper_speeds_kmh": {"walking": 6.0}, "ors_pruning_margin": 1.5,
+    }})
+    ctx.put("task", TaskSpec(place_name="Phoenix", threshold_minutes=15))
+    ctx.put("study", {"cache_scope": "phoenix"})
+    ctx.put("demand", {"points": demand})
+    ctx.put("candidates", candidates)
+    result = registry.get("build_travel_matrix").fn(ctx=ctx)
+    report = result.summary["mode_reports"]["walking"]
+    assert report["total_pairs"] == 4
+    assert 0 < report["eligible_pairs"] < report["total_pairs"]
+    assert report["eligible_pairs"] + report["pruned_pairs"] == report["total_pairs"]
 
 
 def test_oversized_county_reports_haversine_fallback(monkeypatch, caplog):

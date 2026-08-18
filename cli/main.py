@@ -20,7 +20,7 @@ def run_pipeline(cfg: dict, place: str, profile: str | None = None,
     """Confirm geography, then run the deterministic six-tool pipeline."""
     opt, access = cfg.get("optimization", {}), cfg.get("accessibility", {})
     selected_profile = profile or opt.get("value_profile", "balanced")
-    task = TaskSpec(place_name=place, n_facilities=n_facilities if n_facilities is not None else opt.get("n_facilities", 8),
+    task = TaskSpec(place_name=place, n_facilities=n_facilities if n_facilities is not None else opt.get("n_facilities", 10),
                     threshold_minutes=threshold_minutes if threshold_minutes is not None else access.get("threshold_minutes", 15),
                     weights=get_weights(selected_profile), notes=f"value profile: {selected_profile}")
     if validate_place: task = hitl.clarify_place(task, interactive=interactive)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json, logging, os, pathlib, re
 from typing import Any
 from oasis.agent.context import Context
+from oasis.agent.scope import route_origin_from_prompt
 from oasis.core.cancellation import RunCancelled
 from oasis.contracts.domain import (AgentAction, AgentPlan, PlanStep, RecoveryProposal, ResultNarrative, TaskSpec,
                            ToolError, ToolResult)
@@ -27,30 +28,157 @@ def load_prompt(name: str) -> str:
 
 
 class LLMClient:
-    """OpenRouter client using the OpenAI-compatible Chat Completions API."""
+    """OpenAI-compatible Chat Completions client."""
 
-    def __init__(self, cfg: dict):
-        """Configure the OpenRouter-compatible client and request headers."""
+    def __init__(self, cfg: dict, api_key: str | None = None):
+        """Configure an OpenAI-compatible client without persisting credentials."""
         from openai import OpenAI
         self.cfg = cfg
-        if cfg.get("provider") != "openrouter": raise ValueError(f"Unsupported provider: {cfg.get('provider')}. Expected 'openrouter'.")
-        api_key = os.getenv("OPENROUTER_API_KEY")
-        if not api_key: raise RuntimeError("OPENROUTER_API_KEY is missing. Check the project .env file.")
+        provider = str(cfg.get("provider", "openrouter")).lower()
+        if provider not in {"openrouter", "openai", "custom", "local"}:
+            raise ValueError(f"Unsupported LLM provider: {provider}")
+        env_name = "OPENAI_API_KEY" if provider == "openai" else "OPENROUTER_API_KEY"
+        api_key = api_key or cfg.get("_session_api_key") or os.getenv(env_name)
+        if provider == "local" and not api_key:
+            api_key = "local-model"
+        if not api_key:
+            raise RuntimeError(f"{env_name} is missing. Configure a session key or the project environment.")
         headers = {}
-        if os.getenv("OPENROUTER_SITE_URL"): headers["HTTP-Referer"] = os.getenv("OPENROUTER_SITE_URL")
-        if os.getenv("OPENROUTER_APP_NAME"): headers["X-OpenRouter-Title"] = os.getenv("OPENROUTER_APP_NAME")
+        if provider == "openrouter" and os.getenv("OPENROUTER_SITE_URL"): headers["HTTP-Referer"] = os.getenv("OPENROUTER_SITE_URL")
+        if provider == "openrouter" and os.getenv("OPENROUTER_APP_NAME"): headers["X-OpenRouter-Title"] = os.getenv("OPENROUTER_APP_NAME")
         self.client = OpenAI(base_url=cfg.get("base_url", "https://openrouter.ai/api/v1"), api_key=api_key,
                              default_headers=headers or None)
 
-    def structured(self, system: str, user: str) -> dict:
-        """Call the LLM with a system/user prompt and parse the JSON output."""
-        response = self.client.chat.completions.create(
+    def _completion(self, system: str, user: str, *, mode: str):
+        """Return one provider response through a bounded structured-output strategy."""
+        if mode == "prompt":
+            system = (
+                system.rstrip()
+                + "\n\nReturn exactly one valid JSON object. Start with { and end with }. "
+                  "Do not include markdown, analysis, comments, or explanatory text."
+            )
+        kwargs = dict(
             model=self.cfg["model"], messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            max_tokens=self.cfg.get("max_tokens", 4096), temperature=self.cfg.get("temperature", 0.0),
-            response_format={"type": "json_object"}, extra_body={"provider": {"require_parameters": True}})
-        text = response.choices[0].message.content
-        if not text: raise ValueError(f"Model {self.cfg['model']} returned empty content")
-        return json.loads(text.strip().removeprefix("```json").removesuffix("```").strip())
+            max_tokens=self.cfg.get("max_tokens", 4096), temperature=self.cfg.get("temperature", 0.0))
+        if mode == "json":
+            kwargs["response_format"] = {"type": "json_object"}
+        elif mode == "tool":
+            kwargs["tools"] = [{
+                "type": "function",
+                "function": {
+                    "name": "submit_json",
+                    "description": "Submit the requested result as a JSON-encoded object.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "payload": {
+                                "type": "string",
+                                "description": "The complete requested JSON object encoded as a string.",
+                            }
+                        },
+                        "required": ["payload"],
+                        "additionalProperties": False,
+                    },
+                },
+            }]
+            kwargs["tool_choice"] = {
+                "type": "function", "function": {"name": "submit_json"}
+            }
+            kwargs["parallel_tool_calls"] = False
+        if self.cfg.get("provider") == "openrouter":
+            kwargs["extra_body"] = {
+                "provider": {"require_parameters": False},
+                "reasoning": {"effort": "low", "exclude": True},
+            }
+        return self.client.chat.completions.create(**kwargs)
+
+    @staticmethod
+    def _json_payload(response) -> dict:
+        """Parse the first JSON message from one provider response."""
+        if not getattr(response, "choices", None):
+            raise ValueError("The selected model returned no completion choices.")
+        choice = response.choices[0]
+        message = choice.message
+        parsed = getattr(message, "parsed", None)
+        if isinstance(parsed, dict):
+            return parsed
+        tool_calls = getattr(message, "tool_calls", None) or []
+        for call in tool_calls:
+            arguments = getattr(getattr(call, "function", None), "arguments", None)
+            if isinstance(arguments, str):
+                try:
+                    payload = json.loads(arguments)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict) and set(payload) == {"payload"}:
+                    nested = payload["payload"]
+                    if isinstance(nested, str):
+                        try:
+                            nested = json.loads(nested)
+                        except json.JSONDecodeError:
+                            continue
+                    payload = nested
+                if isinstance(payload, dict):
+                    return payload
+        content = getattr(message, "content", None)
+        if isinstance(content, list):
+            text = "\n".join(
+                str(item.get("text", "") if isinstance(item, dict) else getattr(item, "text", ""))
+                for item in content
+            )
+        else:
+            text = content
+        if not text:
+            finish_reason = getattr(choice, "finish_reason", None)
+            if finish_reason in {"length", "max_tokens"}:
+                raise ValueError(
+                    "The selected model exhausted its output-token budget before returning JSON."
+                )
+            raise ValueError("The selected model returned empty content instead of the required JSON.")
+        cleaned = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", str(text).strip(), flags=re.I)
+        decoder = json.JSONDecoder()
+        for index, character in enumerate(cleaned):
+            if character not in "{[":
+                continue
+            try:
+                payload, _ = decoder.raw_decode(cleaned[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                return payload
+        raise ValueError(
+            "The selected model returned text instead of the required JSON object. "
+            "Try the request again or choose a model that supports structured JSON output."
+        )
+
+    def _structured_response(self, system: str, user: str) -> tuple[dict, Any]:
+        """Try JSON mode, forced function calling, then a JSON-only prompt."""
+        failures = []
+        for mode in ("json", "tool", "prompt"):
+            try:
+                response = self._completion(system, user, mode=mode)
+                return self._json_payload(response), response
+            except Exception as exc:
+                failures.append(exc)
+        detail = str(failures[-1]) if failures else "unknown structured-output failure"
+        raise ValueError(
+            f"The selected model could not produce a JSON object after JSON mode, "
+            f"function-call, and prompt compatibility attempts: {detail}"
+        ) from failures[-1]
+
+    def structured(self, system: str, user: str) -> dict:
+        """Call the LLM and parse JSON across OpenAI-compatible provider variants."""
+        return self._structured_response(system, user)[0]
+
+    def probe(self, system: str, user: str) -> tuple[dict, str]:
+        """Return a parsed probe plus the model identifier reported by the provider."""
+        payload, response = self._structured_response(system, user)
+        return payload, str(getattr(response, "model", self.cfg["model"]))
+
+    def list_models(self) -> list[str]:
+        """Return model IDs exposed by the configured OpenAI-compatible endpoint."""
+        response = self.client.models.list()
+        return sorted({str(item.id) for item in response.data if getattr(item, "id", None)})
 
 
 class Orchestrator:
@@ -63,19 +191,47 @@ class Orchestrator:
 
     def parse_task(self, user_prompt: str) -> TaskSpec:
         """Parse a request and deterministically fill vague numeric defaults."""
-        defaults = {"n_facilities": self.cfg.get("optimization", {}).get("n_facilities", 8),
+        defaults = {"n_facilities": self.cfg.get("optimization", {}).get("n_facilities", 10),
                     "threshold_minutes": self.cfg.get("accessibility", {}).get("threshold_minutes", 15)}
         runtime = {"defaults": defaults, "value_profiles": self.cfg.get("value_profiles", {})}
         raw = self.llm.structured(load_prompt("task_parsing"),
                                   f"Runtime configuration: {json.dumps(runtime)}\nUser request: {user_prompt}")
+        explicit_facilities = re.search(
+            r"\b(?:select|choose|site|locate|open|recommend)\s+(?:up\s+to\s+)?(\d+)\b",
+            user_prompt, re.I,
+        ) or re.search(
+            r"\b(\d+)\s+(?:candidate\s+)?(?:cooling[- ]?)?"
+            r"(?:centers?|centres?|facilities|sites?)\b",
+            user_prompt, re.I,
+        )
+        if explicit_facilities:
+            raw["n_facilities"] = int(explicit_facilities.group(1))
         explicit_minutes = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:-\s*)?(?:minutes?|mins?)\b",
                                      user_prompt, re.I)
         if explicit_minutes: raw["threshold_minutes"] = float(explicit_minutes.group(1))
+        route_origin = raw.get("route_origin")
+        if not isinstance(route_origin, dict) or not str(route_origin.get("entity") or "").strip():
+            fallback_origin = route_origin_from_prompt(user_prompt)
+            route_origin = ({
+                "entity": fallback_origin, "context": "", "positional_hint": "",
+                "raw_text": fallback_origin, "source": "fallback",
+            } if fallback_origin else None)
+        if route_origin:
+            raw["route_origin"] = route_origin
+            raw["analysis_goal"] = "facility_siting"
+            raw["candidate_source"] = "osm"
+            if not explicit_facilities:
+                raw["n_facilities"] = defaults["n_facilities"]
+            raw["candidate_amenities"] = [
+                "library", "community_centre", "school", "sports_centre",
+                "arts_centre", "place_of_worship",
+            ]
         asks_for_count = re.search(r"\b(how many|minimum|fewest|least number|smallest number)\b", user_prompt, re.I)
         if raw.get("analysis_goal") == "minimum_facilities" and not asks_for_count:
             raw["analysis_goal"] = "facility_siting"
         nullable_defaults = {"intervention": "cooling_center", "analysis_goal": "facility_siting",
-                             "candidate_source": "osm", "candidate_amenities": ["library", "community_centre", "sports_centre", "arts_centre"],
+                             "candidate_source": "osm", "candidate_amenities": ["library", "community_centre", "school", "sports_centre", "arts_centre", "place_of_worship"],
+                             "route_origin": None,
                              "mobility_scenario": "walking", "recommended_mobility_scenario": None,
                              "recommended_value_profile": None, "recommendation_rationale": "",
                              "operating_window": None, "coverage_group": "all",
@@ -83,9 +239,18 @@ class Orchestrator:
                              "sensitivity_facility_counts": [],
                              "recommended_sensitivity_thresholds": [],
                              "recommended_sensitivity_facility_counts": [],
+                             "comparison_profiles": [],
                              "preference_question": "", "notes": ""}
         for field, default in nullable_defaults.items():
             if raw.get(field) is None: raw[field] = default
+        for field in ("notes", "recommendation_rationale", "preference_question"):
+            value = raw.get(field)
+            if isinstance(value, list):
+                raw[field] = "; ".join(str(item) for item in value if str(item).strip())
+            elif isinstance(value, dict):
+                raw[field] = json.dumps(value, sort_keys=True)
+            elif not isinstance(value, str):
+                raw[field] = "" if value is None else str(value)
         if not isinstance(raw.get("mobility_scenario"), str) or not raw["mobility_scenario"].strip():
             raw["mobility_scenario"] = "walking"
         for field in ("recommended_mobility_scenario", "recommended_value_profile",
@@ -97,10 +262,6 @@ class Orchestrator:
                       "recommended_sensitivity_facility_counts"):
             if raw.get(field) in (None, ""):
                 raw[field] = []
-        if not re.search(r"\bschools?\b", user_prompt, re.I):
-            raw["candidate_amenities"] = [
-                item for item in raw["candidate_amenities"] if item != "school"
-            ]
         equity_mode = re.search(
             r"\b(?:walk[-_ ]?drive[-_ ]?equity|car[- ]?(?:access|availability)[-_ ]?equity)\b",
             user_prompt, re.I,
@@ -124,13 +285,33 @@ class Orchestrator:
         elif not detected_modes:
             raw["mobility_scenario"] = "walking"
         applied = []
-        if isinstance(raw.get("n_facilities"), bool) or not isinstance(raw.get("n_facilities"), int):
+        count = raw.get("n_facilities")
+        if isinstance(count, float) and count.is_integer():
+            raw["n_facilities"] = int(count)
+        elif isinstance(count, bool) or not isinstance(count, int):
             raw["n_facilities"] = defaults["n_facilities"]; applied.append("n_facilities")
         threshold = raw.get("threshold_minutes")
         if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
             raw["threshold_minutes"] = defaults["threshold_minutes"]; applied.append("threshold_minutes")
         if applied: raw["notes"] = f"{raw.get('notes', '')} [runtime defaults: {', '.join(applied)}]".strip()
         profiles, weights = runtime["value_profiles"], raw.get("weights")
+        normalized_prompt = re.sub(r"[-_]+", " ", user_prompt.lower())
+        mentioned_profiles = [
+            name for name, profile in profiles.items()
+            if re.sub(r"[-_]+", " ", name.lower()) in normalized_prompt
+            or re.sub(r"[-_]+", " ", str(profile.get("label", name)).lower()) in normalized_prompt
+        ]
+        if raw.get("analysis_goal") == "scenario_comparison":
+            selected_profiles = list(dict.fromkeys(mentioned_profiles))
+            compares_efficiency_equity = (
+                re.search(r"\b(efficien(?:cy|t)|coverage|access)\b", normalized_prompt)
+                and re.search(r"\b(equit(?:y|able)|inequal(?:ity)?|gini|fairness)\b", normalized_prompt)
+            )
+            if len(selected_profiles) < 2 and compares_efficiency_equity:
+                selected_profiles = [
+                    name for name in ("efficiency_first", "equity_first") if name in profiles
+                ]
+            raw["comparison_profiles"] = selected_profiles
         profile_by_weights = {
             json.dumps(profile["weights"], sort_keys=True): name
             for name, profile in profiles.items()
@@ -181,7 +362,8 @@ class Orchestrator:
         elif step.tool == "optimize_sites":
             args.update(n_facilities=task.n_facilities, threshold_minutes=task.threshold_minutes,
                         weights=task.weights.model_dump() if task.weights else None,
-                        coverage_target=task.coverage_target, coverage_group=task.coverage_group)
+                        coverage_target=task.coverage_target, coverage_group=task.coverage_group,
+                        facility_capacity=task.facility_capacity, equity_alpha=task.equity_alpha)
         elif step.tool == "find_minimum_facilities":
             args.update(threshold_minutes=task.threshold_minutes,
                         coverage_target=task.coverage_target if task.coverage_target is not None else 1.0,
@@ -198,7 +380,13 @@ class Orchestrator:
                 facility_counts=task.sensitivity_facility_counts or [task.n_facilities],
                 weights=task.weights.model_dump() if task.weights else None,
                 coverage_group=task.coverage_group,
+                facility_capacity=task.facility_capacity,
             )
+        elif step.tool == "compare_value_profiles":
+            args.update(profiles=task.comparison_profiles,
+                        n_facilities=task.n_facilities,
+                        threshold_minutes=task.threshold_minutes,
+                        facility_capacity=task.facility_capacity)
         return PlanStep(tool=step.tool, args=args, rationale=step.rationale)
 
     def _normalize_plan_payload(self, payload: dict) -> dict:
@@ -240,6 +428,10 @@ class Orchestrator:
         payload = self.llm.structured(load_prompt("action_selection"), json.dumps(state))
         if "kind" not in payload and "action" in payload: payload["kind"] = payload.pop("action")
         if "tool" not in payload and "tool_name" in payload: payload["tool"] = payload.pop("tool_name")
+        registered_names = {item["name"] for item in registry.describe()}
+        if payload.get("kind") in registered_names and not payload.get("tool"):
+            payload["tool"] = payload["kind"]
+            payload["kind"] = "tool"
         action = AgentAction(**payload)
         if action.kind == "tool":
             if not action.tool: raise ValueError("A tool action requires a registered tool name")
@@ -361,12 +553,19 @@ class Orchestrator:
             return "summarize_heat_exposure"
         if task.analysis_goal == "sensitivity_analysis":
             return "run_sensitivity_analysis" if self.ctx.has("travel") else None
+        if task.analysis_goal == "scenario_comparison":
+            if not self.ctx.has("travel"): return None
+            if not self.ctx.has("built_environment"): return "prepare_built_environment"
+            return "compare_value_profiles"
         if task.analysis_goal != "facility_siting": return None
         if task.coverage_target is not None and self.ctx.has("travel") and not self.ctx.has("analysis"):
             return "optimize_sites"
         if not self.ctx.has("analysis"): return None
         solution = self.ctx.get("analysis", {}).get("solution")
-        return "generate_outputs" if getattr(solution, "solver_status", None) in {"Optimal", "Feasible"} else None
+        if getattr(solution, "solver_status", None) not in {"Optimal", "Feasible"}: return None
+        if self.ctx.has("demand") and not self.ctx.has("built_environment"):
+            return "prepare_built_environment"
+        return "generate_outputs"
 
     def _complete_constraint_diagnostics(self, task: TaskSpec, results: list[ToolResult],
                                          steps: list[PlanStep]) -> None:
@@ -423,11 +622,14 @@ class Orchestrator:
             "solution": analysis["solution"].model_dump(mode="json"),
             "frontier": [{"alpha": p.alpha, "efficiency_metric": p.efficiency_metric,
                           "equity_metric": p.equity_metric,
+                          "population_weighted_gini": p.population_weighted_gini,
                           "covered_population": p.solution.covered_population} for p in analysis["frontier"]],
             "quality": self.ctx.get("quality", {}),
+            "vulnerability_analysis": self.ctx.get("vulnerability_analysis", {}),
+            "built_environment": self.ctx.get("built_environment", {}),
             "routing": self.ctx.get("travel", {}).get("routing_report", {}),
             "provenance": [p.model_dump(mode="json") for p in self.ctx.lineage],
-            "indicators_used": ["population_density", "elderly_ratio", "poverty_rate", "heat_exposure"],
+            "indicators_used": ["population_density", "elderly_ratio", "poverty_rate", "heat_exposure", "environment_burden", "vulnerability_score"],
         }
         self.ctx.record("explanation", "Requesting an evidence-grounded interpretation from the model.")
         narrative = ResultNarrative(**self.llm.structured(load_prompt("result_interpretation"), json.dumps(evidence)))
@@ -441,9 +643,11 @@ class Orchestrator:
             "task": task.model_dump(mode="json"),
             "sensitivity_results": self.ctx.get("sensitivity_results"),
             "quality": self.ctx.get("quality", {}),
+            "vulnerability_analysis": self.ctx.get("vulnerability_analysis", {}),
+            "built_environment": self.ctx.get("built_environment", {}),
             "routing": self.ctx.get("travel", {}).get("routing_report", {}),
             "provenance": [item.model_dump(mode="json") for item in self.ctx.lineage],
-            "indicators_used": ["population_density", "elderly_ratio", "poverty_rate", "heat_exposure"],
+            "indicators_used": ["population_density", "elderly_ratio", "poverty_rate", "heat_exposure", "environment_burden", "vulnerability_score"],
         }
         self.ctx.record("explanation", "Requesting an evidence-grounded sensitivity interpretation.")
         narrative = ResultNarrative(**self.llm.structured(
@@ -467,6 +671,34 @@ class Orchestrator:
         self.ctx.record("explanation", "Generated a concise heat-pattern interpretation.",
                         decision_summary=narrative.decision_summary, self_reflection=narrative.self_reflection)
         return narrative
+
+    def _completion_message(self, task: TaskSpec) -> str:
+        """Return a direct deterministic answer for bounded diagnostic goals."""
+        if task.analysis_goal == "heat_review" and self.ctx.has("heat_summary"):
+            summary = self.ctx.get("heat_summary")
+            top = summary.get("top_tracts", [])
+            if top:
+                row = top[0]
+                return (
+                    f"Tract {row.get('GEOID')} has the highest reported heat "
+                    f"exposure in this run at {float(row.get('heat_exposure')):.1f} C "
+                    f"among {summary.get('tracts_reviewed', 'the retained')} tracts."
+                )
+        if task.analysis_goal == "reachability_review" and self.ctx.has("reachability_analysis"):
+            summary = self.ctx.get("reachability_analysis")
+            hardest = summary.get("hardest_demand", [])
+            if hardest:
+                row = hardest[0]
+                minutes = row.get("nearest_minutes")
+                nearest = "unreachable in the computed matrix" if minutes is None else f"{float(minutes):.1f} minutes from its nearest candidate"
+                unserved = len(summary.get("unserved_demand_ids", []))
+                return (
+                    f"Tract {row.get('demand_id')} is the hardest to reach: it is {nearest}. "
+                    f"{unserved} demand unit(s) have no candidate within the confirmed "
+                    f"{float(summary.get('threshold_minutes', task.threshold_minutes)):g}-minute threshold."
+                )
+        return f"{task.analysis_goal.replace('_', ' ')} completed."
+
     def run(self, task: TaskSpec, explain: bool = True) -> dict[str, Any]:
         """Observe results and select one bounded registered action at a time."""
         self.ctx.put("task", task)
@@ -478,7 +710,7 @@ class Orchestrator:
         for index in range(1, max_steps + 1):
             self.ctx.check_cancelled()
             if self.ctx.has(goal_handle):
-                ok = True; message = f"{task.analysis_goal.replace('_', ' ')} completed."
+                ok = True; message = self._completion_message(task)
                 self.ctx.record("decision", f"Verified completed result handle: {goal_handle}.",
                                 kind="finish", args={}, step_index=index, suggested_changes={})
                 break
@@ -542,6 +774,8 @@ class Orchestrator:
                             suggested_changes=recovery.suggested_changes)
 
         narrative = None
+        if ok:
+            self.ctx.progress("Finalizing: interpreting results", 0, 2, unit="stages")
         if ok and explain:
             try:
                 if self.ctx.has("analysis") and self.ctx.has("outputs"):
@@ -555,12 +789,17 @@ class Orchestrator:
                     from oasis.core.outputs.report import append_heat_narrative
                     append_heat_narrative(self.ctx.get("heat_summary")["report"], narrative)
             except Exception as exc: log.warning("result interpretation skipped: %s", exc)
+        if ok:
+            self.ctx.progress("Finalizing: packaging result", 1, 2, unit="stages")
         diagnostic_handles = ["constraint_validation", "minimum_facilities", "minimum_threshold",
-                              "reachability_analysis", "scenario_comparison", "sensitivity_results"]
+                              "reachability_analysis", "scenario_comparison", "sensitivity_results",
+                              "vulnerability_analysis"]
         diagnostics = {name: json.loads(json.dumps(self.ctx.get(name), default=lambda value: value.model_dump(mode="json")))
                        for name in diagnostic_handles if self.ctx.has(name)}
         plan = AgentPlan(steps=steps, reasoning="Actions were selected from observations one step at a time.")
         failed = next((result.tool for result in reversed(results) if not result.ok), None)
+        if ok:
+            self.ctx.progress("Run complete", 2, 2, unit="stages")
         return {"ok": ok, "paused": paused, "message": message,
                 "failed_tool": None if ok else (failed or ("hitl" if paused else "agent_loop")),
                 "plan": plan, "results": results, "lineage": self.ctx.lineage,

@@ -15,6 +15,7 @@ from oasis.core.cache import (
 from oasis.core.retry import RETRYABLE_STATUS, TransientError, with_retry
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 LEVEL_TYPES = {4: {"state"}, 6: {"county"}, 8: {"city", "town", "municipality", "village"}}
 
 
@@ -110,6 +111,281 @@ def search_place_candidates(place_name: str, limit: int = 5) -> list[dict]:
                             headers={"User-Agent": "oasis-agent/0.1"}, timeout=30)
     if response.status_code in RETRYABLE_STATUS: raise TransientError(f"Nominatim {response.status_code}")
     response.raise_for_status(); return response.json()
+
+
+@with_retry(max_retries=3)
+def search_origin_candidates(query: str, limit: int = 5) -> list[dict]:
+    """Geocode an address or named point for an on-demand route origin."""
+    query = query.strip()
+    if not query:
+        raise ValueError("route origin must not be empty")
+    params = {
+        "q": query, "format": "jsonv2",
+        "addressdetails": 1, "limit": limit,
+    }
+    key = hashlib.sha256(
+        json.dumps({**params, "q": query.casefold()}, sort_keys=True).encode()
+    ).hexdigest()[:16]
+    root = CACHE_DIR / "shared" / "nominatim_route_origins" / CACHE_VERSION
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"origin_{key}.json"
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    response = requests.get(
+        NOMINATIM_URL, params=params,
+        headers={"User-Agent": "oasis-agent/0.1"}, timeout=30,
+    )
+    if response.status_code in RETRYABLE_STATUS:
+        raise TransientError(f"Nominatim {response.status_code}")
+    response.raise_for_status()
+    rows = response.json()
+    atomic_write_text(path, json.dumps(rows))
+    return rows
+
+
+def _landmark_query_variants(query: str) -> list[str]:
+    """Expand conversational entrance phrases into geocoder-friendly landmarks."""
+    modifier = (
+        r"(?:main|principal|front|rear|north(?:ern)?|south(?:ern)?|"
+        r"east(?:ern)?|west(?:ern)?|north[- ]?east(?:ern)?|"
+        r"north[- ]?west(?:ern)?|south[- ]?east(?:ern)?|"
+        r"south[- ]?west(?:ern)?|[A-Z]\d*)"
+    )
+    access_word = r"(?:entrance|entry|exit|gate|door|access\s+point)"
+    cleaned = re.sub(
+        rf"^\s*(?:at\s+)?(?:the\s+)?(?:{modifier}\s+)?{access_word}"
+        rf"(?:\s+{modifier})?\s+(?:of|to)\s+",
+        "",
+        query,
+        flags=re.I,
+    ).strip(" ,")
+    variants: list[str] = []
+    match = re.fullmatch(r"(.+?)\s+in\s+(.+)", cleaned, flags=re.I)
+    landmark, context = (match.group(1).strip(), match.group(2).strip()) if match else (
+        cleaned, None
+    )
+    if context:
+        variants.extend((f"{landmark}, {context}", landmark))
+    else:
+        variants.append(landmark)
+    joined = re.sub(
+        r"\b([A-Za-z]+)\s+([A-Za-z]+)\s+((?:national\s+)?park)\b",
+        lambda item: f"{item.group(1)}{item.group(2)} {item.group(3)}",
+        landmark,
+        flags=re.I,
+    )
+    if joined.casefold() != landmark.casefold():
+        variants.append(f"{joined}, {context}" if context else joined)
+    variants.append(query.strip())
+    return list(dict.fromkeys(variant for variant in variants if variant))
+
+
+def resolve_origin_candidates(query: str, limit: int = 8) -> list[dict]:
+    """Resolve an origin from exact address to progressively broader context."""
+    park_intent = bool(re.search(r"\bpark\b", query, re.I))
+    fallback_rows: list[dict] = []
+    for variant in _landmark_query_variants(query):
+        rows = search_origin_candidates(variant, limit=limit)
+        if not rows:
+            continue
+        if park_intent:
+            preferred = [
+                row for row in rows
+                if str(row.get("type") or row.get("addresstype") or "").casefold()
+                in {"park", "nature_reserve", "protected_area"}
+            ]
+            if preferred:
+                return preferred
+            fallback_rows = fallback_rows or rows
+            continue
+        return rows
+    if fallback_rows and len([part for part in query.split(",") if part.strip()]) < 2:
+        return fallback_rows
+    parts = [part.strip() for part in query.split(",") if part.strip()]
+    if len(parts) < 2:
+        return []
+    subject, context_query = parts[0], ", ".join(parts[1:])
+    context_rows = search_origin_candidates(context_query, limit=limit)
+    context = next(
+        (row for row in context_rows
+         if row.get("address", {}).get("country_code") == "us"),
+        None,
+    )
+    if context is None:
+        return []
+    address = context.get("address", {})
+    state = address.get("state")
+    if not state:
+        return context_rows
+    locality = next(
+        (address.get(key) for key in ("city", "town", "village") if address.get(key)),
+        None,
+    )
+    county = address.get("county")
+    scopes: list[str] = []
+    for scope in (locality, county, state):
+        if scope and scope.casefold() not in {item.casefold() for item in scopes}:
+            scopes.append(scope)
+    variants = [
+        f"{subject}, {scope}, {state}" if scope != state else f"{subject}, {state}"
+        for scope in scopes
+    ]
+    without_number = re.sub(r"^\s*\d+[A-Za-z-]*\s+", "", subject).strip()
+    if without_number and without_number.casefold() != subject.casefold():
+        variants.extend(
+            f"{without_number}, {scope}, {state}"
+            if scope != state else f"{without_number}, {state}"
+            for scope in scopes
+        )
+    broadened: list[list[dict]] = []
+    for variant in variants:
+        rows = search_origin_candidates(variant, limit=limit)
+        if rows:
+            broadened.append(rows)
+            # Preserve the smallest successful unit; a street-level fallback is
+            # used only when the numbered address also has no match.
+            break
+    return _merge_candidates(*broadened) if broadened else context_rows
+
+
+@with_retry(max_retries=3)
+def reverse_origin_address(latitude: float, longitude: float) -> dict:
+    """Return a cached county-level address for a resolved origin coordinate."""
+    params = {
+        "lat": round(float(latitude), 6), "lon": round(float(longitude), 6),
+        "format": "jsonv2", "addressdetails": 1, "zoom": 10,
+    }
+    key = hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()[:16]
+    root = CACHE_DIR / "shared" / "nominatim_route_origins" / CACHE_VERSION
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"reverse_{key}.json"
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8")).get("address", {})
+    response = requests.get(
+        NOMINATIM_REVERSE_URL, params=params,
+        headers={"User-Agent": "oasis-agent/0.1"}, timeout=30,
+    )
+    if response.status_code in RETRYABLE_STATUS:
+        raise TransientError(f"Nominatim {response.status_code}")
+    response.raise_for_status()
+    payload = response.json()
+    atomic_write_text(path, json.dumps(payload))
+    return payload.get("address", {})
+
+
+def _route_parent(row: dict) -> tuple[str | None, str | None]:
+    """Resolve the smallest supported parent, including point reverse lookup."""
+    address = row.get("address", {})
+    locality = next(
+        (address.get(key) for key in ("city", "town", "municipality", "village") if address.get(key)),
+        None,
+    )
+    parent, state = locality or address.get("county"), address.get("state")
+    if parent and state:
+        return parent, state
+    latitude, longitude = row.get("lat"), row.get("lon")
+    if latitude is None or longitude is None:
+        return parent, state
+    try:
+        reverse = reverse_origin_address(float(latitude), float(longitude))
+    except (requests.RequestException, TransientError, ValueError, json.JSONDecodeError):
+        return parent, state
+    reverse_locality = next(
+        (reverse.get(key) for key in ("city", "town", "municipality", "village") if reverse.get(key)),
+        None,
+    )
+    return parent or reverse_locality or reverse.get("county"), state or reverse.get("state")
+
+
+def infer_route_study_area(query: str) -> tuple[str, str]:
+    """Resolve a named route origin to its smallest supported US city or county."""
+    rows = resolve_origin_candidates(query)
+    row = next(
+        (item for item in rows if item.get("address", {}).get("country_code") == "us"),
+        None,
+    )
+    if row is None:
+        raise ValueError(
+            "The route origin could not be matched to a US city or county. "
+            "Enter the study city or county manually."
+        )
+    parent, state = _route_parent(row)
+    if not parent or not state:
+        raise ValueError(
+            "The route origin was found, but its city or county could not be identified. "
+            "Enter the study city or county manually."
+        )
+    label = row.get("display_name") or query
+    return label, f"{parent}, {state}, USA"
+
+
+def route_origin_options(
+    entity: str,
+    context: str = "",
+    positional_hint: str = "",
+    *,
+    fallback_language: bool = False,
+    limit: int = 8,
+) -> tuple[list[dict], bool]:
+    """Search a bounded origin interpretation and return ranked US choices."""
+    queries = [f"{entity}, {context}" if context else entity, entity]
+    groups = []
+    for query in dict.fromkeys(queries):
+        rows = (
+            resolve_origin_candidates(query, limit=limit)
+            if fallback_language else search_origin_candidates(query, limit=limit)
+        )
+        if rows:
+            groups.append(rows)
+    if not groups and context:
+        context_rows = search_origin_candidates(context, limit=limit)
+        if context_rows:
+            groups.append(context_rows)
+    rows = _merge_candidates(*groups)
+    admin_types = set().union(*LEVEL_TYPES.values())
+    preferred_types = {
+        "house": 0, "building": 0, "amenity": 0, "park": 0,
+        "nature_reserve": 0, "protected_area": 0, "tourism": 0,
+        "road": 1, "residential": 1,
+    }
+    rows.sort(key=lambda row: preferred_types.get(
+        str(row.get("type") or row.get("addresstype") or "").casefold(), 2
+    ))
+    choices = []
+    seen = set()
+    for index, row in enumerate(rows):
+        address = row.get("address", {})
+        if address.get("country_code") != "us":
+            continue
+        kind = str(row.get("addresstype") or row.get("type") or "location")
+        administrative = kind in admin_types
+        if administrative:
+            parent_place = canonical_place_name(row)
+        else:
+            parent, state = _route_parent(row)
+            if not parent or not state:
+                continue
+            parent_place = f"{parent}, {state}, USA"
+        display = str(row.get("display_name") or query)
+        longitude, latitude = row.get("lon"), row.get("lat")
+        identity = (display.casefold(), parent_place.casefold())
+        if identity in seen:
+            continue
+        seen.add(identity)
+        choices.append({
+            "candidate_id": str(index), "display_name": display,
+            "place_name": parent_place, "place_type": kind,
+            "entity": entity, "context": context,
+            "positional_hint": positional_hint,
+            "administrative": administrative,
+            "longitude": float(longitude) if longitude is not None else None,
+            "latitude": float(latitude) if latitude is not None else None,
+        })
+    short_admin_alias = bool(re.fullmatch(r"[A-Za-z]{2,3}", entity.strip()))
+    administrative_query = bool(choices) and (
+        short_admin_alias or all(choice["administrative"] for choice in choices)
+    )
+    return choices, administrative_query
 
 
 def cache_place_candidates(place_name: str, rows: list[dict], selected: dict, limit: int = 5) -> str:

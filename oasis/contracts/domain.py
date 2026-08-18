@@ -6,11 +6,12 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ValueWeights(BaseModel):
-    """Weights for the four registered siting indicators."""
+    """User-confirmed weights for registered siting indicators."""
     population_density: float = 0.4
     elderly_ratio: float = 0.2
     poverty_rate: float = 0.2
     heat_exposure: float = 0.2
+    environment_burden: float = 0.0
 
     @field_validator("*")
     @classmethod
@@ -48,6 +49,16 @@ class OperatingWindow(BaseModel):
 MobilityScenario = Literal["walking", "cycling", "driving", "walk_drive_equity"]
 
 
+class RouteOriginSpec(BaseModel):
+    """Bounded landmark interpretation produced by the language model."""
+
+    entity: str = Field(min_length=1)
+    context: str = ""
+    positional_hint: str = ""
+    raw_text: str = ""
+    source: Literal["llm", "fallback"] = "llm"
+
+
 class TaskSpec(BaseModel):
     """Structured, human-confirmable task extracted from natural language."""
     place_name: str = Field(..., description="Geocodable US city or county")
@@ -62,17 +73,31 @@ class TaskSpec(BaseModel):
     recommended_value_profile: str | None = None
     recommendation_rationale: str = ""
     operating_window: OperatingWindow | None = None
-    n_facilities: int = Field(8, ge=1, le=100)
+    n_facilities: int = Field(10, ge=1, le=100)
     threshold_minutes: float = Field(15.0, gt=0)
+    facility_capacity: float | None = Field(
+        None, gt=0, description="Optional people served per selected facility"
+    )
+    equity_alpha: float | None = Field(
+        None, ge=0.0, le=1.0,
+        description="Optional human-confirmed efficiency versus access-equality trade-off",
+    )
     coverage_target: float | None = Field(None, ge=0.0, le=1.0)
     coverage_group: Literal["all", "vulnerable"] = "all"
     weights: ValueWeights | None = None
-    candidate_amenities: list[str] = Field(default_factory=lambda: ["library", "community_centre", "sports_centre", "arts_centre"])
+    candidate_amenities: list[str] = Field(default_factory=lambda: [
+        "library", "community_centre", "school", "sports_centre",
+        "arts_centre", "place_of_worship",
+    ])
+    route_origin: RouteOriginSpec | None = Field(
+        None, description="Structured point to plan from after candidate selection"
+    )
     regional_requirements: list[RegionalRequirement] = Field(default_factory=list)
     sensitivity_thresholds: list[float] = Field(default_factory=list, max_length=12)
     sensitivity_facility_counts: list[int] = Field(default_factory=list, max_length=12)
     recommended_sensitivity_thresholds: list[float] = Field(default_factory=list, max_length=12)
     recommended_sensitivity_facility_counts: list[int] = Field(default_factory=list, max_length=12)
+    comparison_profiles: list[str] = Field(default_factory=list, max_length=6)
     preference_question: str = ""
     notes: str = ""
 
@@ -93,6 +118,12 @@ class TaskSpec(BaseModel):
         if any(value < 1 or value > 100 for value in values):
             raise ValueError("sensitivity facility counts must be in [1,100]")
         return list(dict.fromkeys(int(value) for value in values))
+
+    @model_validator(mode="after")
+    def _compatible_optimization_controls(self) -> "TaskSpec":
+        if self.equity_alpha is not None and self.coverage_target is not None:
+            raise ValueError("equity_alpha cannot be combined with a hard coverage_target")
+        return self
 
     def is_complete(self) -> bool:
         """Return whether all human value judgments have been supplied."""
@@ -159,6 +190,13 @@ class SiteSolution(BaseModel):
     covered_population: float
     covered_ratio: float
     vulnerable_covered_ratio: float
+    population_weighted_access_gini: float | None = None
+    mean_access_score: float = 0.0
+    gradual_coverage_ratio: float = 0.0
+    assigned_population: float = 0.0
+    facility_loads: dict[str, float] = Field(default_factory=dict)
+    facility_capacities: dict[str, float] = Field(default_factory=dict)
+    maximum_capacity_utilization: float | None = None
     mean_travel_minutes: float
     weights_used: ValueWeights | None
     solver_status: str
@@ -169,6 +207,7 @@ class ParetoPoint(BaseModel):
     alpha: float
     efficiency_metric: float
     equity_metric: float
+    population_weighted_gini: float | None = None
     solution: SiteSolution
 
 

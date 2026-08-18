@@ -5,20 +5,48 @@ import geopandas as gpd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
 import numpy as np
 
 from oasis.contracts.domain import ParetoPoint
 
 
 def pareto_chart(points: list[ParetoPoint], frontier: list[ParetoPoint], out_path: str) -> str:
-    """Render all swept solutions and their non-dominated frontier."""
+    """Show total coverage against access inequality for the existing coverage sweep."""
     fig, ax = plt.subplots(figsize=(6, 5))
-    ax.scatter([p.efficiency_metric for p in points],
-               [p.equity_metric for p in points], alpha=.35, label="swept solutions")
-    ax.plot([p.efficiency_metric for p in frontier],
-            [p.equity_metric for p in frontier], "-o", label="non-dominated frontier")
-    ax.set_xlabel("total population coverage"); ax.set_ylabel("vulnerable population coverage")
-    ax.set_title("Efficiency-Equity Trade-off Frontier"); ax.legend(); ax.grid(alpha=.3)
+    gini = np.array([
+        p.population_weighted_gini if p.population_weighted_gini is not None else np.nan
+        for p in points
+    ])
+    alpha = np.array([p.alpha for p in points])
+    valid = np.isfinite(gini)
+    scatter = ax.scatter(
+        np.array([p.efficiency_metric for p in points])[valid], gini[valid],
+        c=alpha[valid], cmap="viridis", alpha=.8, zorder=3,
+        label="efficiency--Gini solutions",
+    )
+    ordered = sorted((point for point in points if point.population_weighted_gini is not None), key=lambda point: point.alpha)
+    if ordered:
+        ax.plot(
+            [p.efficiency_metric for p in ordered], [p.population_weighted_gini for p in ordered],
+            color="#657b83", linewidth=1.2, alpha=.65, zorder=2, label="alpha sweep order",
+        )
+    frontier_ids = {id(point) for point in frontier}
+    highlighted = [point for point in points if id(point) in frontier_ids and point.population_weighted_gini is not None]
+    if highlighted:
+        ax.scatter(
+            [p.efficiency_metric for p in highlighted], [p.population_weighted_gini for p in highlighted],
+            facecolors="none", edgecolors="#17211d", linewidths=1.4, s=70,
+            zorder=4, label="coverage frontier points",
+        )
+    ax.set_xlabel("Population weighted gradual access (higher is better)")
+    ax.xaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=1))
+    ax.set_ylabel("Population weighted access Gini (lower is more equal)")
+    ax.set_title("Population Coverage vs Access Inequality")
+    ax.legend(fontsize=8); ax.grid(alpha=.3)
+    if valid.any():
+        colorbar = fig.colorbar(scatter, ax=ax)
+        colorbar.set_label("Gini emphasis alpha (higher prioritizes equality)")
     fig.tight_layout(); fig.savefig(out_path, dpi=150); plt.close(fig)
     return out_path
 
@@ -55,7 +83,7 @@ def heat_analysis_chart(tracts: gpd.GeoDataFrame, out_path: str, permutations: i
     fig, axes = plt.subplots(1, 2, figsize=(10, 4.2))
     axes[0].hist(values, bins=min(12, max(4, int(np.sqrt(len(values))))), color="#EF9F27", edgecolor="white")
     axes[0].axvline(stats["mean_c"], color="#185FA5", linestyle="--", label=f"Mean {stats['mean_c']:.1f} C")
-    axes[0].set(title="Tract heat-exposure distribution", xlabel="Mean land-surface temperature (C)", ylabel="Census tracts")
+    axes[0].set(title="Tract heat-exposure distribution", xlabel="Mean land-surface temperature (°C)", ylabel="Census tracts")
     axes[0].legend(frameon=False)
     finite = np.isfinite(lag)
     if stats["morans_i"] is None or not finite.any():
