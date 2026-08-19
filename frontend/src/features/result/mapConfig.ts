@@ -74,7 +74,8 @@ export function plannedRouteLayers() {
   const origin: CircleLayerSpecification = {
     id: MAP_LAYER_IDS.routeOrigin, type: "circle", source: ROUTE_SOURCE_ID,
     filter: ["==", ["get", "layer_kind"], "route_origin"],
-    paint: { "circle-radius": 7, "circle-color": "#f57c00",
+    paint: { "circle-radius": ["case", ["==", ["get", "outside_study_area"], true], 10, 7],
+      "circle-color": ["case", ["==", ["get", "outside_study_area"], true], "#c43d2f", "#f57c00"],
       "circle-stroke-color": "#ffffff", "circle-stroke-width": 2 },
   };
   return [route, origin];

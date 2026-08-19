@@ -127,6 +127,7 @@ def plan_point_to_nearest_site(
     timeout_s: float = 60,
     request_interval_s: float = 1.6,
     candidate_limit: int = 15,
+    study_boundary=None,
     cancel_check: Callable[[], None] | None = None,
 ) -> dict:
     """Shortlist nearby selected facilities, then find the network-nearest route."""
@@ -138,10 +139,11 @@ def plan_point_to_nearest_site(
         raise ValueError("the completed solution contains no selected candidate facilities")
     origin_point = gpd.points_from_xy([longitude], [latitude], crs="EPSG:4326")[0]
     tract = areas.loc[areas.geometry.covers(origin_point)]
-    if tract.empty:
+    coverage = study_boundary if study_boundary is not None else areas.geometry.union_all()
+    if not coverage.covers(origin_point):
         raise ValueError(
             "This origin is outside the current study area; select a point "
-            "inside one of the displayed Census tracts."
+            "inside the displayed study boundary."
         )
     api_key = os.getenv("ORS_API_KEY", "")
     if not api_key:

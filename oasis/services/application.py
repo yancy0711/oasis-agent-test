@@ -1065,6 +1065,8 @@ class OasisService:
     ) -> dict:
         """Plan a transient clicked-point route from the map currently visible to the user."""
         import geopandas as gpd
+        from shapely.geometry import Point, shape
+        from shapely.ops import unary_union
 
         snapshot = self.store.snapshot(run_id)
         map_path = self._visible_map_artifact(run_id)
@@ -1077,6 +1079,10 @@ class OasisService:
             feature for feature in payload.get("features", [])
             if feature.get("properties", {}).get("layer_kind") == "selected_site"
         ]
+        boundary_features = [
+            feature for feature in payload.get("features", [])
+            if feature.get("properties", {}).get("layer_kind") == "boundary"
+        ]
         if not tract_features or not site_features:
             raise ValueError("completed map does not contain tracts and selected candidate facilities")
         areas = gpd.GeoDataFrame.from_features(tract_features, crs="EPSG:4326")
@@ -1084,6 +1090,27 @@ class OasisService:
         candidates = gpd.GeoDataFrame.from_features(site_features, crs="EPSG:4326")
         candidates["cand_id"] = candidates["candidate_id"].astype(str)
         place_name = snapshot["task"]["place_name"]
+        study_boundary = unary_union([shape(feature["geometry"]) for feature in boundary_features]) \
+            if boundary_features else areas.geometry.union_all()
+        origin = Point(float(longitude), float(latitude))
+        if not study_boundary.covers(origin):
+            message = (
+                f"This location is outside the analyzed boundary for {place_name}. "
+                "The origin is shown briefly before the map returns to the study area."
+            )
+            return {
+                "type": "FeatureCollection",
+                "features": [{
+                    "type": "Feature",
+                    "geometry": {"type": "Point", "coordinates": [float(longitude), float(latitude)]},
+                    "properties": {"layer_kind": "route_origin", "outside_study_area": True},
+                }],
+                "summary": {
+                    "status": "outside_study_area", "message": message,
+                    "origin_label": "Selected origin", "origin_longitude": float(longitude),
+                    "origin_latitude": float(latitude), "study_area": place_name,
+                },
+            }
         accessibility = self.cfg.get("accessibility", {})
         with scoped_cache(place_name):
             return plan_point_to_nearest_site(
@@ -1095,12 +1122,14 @@ class OasisService:
                 timeout_s=accessibility.get("ors_timeout_s", 60),
                 request_interval_s=accessibility.get("ors_request_interval_s", 1.6),
                 candidate_limit=accessibility.get("point_route_candidate_limit", 15),
+                study_boundary=study_boundary,
             )
 
     def plan_place_route(self, run_id: str, query: str, mode: str) -> dict:
         """Geocode one US origin inside the displayed study area and plan its route."""
         import geopandas as gpd
-        from shapely.geometry import Point
+        from shapely.geometry import Point, shape
+        from shapely.ops import unary_union
 
         snapshot = self.store.snapshot(run_id)
         payload = json.loads(
@@ -1110,9 +1139,15 @@ class OasisService:
             feature for feature in payload.get("features", [])
             if feature.get("properties", {}).get("layer_kind") == "tract"
         ]
+        boundary_features = [
+            feature for feature in payload.get("features", [])
+            if feature.get("properties", {}).get("layer_kind") == "boundary"
+        ]
         if not tract_features:
             raise ValueError("the displayed map contains no Census tract geometry")
         areas = gpd.GeoDataFrame.from_features(tract_features, crs="EPSG:4326")
+        study_boundary = unary_union([shape(feature["geometry"]) for feature in boundary_features]) \
+            if boundary_features else areas.geometry.union_all()
         place_name = snapshot["task"]["place_name"]
         with scoped_cache(place_name):
             rows = search_origin_candidates(query)
@@ -1124,15 +1159,31 @@ class OasisService:
                 point = Point(float(row["lon"]), float(row["lat"]))
             except (KeyError, TypeError, ValueError):
                 continue
-            if areas.geometry.covers(point).any():
+            if study_boundary.covers(point):
                 matched = (row, point)
                 break
         if matched is None:
-            first = rows[0].get("display_name", query)
-            raise ValueError(
-                f"Location found ({first}), but it is outside the current study area "
-                f"({place_name}). Enter an address inside the displayed tracts."
+            row = rows[0]
+            point = Point(float(row["lon"]), float(row["lat"]))
+            first = row.get("display_name", query)
+            message = (
+                f"Location found ({first}), but it is outside the analyzed boundary for {place_name}. "
+                "The origin is shown briefly before the map returns to the study area."
             )
+            return {
+                "type": "FeatureCollection",
+                "features": [{
+                    "type": "Feature",
+                    "geometry": {"type": "Point", "coordinates": [float(point.x), float(point.y)]},
+                    "properties": {"layer_kind": "route_origin", "outside_study_area": True},
+                }],
+                "summary": {
+                    "status": "outside_study_area", "message": message,
+                    "origin_query": query, "origin_label": first,
+                    "origin_longitude": float(point.x), "origin_latitude": float(point.y),
+                    "origin_geocoder": "OpenStreetMap Nominatim", "study_area": place_name,
+                },
+            }
         row, point = matched
         result = self.plan_point_route(run_id, float(point.x), float(point.y), mode)
         result["summary"].update({

@@ -40,6 +40,31 @@ def test_point_route_rejects_origin_outside_tract_before_network(monkeypatch):
         )
 
 
+def test_point_route_accepts_origin_inside_boundary_but_outside_retained_tract(monkeypatch):
+    areas = gpd.GeoDataFrame(
+        {"GEOID": ["1"], "mean_lst": [35.0]},
+        geometry=[box(-112.1, 33.4, -112.0, 33.5)], crs="EPSG:4326",
+    )
+    sites = gpd.GeoDataFrame(
+        {"cand_id": ["site"], "name": ["Center"]},
+        geometry=[Point(-112.05, 33.45)], crs="EPSG:4326",
+    )
+    monkeypatch.setenv("ORS_API_KEY", "test")
+    monkeypatch.setattr("oasis.core.spatial.routes.post_ors", lambda *args, **kwargs: {"durations": [[600.0]]})
+    monkeypatch.setattr("oasis.core.spatial.routes._cached_route", lambda *args, **kwargs: ({
+        "type": "Feature", "geometry": {"type": "LineString", "coordinates": [[-112.15, 33.45], [-112.05, 33.45]]},
+        "properties": {"summary": {"duration": 600, "distance": 9000}},
+    }, "live"))
+
+    result = plan_point_to_nearest_site(
+        -112.15, 33.45, areas, sites, ["site"], mode="walking",
+        study_boundary=box(-112.2, 33.3, -111.9, 33.6),
+    )
+
+    assert result["summary"]["origin_geoid"] is None
+    assert result["summary"]["destination_id"] == "site"
+
+
 def test_active_heat_audit_is_explicitly_post_route(monkeypatch):
     areas = gpd.GeoDataFrame({"GEOID": ["1"], "mean_lst": [35.0]},
                              geometry=[box(-112.1, 33.4, -112.0, 33.5)], crs="EPSG:4326")

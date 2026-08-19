@@ -55,11 +55,29 @@ See [PIPELINE.md](PIPELINE.md) for the computational workflow.
 
 ## Requirements
 
-- Python 3.11
-- Node.js 22+
+- [Python 3.11](https://www.python.org/downloads/)
+- [Node.js 22+](https://nodejs.org/en/download)
 - GDAL-compatible geospatial libraries
-- CBC solver for PuLP
+- [CBC solver](https://github.com/coin-or/Cbc) for PuLP
 - Internet access for live data and routing
+
+If a system Python installation cannot resolve GDAL, use
+[Miniconda](https://www.anaconda.com/docs/getting-started/miniconda/install) and the environment steps below.
+
+## Data and API access
+
+| Service | Used for | Access |
+|---|---|---|
+| [US Census ACS 5-year API](https://www.census.gov/data/developers/data-sets/acs-5year.html) | Population and vulnerability indicators | [Request a Census API key](https://api.census.gov/data/key_signup.html) |
+| [US Census TIGER/Line](https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html) | Tract, block-group, city, and county geometry | Public download; no key |
+| [Microsoft Planetary Computer Landsat](https://planetarycomputer.microsoft.com/dataset/group/landsat) | LST, NDVI, NDBI, and albedo diagnostics | Public catalog; no key |
+| [WorldPop data](https://data.worldpop.org/GIS/Population/Global_2015_2030/) and [STAC API](https://api.stac.worldpop.org/api.html) | Optional 100 m population grid | Public download; no key for normal access |
+| [OpenStreetMap](https://www.openstreetmap.org/copyright) and [Nominatim](https://operations.osmfoundation.org/policies/nominatim/) | Candidate facilities and geocoding | Public service; follow usage policies |
+| [openrouteservice](https://api.openrouteservice.org/) | Network matrices and point routes | [Create an account and API key](https://openrouteservice.org/sign-up/) |
+| [Mapillary](https://www.mapillary.com/dashboard/developers) | Optional nearby street-level imagery | Register an app and copy its client token |
+| [OpenRouter](https://openrouter.ai/settings/keys) or [OpenAI](https://platform.openai.com/api-keys) | Optional language-model parsing and orchestration | Create a provider API key, or configure local Ollama |
+
+For a local language model, install [Ollama](https://ollama.com/download); OASIS does not download models automatically.
 
 Copy the environment template:
 
@@ -70,13 +88,14 @@ Copy-Item .env.example .env
 Relevant keys:
 
 ```dotenv
+OPENAI_API_KEY=
 OPENROUTER_API_KEY=
 ORS_API_KEY=
 CENSUS_API_KEY=
 MAPILLARY_ACCESS_TOKEN=
 ```
 
-Mapillary is optional. Register an application at https://www.mapillary.com/dashboard/developers and copy its client access token. Never commit the populated `.env`.
+Only configure the services you use. Mapillary and visitor-provided language models are optional. Never commit the populated `.env`.
 
 ## Install
 
@@ -140,17 +159,21 @@ python -m cli.main --mode pipeline --place "New York City" --n-facilities 12 --t
 python -m cli.main --mode agent --prompt "Select 10 candidate cooling facilities in Phoenix within a 15-minute walk."
 ```
 
+The default terminal view shows confirmation choices, a short success or failure summary, actionable warnings,
+and output locations. Add `--verbose` only when you need progress, network, or debugging logs.
+
+The CLI writes analysis artifacts but does not reproduce the browser's interactive maps, selectable Pareto points,
+comparison map, or point-route planner. Start the web application for those features.
+
 ## Outputs
 
 Web runs are stored under `outputs_run/api_runs/<run_id>/`. Outputs include MapLibre GeoJSON, charts, Markdown reports, provenance, progress, and run records.
 
-## Deployment and mobile
+## Deployment
 
 ```powershell
 docker compose up --build
 ```
-
-A phone is a browser client; data processing, optimization, API keys, and optional local models remain on a reachable backend. Local mobile testing requires the computer to stay on and be reachable over LAN or a secure tunnel. Public use requires a hosted backend/frontend.
 
 ## Verify
 

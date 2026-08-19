@@ -295,7 +295,7 @@ def test_point_route_uses_visible_quick_preview(tmp_path, monkeypatch, status):
         service.executor.shutdown(wait=True)
 
 
-def test_place_route_rejects_geocoded_origin_outside_study_area(tmp_path, monkeypatch):
+def test_place_route_returns_preview_for_geocoded_origin_outside_study_area(tmp_path, monkeypatch):
     service = _service(tmp_path, monkeypatch)
     run_id = "place-route"
     task = TaskSpec(place_name="Phoenix")
@@ -319,8 +319,9 @@ def test_place_route_rejects_geocoded_origin_outside_study_area(tmp_path, monkey
         lambda query: [{"display_name": "Hong Kong", "lon": "114.17", "lat": "22.32"}],
     )
     try:
-        with pytest.raises(ValueError, match="outside the current study area"):
-            service.plan_place_route(run_id, "Hong Kong", "walking")
+        result = service.plan_place_route(run_id, "Hong Kong", "walking")
+        assert result["summary"]["status"] == "outside_study_area"
+        assert result["features"][0]["geometry"]["coordinates"] == [114.17, 22.32]
     finally:
         service.executor.shutdown(wait=True)
 

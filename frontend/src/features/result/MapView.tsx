@@ -46,6 +46,7 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
   const routeManuallyMovedRef = useRef(false);
   const planAtRef = useRef<((longitude: number, latitude: number) => void) | null>(null);
   const autoRouteRef = useRef<string | null>(null);
+  const outsideReturnTimerRef = useRef<number | null>(null);
   const planningEnabledRef = useRef(false);
   const routeModeRef = useRef<RouteMode>("walking");
   const [data, setData] = useState<MapDataset | null>(null);
@@ -96,6 +97,10 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
     const map = mapRef.current;
     const source = map?.getSource(ROUTE_SOURCE_ID) as GeoJSONSource | undefined;
     if (!map || !source) throw new Error("The interactive map is not ready.");
+    if (outsideReturnTimerRef.current !== null) {
+      window.clearTimeout(outsideReturnTimerRef.current);
+      outsideReturnTimerRef.current = null;
+    }
     const origin: Feature<Point> = {
       type: "Feature", geometry: { type: "Point", coordinates: [longitude, latitude] },
       properties: { layer_kind: "route_origin" },
@@ -105,6 +110,31 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
     setRouteStatus(routeResultStatus(result));
     setRouteAudit(result.summary);
     setPlanningEnabled(false);
+  }, []);
+
+  const showRouteResult = useCallback((result: PlannedRoute, longitude: number, latitude: number) => {
+    if (result.summary.status !== "outside_study_area") {
+      showRoute(result, longitude, latitude);
+      return;
+    }
+    const map = mapRef.current;
+    const source = map?.getSource(ROUTE_SOURCE_ID) as GeoJSONSource | undefined;
+    if (!map || !source || !data) throw new Error("The interactive map is not ready.");
+    if (outsideReturnTimerRef.current !== null) window.clearTimeout(outsideReturnTimerRef.current);
+    source.setData(result);
+    map.flyTo({ center: [longitude, latitude], zoom: 11, duration: 650 });
+    setRouteStatus(String(result.summary.message ?? "This origin is outside the current study area."));
+    setRouteAudit(null);
+    setPlanningEnabled(false);
+    outsideReturnTimerRef.current = window.setTimeout(() => {
+      map.fitBounds(data.metadata.bounds, { padding: 30, duration: 700, maxZoom: 13 });
+      source.setData(EMPTY_ROUTE);
+      outsideReturnTimerRef.current = null;
+    }, 3000);
+  }, [data, showRoute]);
+
+  useEffect(() => () => {
+    if (outsideReturnTimerRef.current !== null) window.clearTimeout(outsideReturnTimerRef.current);
   }, []);
 
   useEffect(() => {
@@ -124,7 +154,7 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
       const longitude = Number(result.summary.origin_longitude);
       const latitude = Number(result.summary.origin_latitude);
       if (!Number.isFinite(longitude) || !Number.isFinite(latitude)) throw new Error("The geocoder returned an invalid origin coordinate.");
-      showRoute(result, longitude, latitude);
+      showRouteResult(result, longitude, latitude);
     }).catch((reason: unknown) => {
       if (autoRouteRef.current === autoRouteKey) {
         setRouteStatus(reason instanceof Error ? reason.message : "Could not plan from this location.");
@@ -132,7 +162,7 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
     }).finally(() => {
       if (autoRouteRef.current === autoRouteKey) setRouteBusy(false);
     });
-  }, [mapReady, routeOriginQuery, runId, showRoute, showRoutePlanner, url]);
+  }, [mapReady, routeOriginQuery, runId, showRoutePlanner, showRouteResult, url]);
 
   useEffect(() => {
     if (!url) { setData(null); return; }
@@ -178,7 +208,7 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
         setRouteBusy(true);
         setRouteStatus("Origin selected. Comparing network travel times to selected candidate facilities…");
         planPointRoute(runId, longitude, latitude, routeModeRef.current).then((result) => {
-          showRoute(result, longitude, latitude);
+          showRouteResult(result, longitude, latitude);
         }).catch((reason: unknown) => {
           setRouteStatus(reason instanceof Error ? reason.message : "Could not plan this route.");
         }).finally(() => setRouteBusy(false));
@@ -251,8 +281,16 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
         map.on("mouseleave", id, () => { map.getCanvas().style.cursor = planningEnabledRef.current ? "crosshair" : ""; });
       });
     });
-    return () => { mapSizeObserver.disconnect(); planAtRef.current = null; popup?.remove(); map.off("rotate", updateBearing); map.remove(); mapRef.current = null; setMapReady(false); setBearing(0); };
-  }, [data, focusTractId, runId, showRoute]);
+    return () => {
+      if (outsideReturnTimerRef.current !== null) {
+        window.clearTimeout(outsideReturnTimerRef.current);
+        outsideReturnTimerRef.current = null;
+      }
+      mapSizeObserver.disconnect(); planAtRef.current = null; popup?.remove();
+      map.off("rotate", updateBearing); map.remove(); mapRef.current = null;
+      setMapReady(false); setBearing(0);
+    };
+  }, [data, focusTractId, runId, showRouteResult]);
 
   useEffect(() => {
     const source = mapRef.current?.getSource(PARETO_SOURCE_ID) as GeoJSONSource | undefined;
@@ -320,7 +358,7 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
       if (!Number.isFinite(longitude) || !Number.isFinite(latitude)) {
         throw new Error("The geocoder returned an invalid origin coordinate.");
       }
-      showRoute(result, longitude, latitude);
+      showRouteResult(result, longitude, latitude);
     }).catch((reason: unknown) => {
       setRouteStatus(reason instanceof Error ? reason.message : "Could not plan from this location.");
     }).finally(() => setRouteBusy(false));

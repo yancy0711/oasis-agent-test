@@ -75,7 +75,14 @@ h2 { font-size: 1.28rem; }
 .prompt-label { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
 .prompt-label > label { margin: 0; }
 .prompt-label .info-label > span:first-child { display: none; }
-.prompt-examples { display: flex; flex-wrap: wrap; gap: 7px; margin: 0 0 10px; }
+.prompt-audience-tabs { display: flex; width: fit-content; max-width: 100%; padding: 4px; border: 1px solid #cfd9d2; border-radius: 12px; background: #f1f5f2; }
+.prompt-audience-tabs button { min-height: 36px; padding: 7px 13px; color: #526058; border-radius: 9px; background: transparent; font-size: .76rem; }
+.prompt-audience-tabs button.is-active { color: white; background: var(--green); box-shadow: 0 3px 9px rgba(25, 77, 58, .18); }
+.prompt-audience-panel { margin: 8px 0 11px; padding: 11px 12px; border-left: 3px solid #7d9f8e; border-radius: 0 9px 9px 0; background: rgba(255, 255, 255, .58); }
+.prompt-audience-for { display: block; margin-bottom: 3px; color: var(--green); font-size: .76rem; }
+.prompt-audience-panel > p { margin: 0 0 8px; color: #526058; font-size: .76rem; line-height: 1.45; }
+.prompt-audience-panel > .prompt-audience-note { margin: 8px 0 0; color: #8b4c21; }
+.prompt-examples { display: flex; flex-wrap: wrap; gap: 7px; margin: 0; }
 .prompt-examples button { padding: 6px 10px; color: var(--green); background: var(--green-soft); border-radius: 999px; font-size: .75rem; }
 .prompt-input label, .inline-form label { display: block; margin-bottom: 8px; font-size: .82rem; font-weight: 750; }
 .request-decision { display: grid; gap: 3px; margin-top: 12px; padding: 10px 12px; color: #155b38; border: 1px solid #b7d8c5; border-radius: 10px; background: #edf8f1; font-size: .78rem; }
@@ -407,6 +414,7 @@ th { color: var(--muted); background: #f4f7f4; text-transform: capitalize; }
 @media (max-width: 620px) {
   .app-shell { width: min(100% - 18px, 1500px); }
   .prompt-input__row, .inline-form, .form-grid { grid-template-columns: 1fr; }
+  .prompt-audience-tabs { display: grid; grid-template-columns: 1fr 1fr; width: 100%; }
   .field--wide { grid-column: auto; }
   .form-actions, .section-heading, .run-progress__labels, .progress-stats { align-items: stretch; flex-direction: column; }
   .metrics { grid-template-columns: 1fr; }
