@@ -93,7 +93,8 @@ def _gini_aware_solve(
         weights = (1.0 - alpha) * efficiency_weights + alpha * underserved
         if monotonic() >= deadline:
             break
-    assert best is not None
+    if best is None:
+        raise RuntimeError("Pareto search completed without a candidate solution")
     return _ParetoResult(index, alpha, best[2], best[3], best[4])
 
 

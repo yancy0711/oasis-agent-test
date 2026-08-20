@@ -31,7 +31,7 @@ from oasis.settings import load_profiles
 from oasis.core.outputs.report import render_diagnostic_report
 from oasis.core.data.geocoding import (AmbiguousPlaceError, cache_place_candidates,
                                        canonical_place_name, route_origin_options, search_origin_candidates,
-                                       select_place_candidate)
+                                       reverse_origin_address, select_place_candidate)
 from oasis.core.data.source_status import inspect_data_sources
 from oasis.core.data.official_resources import discover_official_resources
 from oasis.core.cache import scoped_cache
@@ -380,6 +380,67 @@ class OasisService:
         canonical = canonical_place_name(selected); cache_place_candidates(resolution["query"], rows, selected)
         return {**self._candidate(selected, index), "query": resolution["query"],
                 "canonical_name": canonical}
+
+    def reverse_route_origin(self, longitude: float, latitude: float) -> dict:
+        """Resolve one exact browser coordinate into supported parent boundaries."""
+        address = reverse_origin_address(latitude, longitude)
+        coordinate = f"{latitude:.5f}, {longitude:.5f}"
+        if str(address.get("country_code", "")).casefold() != "us":
+            return {
+                "outside_us": True,
+                "message": (
+                    f"Location received ({coordinate}), but it is outside the United States. "
+                    "Current-location routing is available only for US study areas."
+                ),
+                "candidates": [],
+            }
+        state = address.get("state")
+        if not state:
+            return {
+                "outside_us": False,
+                "message": f"Location received ({coordinate}), but its state could not be identified.",
+                "candidates": [],
+            }
+        candidates, seen = [], set()
+        for key in ("city", "town", "municipality", "village", "county"):
+            parent = address.get(key)
+            if not parent:
+                continue
+            place_name = f"{parent}, {state}, USA"
+            if place_name.casefold() in seen:
+                continue
+            seen.add(place_name.casefold())
+            candidates.append({
+                "candidate_id": hashlib.sha256(
+                    f"{longitude:.6f}:{latitude:.6f}:{place_name}".encode()
+                ).hexdigest()[:16],
+                "display_name": f"Current location ({coordinate})",
+                "place_name": place_name,
+                "place_type": key,
+                "entity": f"Current location ({coordinate})",
+                "context": place_name,
+                "positional_hint": "",
+                "administrative": False,
+                "longitude": float(longitude),
+                "latitude": float(latitude),
+            })
+        if not candidates:
+            return {
+                "outside_us": False,
+                "message": (
+                    f"Location received ({coordinate}), but no supported city or county "
+                    "boundary could be identified."
+                ),
+                "candidates": [],
+            }
+        return {
+            "outside_us": False,
+            "message": (
+                "Location found. Choose the smallest applicable city, town, village, "
+                "or county boundary."
+            ),
+            "candidates": candidates,
+        }
 
     def upload_candidates(self, filename: str, content: bytes) -> dict:
         """Store one CSV under an opaque ID and never expose its backend path."""
@@ -795,8 +856,8 @@ class OasisService:
                 )
             elif execution.accuracy == "network":
                 notice = (
-                    "> **Precise network result (ORS):** This report uses the completed "
-                    "ORS network travel-time matrix.\n\n"
+                    "**Precise network result (ORS):** Travel times use the completed "
+                    "OpenRouteService network matrix.\n\n"
                 )
             report.write_text(
                 notice + report.read_text(encoding="utf-8").rstrip() + section,

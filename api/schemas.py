@@ -87,6 +87,21 @@ class RouteOriginCandidate(BaseModel):
     latitude: float | None = None
 
 
+class CoordinateOriginRequest(BaseModel):
+    """Carry one browser geolocation coordinate for reverse resolution."""
+
+    longitude: float = Field(ge=-180, le=180)
+    latitude: float = Field(ge=-90, le=90)
+
+
+class CoordinateOriginResponse(BaseModel):
+    """Return supported US parent boundaries for one exact route origin."""
+
+    outside_us: bool
+    message: str
+    candidates: list[RouteOriginCandidate] = Field(default_factory=list)
+
+
 class ParseResponse(BaseModel):
     """Return one proposed task draft and its observable parse events."""
 

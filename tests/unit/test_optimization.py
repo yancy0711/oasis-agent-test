@@ -4,10 +4,16 @@ Purpose: (1) keep the solver verifiable; (2) show reviewers exactly which
 behaviors are guaranteed vs model-decided.
 """
 import numpy as np
+import pytest
 from oasis.contracts.domain import ValueWeights
 from oasis.core.optimization.models import (_solve_mclp_selection, build_demand_weights, gradual_coverage_matrix, population_weighted_gini,
                                        minimum_coverage_threshold, solve_lscp, solve_mclp)
 from oasis.core.optimization.pareto import coverage_pareto_sweep, non_dominated
+
+
+def test_value_weights_reject_values_outside_unit_interval():
+    with pytest.raises(ValueError, match=r"weights must be in \[0,1\]"):
+        ValueWeights(population_density=1.01)
 
 
 def test_mclp_prefers_high_weight_demand():

@@ -6,6 +6,7 @@ import { planPlaceRoute, planPointRoute, type PlannedRoute } from "../../api/cli
 import { BASE_MAP_STYLE, HEAT_COLORS, MAP_LAYER_IDS, MAP_SOURCE_ID, PARETO_SOURCE_ID, ROUTE_SOURCE_ID, paretoPreviewLayer, plannedRouteLayers, resultLayers } from "./mapConfig";
 import { popupContent } from "./mapPopup";
 import type { ParetoPoint } from "./ParetoView";
+import { useMediaQuery } from "../../hooks/useMediaQuery";
 
 interface MapMetadata {
   renderer: "maplibre";
@@ -15,7 +16,7 @@ interface MapMetadata {
   bounds: [[number, number], [number, number]];
 }
 interface MapDataset extends FeatureCollection { metadata: MapMetadata; }
-interface MapViewProps { url?: string; runId: string; paretoPreview?: ParetoPoint | null; onClearParetoPreview?: () => void; showRoutePlanner?: boolean; focusTractId?: string | null; routeOriginQuery?: string | null; }
+interface MapViewProps { url?: string; runId: string; paretoPreview?: ParetoPoint | null; onClearParetoPreview?: () => void; showRoutePlanner?: boolean; focusTractId?: string | null; routeOriginQuery?: string | null; routeOriginCoordinate?: { longitude: number; latitude: number } | null; }
 type LayerState = { tracts: boolean; boundary: boolean; route: boolean; sites: boolean };
 type RouteMode = "walking" | "cycling" | "driving";
 type PanelPosition = { x: number; y: number };
@@ -37,7 +38,7 @@ function RouteAudit({ summary }: { summary: Record<string, unknown> }) {
   return <section className="route-audit"><h4>Active route heat audit</h4><div><span>Network travel</span><strong>{duration.toFixed(1)} min</strong></div><div><span>Route mean LST</span><strong>{heat == null ? "Unavailable" : `${heat.toFixed(1)} °C`}</strong></div><div><span>LST × travel-time index</span><strong>{dose == null ? "Unavailable" : `${dose.toFixed(0)} °C·min`}</strong></div><p>{calculation ? `${calculation}. ` : ""}This is a comparative route index, not a temperature reading or physiological heat dose. It does not alter ORS routing or facility optimization.</p></section>;
 }
 
-export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showRoutePlanner = true, focusTractId = null, routeOriginQuery = null }: MapViewProps) {
+export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showRoutePlanner = true, focusTractId = null, routeOriginQuery = null, routeOriginCoordinate = null }: MapViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const routeControlRef = useRef<HTMLDivElement>(null);
@@ -49,6 +50,7 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
   const outsideReturnTimerRef = useRef<number | null>(null);
   const planningEnabledRef = useRef(false);
   const routeModeRef = useRef<RouteMode>("walking");
+  const mobile = useMediaQuery("(max-width: 620px)");
   const [data, setData] = useState<MapDataset | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [mapReady, setMapReady] = useState(false);
@@ -59,7 +61,7 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
   const [routeBusy, setRouteBusy] = useState(false);
   const [routeAudit, setRouteAudit] = useState<Record<string, unknown> | null>(null);
   const [originQuery, setOriginQuery] = useState("");
-  const [routeCollapsed, setRouteCollapsed] = useState(false);
+  const [routeCollapsed, setRouteCollapsed] = useState(mobile);
   const [routePosition, setRoutePosition] = useState<PanelPosition>(DEFAULT_ROUTE_POSITION);
   const [layers, setLayers] = useState<LayerState>({ tracts: true, boundary: true, route: true, sites: true });
 
@@ -73,7 +75,9 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
       const bounds = container.getBoundingClientRect();
       const panelRect = panel.getBoundingClientRect();
       setRoutePosition((current) => ({
-        x: Math.max(6, Math.min(current.x, bounds.width - panelRect.width - 6)),
+        x: mobile && !routeManuallyMovedRef.current
+          ? Math.max(6, (bounds.width - panelRect.width) / 2)
+          : Math.max(6, Math.min(current.x, bounds.width - panelRect.width - 6)),
         y: Math.max(6, Math.min(current.y, bounds.height - panelRect.height - 6)),
       }));
     };
@@ -85,7 +89,7 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
       observer.disconnect();
       window.removeEventListener("resize", clampPanel);
     };
-  }, [mapReady, routeCollapsed]);
+  }, [mapReady, mobile, routeCollapsed]);
 
   const routeResultStatus = (result: PlannedRoute) => {
     const summary = result.summary;
@@ -144,15 +148,21 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
 
   useEffect(() => {
     const query = routeOriginQuery?.trim();
-    const autoRouteKey = `${runId}:${url ?? ""}:${query}`;
-    if (!mapReady || !showRoutePlanner || !query || autoRouteRef.current === autoRouteKey) return;
+    const coordinate = routeOriginCoordinate;
+    const autoRouteKey = `${runId}:${url ?? ""}:${coordinate ? `${coordinate.longitude},${coordinate.latitude}` : query}`;
+    if (!mapReady || !showRoutePlanner || (!query && !coordinate) || autoRouteRef.current === autoRouteKey) return;
     autoRouteRef.current = autoRouteKey;
     setRouteBusy(true);
-    setRouteStatus(`Finding "${query}" and planning its nearest selected facility...`);
-    planPlaceRoute(runId, query, routeModeRef.current).then((result) => {
+    setRouteStatus(coordinate
+      ? "Planning from the confirmed browser location..."
+      : `Finding "${query}" and planning its nearest selected facility...`);
+    const request = coordinate
+      ? planPointRoute(runId, coordinate.longitude, coordinate.latitude, routeModeRef.current)
+      : planPlaceRoute(runId, query as string, routeModeRef.current);
+    request.then((result) => {
       if (autoRouteRef.current !== autoRouteKey) return;
-      const longitude = Number(result.summary.origin_longitude);
-      const latitude = Number(result.summary.origin_latitude);
+      const longitude = coordinate?.longitude ?? Number(result.summary.origin_longitude);
+      const latitude = coordinate?.latitude ?? Number(result.summary.origin_latitude);
       if (!Number.isFinite(longitude) || !Number.isFinite(latitude)) throw new Error("The geocoder returned an invalid origin coordinate.");
       showRouteResult(result, longitude, latitude);
     }).catch((reason: unknown) => {
@@ -162,7 +172,7 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
     }).finally(() => {
       if (autoRouteRef.current === autoRouteKey) setRouteBusy(false);
     });
-  }, [mapReady, routeOriginQuery, runId, showRoutePlanner, showRouteResult, url]);
+  }, [mapReady, routeOriginCoordinate, routeOriginQuery, runId, showRoutePlanner, showRouteResult, url]);
 
   useEffect(() => {
     if (!url) { setData(null); return; }
@@ -402,7 +412,19 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
       const routePanel = routeControlRef.current;
       const container = containerRef.current;
       if (routeManuallyMovedRef.current) return;
-      if (!layersPanel?.open) { setRoutePosition(DEFAULT_ROUTE_POSITION); return; }
+      if (!layersPanel?.open) {
+        if (mobile && routePanel && container) {
+          const bounds = container.getBoundingClientRect();
+          const routeRect = routePanel.getBoundingClientRect();
+          setRoutePosition({
+            x: Math.max(6, (bounds.width - routeRect.width) / 2),
+            y: DEFAULT_ROUTE_POSITION.y,
+          });
+        } else {
+          setRoutePosition(DEFAULT_ROUTE_POSITION);
+        }
+        return;
+      }
       if (!routePanel || !container) return;
       const layersRect = layersPanel.getBoundingClientRect();
       const routeRect = routePanel.getBoundingClientRect();
@@ -421,7 +443,7 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
   if (error) return <p className="error error--block">{error}</p>;
   const range = data?.metadata.value_range;
   const displayIndicator = data ? indicatorLabel(data.metadata.indicator_label) : "";
-  const routeWarning = !routeBusy && /outside the current study area|not found|denied|could not|failed|timed out|not available|invalid/i.test(routeStatus);
+  const routeWarning = !routeBusy && /outside the (?:current study area|analyzed boundary)|not found|denied|could not|failed|timed out|not available|invalid/i.test(routeStatus);
   return <div className="map-view">
     <div ref={containerRef} className="map-canvas" aria-label="Interactive analysis map" />
     {!data && <p className="map-loading">Loading interactive map…</p>}

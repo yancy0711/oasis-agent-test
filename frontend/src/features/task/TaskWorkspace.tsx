@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import type { PlaceResolveResponse, RouteOriginCandidate, RoutingMode, TaskSpec } from "../../api/models";
 import type { RequestDisposition } from "../../api/models";
 import { getConfig } from "../../api/client";
+import { reverseRouteOrigin } from "../../api/client";
 import { configKeys } from "../../api/queryKeys";
 import { useAppStore } from "../../store/appStore";
 import { useStartRun } from "../run/run.mutations";
@@ -13,6 +14,7 @@ import { PromptInput } from "./PromptInput";
 import { LlmSettings } from "./LlmSettings";
 import { TaskForm, type ValueProfile } from "./TaskForm";
 import { taskFromDraft, toTaskSpec } from "./taskForm.mapper";
+import { useMediaQuery } from "../../hooks/useMediaQuery";
 import type { TaskFormValues } from "./taskForm.schema";
 import {
   useConfirmPlace,
@@ -32,6 +34,8 @@ export function TaskWorkspace() {
   const [uploadedName, setUploadedName] = useState<string | null>(null);
   const [decision, setDecision] = useState<{ disposition: RequestDisposition; reason: string; alternative: string } | null>(null);
   const [draftLocked, setDraftLocked] = useState(false);
+  const mobile = useMediaQuery("(max-width: 620px)");
+  const [routeStepOpen, setRouteStepOpen] = useState(true);
   const parseController = useRef<AbortController | null>(null);
   const confirmedPlace = useAppStore((state) => state.confirmedPlace);
   const candidateUploadId = useAppStore((state) => state.candidateUploadId);
@@ -134,6 +138,8 @@ export function TaskWorkspace() {
         positional_hint: candidate.positional_hint,
         raw_text: current.route_origin?.raw_text ?? candidate.display_name,
         source: current.route_origin?.source ?? "llm",
+        longitude: candidate.longitude ?? current.route_origin?.longitude ?? null,
+        latitude: candidate.latitude ?? current.route_origin?.latitude ?? null,
       },
     } : current);
     const resolved = await resolve(candidate.place_name);
@@ -141,6 +147,90 @@ export function TaskWorkspace() {
       await confirmResolution(resolved, resolved.selected.candidate_id);
       setResolution(null);
     }
+  }
+
+  function useCurrentLocation() {
+    setConfirmedPlace(null);
+    setResolution(null);
+    setRouteOriginCandidates([]);
+    setSelectedRouteOriginId(null);
+    setDraftLocked(false);
+    if (!navigator.geolocation) {
+      setTask(null);
+      setDecision({
+        disposition: "out_of_scope",
+        reason: "This browser does not provide geolocation.",
+        alternative: "Use a browser with location access or choose the Landmark route example.",
+      });
+      return;
+    }
+    setDecision({
+      disposition: "needs_clarification",
+      reason: "Waiting for browser location permission.",
+      alternative: "",
+    });
+    navigator.geolocation.getCurrentPosition(
+      ({ coords }) => {
+        const coordinate = coords.latitude.toFixed(5) + ", " + coords.longitude.toFixed(5);
+        setDecision({
+          disposition: "needs_clarification",
+          reason: "Location received (" + coordinate + "). Identifying the smallest supported boundary.",
+          alternative: "",
+        });
+        void reverseRouteOrigin(coords.longitude, coords.latitude).then((result) => {
+          if (result.outside_us || !result.candidates.length) {
+            setTask(null);
+            setRouteOriginCandidates([]);
+            setDecision({
+              disposition: result.outside_us ? "out_of_scope" : "needs_clarification",
+              reason: result.message,
+              alternative: result.outside_us
+                ? "Choose a US landmark instead; no address entry is required for this result."
+                : "Choose a named US landmark or city.",
+            });
+            return;
+          }
+          const first = result.candidates[0];
+          setTask(taskFromDraft({
+            place_name: "",
+            route_origin: {
+              entity: first.entity,
+              context: first.context,
+              positional_hint: "",
+              raw_text: "Use my current location to find the nearest cooling facility.",
+              source: "fallback",
+              longitude: first.longitude,
+              latitude: first.latitude,
+            },
+            notes: "Browser location supplied by the user.",
+          }));
+          setRouteOriginCandidates(result.candidates);
+          setDecision({
+            disposition: "needs_clarification",
+            reason: result.message,
+            alternative: "The smallest supported administrative unit is listed first.",
+          });
+        }).catch((reason: unknown) => {
+          setTask(null);
+          setDecision({
+            disposition: "out_of_scope",
+            reason: reason instanceof Error ? reason.message : "Could not identify this location.",
+            alternative: "Choose a named US landmark instead.",
+          });
+        });
+      },
+      (reason) => {
+        setTask(null);
+        setDecision({
+          disposition: "out_of_scope",
+          reason: reason.code === 1
+            ? "Location permission was denied."
+            : "The browser could not determine the current location.",
+          alternative: "Allow location access or choose the Landmark route example.",
+        });
+      },
+      { enableHighAccuracy: true, timeout: 10000 },
+    );
   }
 
   function refineRouteOrigin(event: FormEvent) {
@@ -172,13 +262,16 @@ export function TaskWorkspace() {
         <p className="eyebrow">Policy and research decision support</p>
         <h1>OASIS: A bounded LLM agent for auditable, equity-aware cooling center siting</h1>
         <LlmSettings defaults={configQuery.data?.agent as Record<string, unknown> | undefined} />
-        <PromptInput pending={parseMutation.isPending} onSubmit={(prompt) => void analyze(prompt)} onCancel={cancelAnalysis} />
+        <PromptInput pending={parseMutation.isPending} onSubmit={(prompt) => void analyze(prompt)} onCancel={cancelAnalysis} onUseLocation={useCurrentLocation} />
         {decision && <div className={`request-decision request-decision--${decision.disposition}`} role="status"><strong>{decision.disposition.replaceAll("_", " ")}</strong><span>{decision.reason}</span>{decision.alternative && <span>{decision.alternative}</span>}</div>}
         {error && <p className="error error--block">{error instanceof Error ? error.message : "The request failed."}</p>}
       </section>
 
       {task && routeOriginCandidates.length > 0 && (
-        <section className="panel">
+        <details className="panel mobile-step-panel" data-study-area-step open={!mobile || routeStepOpen} onToggle={(event) => {
+          if (mobile) setRouteStepOpen(event.currentTarget.open);
+        }}>
+          <summary>
           <div className="section-heading">
             <div>
               <p className="eyebrow">Step 2 - Route origin</p>
@@ -188,6 +281,8 @@ export function TaskWorkspace() {
               {confirmedPlace ? "Origin selected" : "Confirmation required"}
             </span>
           </div>
+          </summary>
+          <div className="mobile-step-panel__body">
           <p className="muted">Choose an exact origin for route planning, or an administrative place to analyze as the study area.</p>
           <div className="candidate-list">
             {routeOriginCandidates.map((candidate) => (
@@ -204,11 +299,12 @@ export function TaskWorkspace() {
             <input id="origin-refinement" value={originRefinement} onChange={(event) => setOriginRefinement(event.target.value)} placeholder="For example, Walt Disney World, Florida" />
             <button type="submit" disabled={parseMutation.isPending || candidateSelectionLocked}>Search again</button>
           </form>
-        </section>
+          </div>
+        </details>
       )}
 
       {task && !task.place_name && routeOriginCandidates.length === 0 && (
-        <form className="panel inline-form" onSubmit={submitManualPlace}>
+        <form className="panel inline-form" data-study-area-step onSubmit={submitManualPlace}>
           <label htmlFor="manual-place">The request needs a US city or county</label>
           <input id="manual-place" value={manualPlace} onChange={(event) => setManualPlace(event.target.value)} />
           <button type="submit" disabled={resolveMutation.isPending}>Resolve place</button>

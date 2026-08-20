@@ -27,10 +27,6 @@ Candidate facilities are possible existing service locations, not confirmed cool
 ## Code layout
 
 ```text
-React UI -> FastAPI -> OasisService -> bounded LLM orchestration
-                                  -> deterministic GIS tools
-                                  -> data, optimization, maps, reports, provenance
-
 oasis-agent/
 |-- api/                 # FastAPI routes and HTTP schemas
 |-- cli/                 # Command-line entry and terminal confirmation
@@ -49,6 +45,7 @@ oasis-agent/
 |       `-- styles/      # Global responsive styling
 |-- tests/               # Unit and integration tests
 |-- experiments/         # Research evaluation scripts
+|-- notebooks/           # Minimal API-driven agent quickstart
 ```
 
 See [PIPELINE.md](PIPELINE.md) for the computational workflow.

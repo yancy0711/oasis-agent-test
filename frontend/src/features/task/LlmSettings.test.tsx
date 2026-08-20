@@ -19,7 +19,7 @@ describe("visitor model connection", () => {
     fireEvent.click(screen.getByRole("button", { name: "Model choices" }));
     fireEvent.change(screen.getByLabelText("Exact model ID"), { target: { value: "gpt-test" } });
     fireEvent.change(screen.getByLabelText("API key"), { target: { value: "visitor-secret" } });
-    fireEvent.click(screen.getByRole("button", { name: "Test and use connection" }));
+    fireEvent.click(screen.getByRole("button", { name: "Test connection" }));
     await waitFor(() => expect(screen.getByText(/gpt-test passed the OASIS task-structure check in 18 ms/)).toBeInTheDocument());
     expect(useAppStore.getState().llmSessionId).toBe("opaque-session");
     expect(screen.getByLabelText("API key")).toHaveValue("");

@@ -432,8 +432,29 @@ def select_place_candidate(place_name: str, expect_level: int | None = None) -> 
         if not rows: raise ValueError(f"No admin_level={expect_level} boundary matched '{place_name}'")
     elif "county" in place_name.lower(): rows = [row for row in rows if row.get("addresstype") == "county"] or rows
     if not rows: raise ValueError(f"No polygon boundary found for '{place_name}'")
-    allowed = set().union(*LEVEL_TYPES.values()) | {"country"}
-    viable = sorted([row for row in rows if row.get("addresstype") in allowed] or rows, key=_candidate_priority)
+    supported = LEVEL_TYPES[8] | {"county"}
+    viable = [row for row in rows if row.get("addresstype") in supported]
+    if not viable and expect_level is None:
+        fallback_queries = []
+        for row in rows:
+            address, state = row.get("address", {}), row.get("address", {}).get("state")
+            if not state:
+                continue
+            for key in ("city", "municipality", "town", "village", "county"):
+                parent = address.get(key)
+                query = f"{parent}, {state}" if parent else ""
+                if query and query.casefold() not in {item.casefold() for item in fallback_queries}:
+                    fallback_queries.append(query)
+        expanded = [search_place_candidates(query) for query in fallback_queries]
+        all_rows = _merge_candidates(all_rows, *expanded)
+        rows = [row for row in all_rows if row.get("geojson", {}).get("type") in {"Polygon", "MultiPolygon"}]
+        viable = [row for row in rows if row.get("addresstype") in supported]
+    if not viable:
+        raise ValueError(
+            f"No supported city or county boundary matched '{place_name}'. "
+            "Choose a city or county from the available location options."
+        )
+    viable = sorted(viable, key=_candidate_priority)
     if len(viable) > 1: raise AmbiguousPlaceError(place_name, viable)
     cache_place_candidates(place_name, all_rows, viable[0])
     return viable[0], viable

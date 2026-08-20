@@ -38,6 +38,20 @@ describe("prompt examples", () => {
     );
   });
 
+  it("offers current location before landmark routing and invokes geolocation", () => {
+    const locate = vi.fn();
+    render(<PromptInput pending={false} onSubmit={vi.fn()} onCancel={vi.fn()} onUseLocation={locate} />);
+    fireEvent.click(screen.getByRole("tab", { name: "Find a nearby facility" }));
+    const current = screen.getByRole("button", { name: "Use my location" });
+    const landmark = screen.getByRole("button", { name: "Landmark route" });
+    expect(current.compareDocumentPosition(landmark) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    fireEvent.click(current);
+    expect(locate).toHaveBeenCalledOnce();
+    expect(screen.getByLabelText("Describe the cooling-access question")).toHaveValue(
+      "Use my current location to find the nearest cooling facility.",
+    );
+  });
+
   it("submits the current prompt when Enter is pressed", () => {
     const submit = vi.fn();
     render(<PromptInput pending={false} onSubmit={submit} onCancel={vi.fn()} />);

@@ -1,0 +1,17 @@
+{
+  "name": "OASIS Cooling Access",
+  "short_name": "OASIS",
+  "description": "Auditable, equity-aware cooling facility access analysis",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#eef2ee",
+  "theme_color": "#194d3a",
+  "icons": [
+    {
+      "src": "/oasis-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

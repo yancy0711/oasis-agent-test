@@ -8,6 +8,7 @@ import type {
   OfficialResources,
   PlaceConfirmResponse,
   PlaceResolveResponse,
+  RouteOriginCandidate,
   RoutingMode,
   RunAccepted,
   RunRevisionRequest,
@@ -133,6 +134,29 @@ export async function confirmPlace(
     body: { resolution_id: resolutionId, candidate_id: candidateId },
   });
   return valueOrThrow(data, error, "Could not confirm the study area.");
+}
+
+export interface CoordinateOriginResult {
+  outside_us: boolean;
+  message: string;
+  candidates: RouteOriginCandidate[];
+}
+
+export async function reverseRouteOrigin(
+  longitude: number,
+  latitude: number,
+): Promise<CoordinateOriginResult> {
+  const response = await fetch("/api/v1/places/reverse-origin", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ longitude, latitude }),
+  });
+  if (!response.ok) {
+    let detail: unknown;
+    try { detail = await response.json(); } catch { detail = await response.text(); }
+    throw apiError(detail, "Could not identify the current location.");
+  }
+  return response.json() as Promise<CoordinateOriginResult>;
 }
 
 export async function uploadCandidates(file: File): Promise<UploadResponse> {

@@ -5,6 +5,7 @@ import type { RoutingMode, TaskSpec } from "../../api/models";
 import { InfoLabel } from "../../components/InfoLabel";
 import { CheckboxDropdown } from "../../components/CheckboxDropdown";
 import { CandidateUpload } from "./CandidateUpload";
+import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { useTaskEditor, type TaskEditorPatch } from "./TaskEditorContext";
 import { toTaskFormValues } from "./taskForm.mapper";
 import { taskFormSchema, type TaskFormValues } from "./taskForm.schema";
@@ -67,7 +68,14 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
     resolver: zodResolver(taskFormSchema), defaultValues: toTaskFormValues(task),
   });
   const editor = useTaskEditor();
+  const mobile = useMediaQuery("(max-width: 620px)");
+  const [mobileStepOpen, setMobileStepOpen] = useState(true);
+  const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false);
   useEffect(() => reset(toTaskFormValues(task)), [task, reset]);
+  useEffect(() => {
+    setMobileStepOpen(true);
+    setMobileSettingsOpen(false);
+  }, [task]);
   useEffect(() => {
     const apply = (patch: TaskEditorPatch) => Object.entries(patch).forEach(([key, value]) => setValue(key as keyof TaskFormValues, value as never, { shouldDirty: true, shouldValidate: true }));
     editor.register(apply); return () => editor.register(null);
@@ -83,6 +91,9 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
   const sensitivity = task.analysis_goal === "sensitivity_analysis";
   const comparison = task.analysis_goal === "scenario_comparison";
   const heatOnly = task.analysis_goal === "heat_review";
+  const facilityCount = watch("n_facilities");
+  const threshold = watch("threshold_minutes");
+  const mobility = watch("mobility_scenario");
   const allProfiles = [...profiles, ...QUICK_PROFILES.filter((quick) => !profiles.some((profile) => profile.name === quick.name))];
   const recommended = profiles.find((profile) => profile.name === task.recommended_value_profile);
 
@@ -95,7 +106,12 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
   }
 
   return <form className="panel" onSubmit={handleSubmit(onSubmit)}>
-    <div className="section-heading"><div><p className="eyebrow">Step 3 - Human confirmation</p><h2>Review the executable task</h2></div><span className="status">{task.analysis_goal.replaceAll("_", " ")}</span></div>
+    <details className="mobile-step-disclosure task-step-disclosure" open={!mobile || mobileStepOpen} onToggle={(event) => {
+      if (mobile) setMobileStepOpen(event.currentTarget.open);
+    }}>
+    <summary><span><span className="form-step">Step 3</span> Review the executable task</span></summary>
+    <div className="mobile-step-body">
+    <div className="section-heading task-step-heading"><div><p className="eyebrow">Step 3 - Human confirmation</p><h2>Review the executable task</h2></div><span className="status">{task.analysis_goal.replaceAll("_", " ")}</span></div>
 
     {(task.recommended_value_profile || task.recommended_mobility_scenario || task.recommended_sensitivity_thresholds?.length) ? <div className="recommendation-panel">
       <div><strong>Model recommendation</strong><p>{task.recommendation_rationale || "Review and explicitly apply the suggested settings."}</p></div>
@@ -104,6 +120,11 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
     {task.route_origin && <div className="route-request-notice"><strong>Route origin</strong><span>{task.route_origin.entity}{task.route_origin.context ? `, ${task.route_origin.context}` : ""}</span>{task.route_origin.positional_hint && <small>Position described by user: {task.route_origin.positional_hint}. The confirmed candidate supplies the route coordinate.</small>}<small>Confirm the inferred city or county and run the candidate selection. The Map tab will then plan to the network-nearest selected facility.</small></div>}
     {task.preference_question && <div className="preference-panel"><strong>{task.preference_question}</strong><div className="button-row">{QUICK_PROFILES.map((profile) => <button type="button" key={profile.name} onClick={() => applyProfile(profile)}>{profile.label}</button>)}</div></div>}
 
+    <details className="task-settings-disclosure" open={!mobile || mobileSettingsOpen} onToggle={(event) => {
+      if (mobile) setMobileSettingsOpen(event.currentTarget.open);
+    }}>
+      <summary><span>Analysis settings</span><small>{heatOnly ? "Heat diagnostic" : `${facilityCount} facilities - ${threshold} min - ${mobility.replaceAll("_", " ")}`}</small></summary>
+      <div className="task-settings-body">
     {!heatOnly && <>
       <div className="form-grid">
         <label className="field"><span>Facilities</span><input type="number" {...register("n_facilities", { valueAsNumber: true })} />{errors.n_facilities && <small className="error">{errors.n_facilities.message}</small>}</label>
@@ -135,7 +156,11 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
     <fieldset className="weights"><legend><InfoLabel label="Operating window">Filters candidate facilities using the selected local date and service hours; you can choose whether facilities with unknown hours remain eligible.</InfoLabel></legend><label className="check-row"><input type="checkbox" {...register("operating_window_enabled")} /><span>Filter candidate availability by local service hours</span></label>{hasWindow && <div className="form-grid form-grid--four"><label className="field"><span>Date</span><input type="date" {...register("service_date")} /></label><label className="field"><span>Start</span><input type="time" {...register("service_start")} /></label><label className="field"><span>End</span><input type="time" {...register("service_end")} />{errors.service_end && <small className="error">{errors.service_end.message}</small>}</label><label className="field"><InfoLabel label="Unknown hours">Controls whether candidate facilities without published opening hours remain eligible for the run.</InfoLabel><select aria-label="Unknown hours" {...register("unknown_policy")}><option value="include">Include</option><option value="exclude">Exclude</option></select></label></div>}</fieldset>
 
     {sensitivity && <fieldset className="weights"><legend>Sensitivity grid</legend><div className="form-grid"><div className="field"><span>Thresholds (minutes)</span><Controller control={control} name="sensitivity_thresholds" render={({ field }) => <NumberListEditor value={field.value} onChange={field.onChange} />} />{errors.sensitivity_thresholds && <small className="error">{errors.sensitivity_thresholds.message}</small>}</div><div className="field"><span>Facility counts</span><Controller control={control} name="sensitivity_facility_counts" render={({ field }) => <NumberListEditor integer value={field.value} onChange={field.onChange} />} /></div></div><small>Maximum 12 values per list and 36 experiments total.</small></fieldset>}
+      </div>
+    </details>
 
     <div className="form-actions"><span>{ready ? "The confirmed task is ready to run." : "Confirm a study area before running."}</span><button type="submit" disabled={!ready || pending || (source === "csv" && !uploadedName)}>{pending ? "Starting…" : "Run confirmed agent"}</button></div>
+    </div>
+    </details>
   </form>;
 }

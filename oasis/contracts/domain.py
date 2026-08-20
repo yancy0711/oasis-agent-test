@@ -17,7 +17,8 @@ class ValueWeights(BaseModel):
     @classmethod
     def _in_range(cls, v: float) -> float:
         """Reject value weights outside the closed unit interval."""
-        assert 0.0 <= v <= 1.0, "weights must be in [0,1]"
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("weights must be in [0,1]")
         return v
 
     def normalized(self) -> "ValueWeights":
@@ -57,6 +58,8 @@ class RouteOriginSpec(BaseModel):
     positional_hint: str = ""
     raw_text: str = ""
     source: Literal["llm", "fallback"] = "llm"
+    longitude: float | None = Field(None, ge=-180, le=180)
+    latitude: float | None = Field(None, ge=-90, le=90)
 
 
 class TaskSpec(BaseModel):

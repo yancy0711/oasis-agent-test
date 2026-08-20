@@ -249,7 +249,7 @@ def test_nyc_stays_city_without_canonical_state_expansion(monkeypatch):
     assert geocoding.canonical_place_name(selected) == "New York, New York, USA"
 
 def test_la_requires_hitl_without_hardcoded_selection(monkeypatch):
-    """Verify LA exposes city, county, and state candidates instead of guessing."""
+    """Verify LA exposes supported city and county candidates instead of guessing."""
     city = _candidate("Los Angeles, California, United States", "city")
     city["address"]["county"] = "Los Angeles County"
     county = _candidate("Los Angeles County, California, United States", "county")
@@ -262,7 +262,27 @@ def test_la_requires_hitl_without_hardcoded_selection(monkeypatch):
     monkeypatch.setattr(geocoding, "search_place_candidates", fake_search)
     monkeypatch.setattr(geocoding, "cache_place_candidates", lambda *args: pytest.fail("cached before HITL"))
     with pytest.raises(geocoding.AmbiguousPlaceError) as error: geocoding.select_place_candidate("LA")
-    assert [row["addresstype"] for row in error.value.candidates] == ["city", "county", "state"]
+    assert [row["addresstype"] for row in error.value.candidates] == ["city", "county"]
+
+
+def test_census_place_expands_to_supported_parent_boundary(monkeypatch):
+    """An unsupported census result is replaced by a city or county choice."""
+    census = _candidate("Port Ewen, New York, United States", "census", "New York")
+    census["address"].update({"town": "Port Ewen", "county": "Ulster County"})
+    county = _candidate("Ulster County, New York, United States", "county", "New York")
+    calls = []
+
+    def fake_search(query, *args):
+        calls.append(query)
+        return [county] if query.startswith("Ulster County") else [census]
+
+    monkeypatch.setattr(geocoding, "search_place_candidates", fake_search)
+    monkeypatch.setattr(geocoding, "cache_place_candidates", lambda *args: "test")
+    selected, candidates = geocoding.select_place_candidate("Port Ewen, New York, USA")
+    assert selected["addresstype"] == "county"
+    assert geocoding.canonical_place_name(selected) == "Ulster County, New York, USA"
+    assert all(row["addresstype"] in geocoding.LEVEL_TYPES[8] | {"county"} for row in candidates)
+    assert "Ulster County, New York" in calls
 
 
 def test_ambiguous_place_requires_noninteractive_confirmation(monkeypatch):

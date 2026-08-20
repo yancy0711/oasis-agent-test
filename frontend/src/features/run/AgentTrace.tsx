@@ -1,4 +1,6 @@
 import type { PublicAgentEvent } from "../../api/models";
+import { useState } from "react";
+import { useMediaQuery } from "../../hooks/useMediaQuery";
 
 interface AgentTraceProps {
   events: PublicAgentEvent[];
@@ -15,12 +17,19 @@ const TOOL_LABELS: Record<string, string> = {
 const readable = (value: string) => TOOL_LABELS[value] ?? value.replaceAll("_", " ");
 
 export function AgentTrace({ events }: AgentTraceProps) {
+  const mobile = useMediaQuery("(max-width: 620px)");
+  const [open, setOpen] = useState(false);
   return (
-    <section className="panel trace-panel">
+    <details className="panel trace-panel mobile-trace-disclosure" open={!mobile || open} onToggle={(event) => {
+      if (mobile) setOpen(event.currentTarget.open);
+    }}>
+      <summary>
       <div className="section-heading">
         <div><p className="eyebrow">Process</p><h2>Run activity</h2></div>
         <span className="status">{events.length} steps</span>
       </div>
+      </summary>
+      <div className="mobile-trace-body">
       {events.length === 0 ? (
         <p className="muted">Observable decisions will appear after execution begins.</p>
       ) : (
@@ -36,6 +45,7 @@ export function AgentTrace({ events }: AgentTraceProps) {
           ))}
         </ol>
       )}
-    </section>
+      </div>
+    </details>
   );
 }

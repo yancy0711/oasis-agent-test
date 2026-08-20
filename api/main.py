@@ -9,6 +9,7 @@ from api.schemas import (ParseRequest, ParseResponse, PlaceConfirmRequest,
                          RunSnapshotResponse, UiConfigResponse, UploadResponse,
                          PlaceRouteRequest, PointRouteRequest, PointRouteResponse,
                          DataSourceStatusResponse)
+from api.schemas import CoordinateOriginRequest, CoordinateOriginResponse
 from api.schemas import OfficialResourcesResponse
 from api.schemas import (LlmConnectionRequest, LlmConnectionResponse,
                          LlmModelsRequest, LlmModelsResponse, LlmSessionRevokeResponse)
@@ -117,6 +118,16 @@ def create_app(service: OasisService | None = None) -> FastAPI:
         """Confirm one candidate from a prior resolution."""
         try: return app.state.service.confirm_place(request.resolution_id, request.candidate_id)
         except KeyError as exc: raise HTTPException(404, str(exc)) from exc
+
+    @router.post("/places/reverse-origin", response_model=CoordinateOriginResponse)
+    def reverse_route_origin(request: CoordinateOriginRequest) -> dict:
+        """Resolve a browser coordinate into supported US city or county choices."""
+        try:
+            return app.state.service.reverse_route_origin(
+                request.longitude, request.latitude
+            )
+        except Exception as exc:
+            raise HTTPException(422, str(exc)) from exc
 
     @router.post("/uploads", response_model=UploadResponse)
     async def upload_candidates(file: UploadFile = File(...)) -> dict:

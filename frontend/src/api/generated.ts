@@ -822,6 +822,10 @@ export interface components {
             raw_text: string;
             /** @default llm */
             source: "llm" | "fallback";
+            /** Longitude */
+            longitude?: number | null;
+            /** Latitude */
+            latitude?: number | null;
         };
         /**
          * RegionalRequirement

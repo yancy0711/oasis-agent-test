@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { listLlmModels, revokeLlmSession, testLlmConnection, type LlmConnectionInput } from "../../api/client";
 import { CheckboxDropdown } from "../../components/CheckboxDropdown";
 import { useAppStore } from "../../store/appStore";
+import { useMediaQuery } from "../../hooks/useMediaQuery";
 
 type Provider = LlmConnectionInput["provider"];
 type ConnectionState = "idle" | "success" | "failure";
@@ -31,6 +32,8 @@ function modelGroup(model: string, provider: Provider, discovered: Set<string>) 
 }
 
 export function LlmSettings({ defaults }: { defaults?: Record<string, unknown> }) {
+  const mobile = useMediaQuery("(max-width: 620px)");
+  const [settingsOpen, setSettingsOpen] = useState(() => !mobile);
   const initialProvider = (["openai", "openrouter", "custom", "local"].includes(String(defaults?.provider)) ? String(defaults?.provider) : "openrouter") as Provider;
   const [provider, setProvider] = useState(initialProvider);
   const [baseUrl, setBaseUrl] = useState(String(defaults?.base_url || PRESETS[initialProvider].baseUrl));
@@ -126,7 +129,7 @@ export function LlmSettings({ defaults }: { defaults?: Record<string, unknown> }
   };
   const baseUrlHelp = provider === "openai" ? "Official API root; no editing is needed." : provider === "openrouter" ? "OpenRouter API root; no editing is needed." : provider === "local" ? "For Ollama running on this computer, use http://127.0.0.1:11434/v1." : "Enter the provider's OpenAI-compatible API root, normally an HTTPS address ending in /v1.";
 
-  return <details className="llm-settings" open>
+  return <details className="llm-settings" open={settingsOpen} onToggle={(event) => setSettingsOpen(event.currentTarget.open)}>
     <summary><span className="llm-settings__step">Preliminary setup</span><strong>Connect a language model</strong><span className="llm-settings__session">{sessionLabel ?? "server default"}</span></summary>
     <form onSubmit={test}>
       <p className="llm-settings__intro">Please set this before describing the task when you want to use your own model. Otherwise the configured server default is used.</p>
@@ -137,7 +140,7 @@ export function LlmSettings({ defaults }: { defaults?: Record<string, unknown> }
         <label className="field"><span>{provider === "local" ? "API key (optional)" : "API key"}</span><input aria-label={provider === "local" ? "API key (optional)" : "API key"} type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} /><small>The key is never saved in browser storage or run output.</small></label>
       </div>
       {provider === "local" && <section className="local-model-setup"><strong>Example setup (Windows PowerShell)</strong><p>Install Ollama, then download the model selected above. These are examples; OASIS does not download models.</p>{["winget install --id Ollama.Ollama -e", `ollama pull ${model || "qwen2.5:3b"}`].map((command) => <div className="copy-command" key={command}><code>{command}</code><button type="button" className="button--secondary" onClick={() => void copy(command)}>Copy{copiedCommand === command && <span className="copy-success" aria-label="Copied">{"\u2713"}</span>}</button></div>)}<p>Start Ollama, keep Base URL as <code>http://127.0.0.1:11434/v1</code>, leave API key empty, and check the installed model list.</p></section>}
-      <div className="button-row"><button type="button" className="button--secondary" onClick={() => void discover(false)} disabled={discovering || (provider !== "local" && provider !== "openrouter" && !apiKey.trim())}>{discovering ? <>Checking models<span className="animated-ellipsis" aria-label="in progress" /></> : provider === "local" ? "Check installed models" : provider === "openrouter" ? "Refresh model catalog" : "Check available models"}</button><button type="submit" disabled={pending || !model.trim() || (provider !== "local" && !apiKey.trim())}>{pending ? <>Testing connection<span className="animated-ellipsis" aria-label="in progress" /></> : "Test and use connection"}</button></div>
+      <div className="button-row"><button type="button" className="button--secondary" onClick={() => void discover(false)} disabled={discovering || (provider !== "local" && provider !== "openrouter" && !apiKey.trim())}>{discovering ? <>Checking models<span className="animated-ellipsis" aria-label="in progress" /></> : provider === "local" ? "Check installed models" : provider === "openrouter" ? "Refresh model catalog" : "Check available models"}</button><button type="submit" disabled={pending || !model.trim() || (provider !== "local" && !apiKey.trim())}>{pending ? <>Testing connection<span className="animated-ellipsis" aria-label="in progress" /></> : "Test connection"}</button></div>
       {message && <p className={`llm-connection-status llm-connection-status--${connectionState}`} aria-live="polite"><span aria-hidden="true">{connectionState === "success" ? "\u2713" : connectionState === "failure" ? "\u00d7" : "i"}</span>{message}</p>}
     </form>
   </details>;

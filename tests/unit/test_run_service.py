@@ -15,6 +15,34 @@ from oasis.services.application import OasisService
 from oasis.services.run_store import RunStore
 
 
+def test_browser_coordinate_returns_smallest_supported_us_parents_first(monkeypatch):
+    service = object.__new__(OasisService)
+    monkeypatch.setattr(
+        "oasis.services.application.reverse_origin_address",
+        lambda *_: {
+            "country_code": "us", "city": "New York", "county": "New York County",
+            "state": "New York",
+        },
+    )
+    result = service.reverse_route_origin(-73.985, 40.758)
+    assert result["outside_us"] is False
+    assert [item["place_type"] for item in result["candidates"]] == ["city", "county"]
+    assert result["candidates"][0]["place_name"] == "New York, New York, USA"
+    assert result["candidates"][0]["longitude"] == -73.985
+
+
+def test_browser_coordinate_outside_us_returns_no_address_prompt(monkeypatch):
+    service = object.__new__(OasisService)
+    monkeypatch.setattr(
+        "oasis.services.application.reverse_origin_address",
+        lambda *_: {"country_code": "hk", "city": "Hong Kong"},
+    )
+    result = service.reverse_route_origin(114.17, 22.3)
+    assert result["outside_us"] is True
+    assert result["candidates"] == []
+    assert "outside the United States" in result["message"]
+
+
 def test_public_llm_endpoints_are_fixed_or_explicitly_approved(monkeypatch):
     service = object.__new__(OasisService)
     service.cfg = {"llm": {"allowed_custom_hosts": []}}
