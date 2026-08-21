@@ -72,4 +72,25 @@ describe("facility-siting analysis", () => {
     fireEvent.click(screen.getByText("Missingness, collinearity, and weight-scheme details"));
     expect(screen.getByText("Weight sensitivity")).toBeInTheDocument();
   });
+
+  it("keeps an approximate complementary bound visible after precise refinement", () => {
+    const result = {
+      ok: true, paused: false,
+      message: "Precise ORS is infeasible at 15 minutes. The approximate screening bound is 131.6 minutes.",
+      task: taskFromDraft({ place_name: "Phoenix", analysis_goal: "minimum_facilities" }),
+      execution: { mode: "auto", phase: "precise", router_requested: "ors", router_used: "ors_sparse", accuracy: "network", status: "complete" },
+      diagnostics: {
+        minimum_facilities: { feasible: false, threshold_minutes: 15 },
+        minimum_threshold: { feasible: false },
+        approximate_minimum_threshold: {
+          feasible: true, minimum_threshold_minutes: 131.6, n_facilities: 10,
+          accuracy: "approximate_haversine",
+        },
+      },
+    } as RunResult;
+    render(<AnalysisView result={result} />);
+    expect(screen.getByText(/screening bound is 131.6 minutes/i)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Approximate complementary bound" })).toBeInTheDocument();
+    expect(screen.getByText(/not a precise network result/i)).toBeInTheDocument();
+  });
 });

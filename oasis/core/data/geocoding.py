@@ -330,6 +330,21 @@ def route_origin_options(
     """Search a bounded origin interpretation and return ranked US choices."""
     queries = [f"{entity}, {context}" if context else entity, entity]
     groups = []
+    exact_administrative: list[dict] = []
+    if not context and not positional_hint and len(entity.split()) >= 2:
+        try:
+            boundary_rows = search_place_candidates(entity, limit=limit)
+        except (requests.RequestException, TransientError, ValueError, json.JSONDecodeError):
+            # This optional exact-boundary probe must not block origin search.
+            boundary_rows = []
+        exact_administrative = [
+            row for row in boundary_rows
+            if row.get("address", {}).get("country_code") == "us"
+            and row.get("addresstype") in (LEVEL_TYPES[8] | {"county"})
+            and _compact(canonical_place_name(row).split(",", 1)[0]) == _compact(entity)
+        ]
+        if exact_administrative:
+            groups.append(exact_administrative)
     for query in dict.fromkeys(queries):
         rows = (
             resolve_origin_candidates(query, limit=limit)
@@ -342,6 +357,8 @@ def route_origin_options(
         if context_rows:
             groups.append(context_rows)
     rows = _merge_candidates(*groups)
+    if exact_administrative:
+        rows = exact_administrative
     admin_types = set().union(*LEVEL_TYPES.values())
     preferred_types = {
         "house": 0, "building": 0, "amenity": 0, "park": 0,
@@ -358,7 +375,11 @@ def route_origin_options(
         if address.get("country_code") != "us":
             continue
         kind = str(row.get("addresstype") or row.get("type") or "location")
-        administrative = kind in admin_types
+        # A fully named multiword city in a route request can serve as an
+        # approximate, user-confirmed origin at Nominatim's representative
+        # coordinate. Short aliases such as "DC" remain study-area queries.
+        exact_route_origin = bool(exact_administrative) and row in exact_administrative
+        administrative = kind in admin_types and not exact_route_origin
         if administrative:
             parent_place = canonical_place_name(row)
         else:
@@ -383,7 +404,8 @@ def route_origin_options(
         })
     short_admin_alias = bool(re.fullmatch(r"[A-Za-z]{2,3}", entity.strip()))
     administrative_query = bool(choices) and (
-        short_admin_alias or all(choice["administrative"] for choice in choices)
+        short_admin_alias
+        or all(choice["administrative"] for choice in choices)
     )
     return choices, administrative_query
 
@@ -425,7 +447,25 @@ def select_place_candidate(place_name: str, expect_level: int | None = None) -> 
                 expansions.append(search_place_candidates(", ".join(filter(None, (address["county"], address.get("state"))))))
         all_rows = _merge_candidates(all_rows, *expansions)
     rows = [row for row in all_rows if row.get("geojson", {}).get("type") in {"Polygon", "MultiPolygon"}]
-    rows = [row for row in rows if row.get("address", {}).get("country_code") == "us"] or rows
+    us_rows = [row for row in rows if row.get("address", {}).get("country_code") == "us"]
+    if rows and not us_rows:
+        raise ValueError(
+            f"'{place_name}' resolved outside the United States. "
+            "OASIS currently supports US city and county study areas only."
+        )
+    rows = us_rows
+    if not rows:
+        try:
+            unrestricted = search_origin_candidates(place_name, limit=5)
+        except (requests.RequestException, TransientError, ValueError, json.JSONDecodeError):
+            unrestricted = []
+        if unrestricted and not any(
+            row.get("address", {}).get("country_code") == "us" for row in unrestricted
+        ):
+            raise ValueError(
+                f"'{place_name}' resolved outside the United States. "
+                "OASIS currently supports US city and county study areas only."
+            )
     expected = LEVEL_TYPES.get(expect_level) if expect_level is not None else None
     if expected:
         rows = [row for row in rows if row.get("addresstype") in expected]

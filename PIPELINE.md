@@ -79,6 +79,7 @@ The additional agent-selectable tools are:
 | `find_minimum_facilities` | At a fixed threshold, what is the LSCP facility lower bound? |
 | `find_minimum_threshold` | At a fixed budget, what is the smallest matrix-supported feasible threshold? |
 | `analyze_reachability` | Which tracts are hardest, unserved, or structurally unreachable? |
+| `answer_result_queries` | Answer one or more typed, read-only tract questions and publish formula, terms, parameters, source fields, and top rows. |
 | `compare_scenarios` | How do the last two successful optimization scenarios differ? |
 
 ### Step 1: resolve the study area
@@ -237,15 +238,16 @@ data and compares the complete serialized `SiteSolution` objects.
 
 ```text
 user prompt
-  -> parse typed TaskSpec
-  -> confirm place and value judgments
+  -> parse against the TaskSpec JSON Schema
+  -> retain one primary analysis_goal, zero or more result_queries, all place_names, and typed ambiguities
+  -> confirm exactly one place and unresolved value judgments
   -> model selects one registered action
   -> deterministic tool returns a compact ToolResult
   -> model observes the result and selects the next action
-  -> finish, bounded repair, or HITL
+  -> finish only when the primary handle and every result query are complete; otherwise bounded repair or HITL
 ```
 
-`max_agent_steps` bounds total decisions, and `max_self_correction_rounds` bounds local retries. Repeating an identical failed call is blocked. Large data objects stay in `Context`; the model receives only handle names and compact summaries.
+`n_facilities` controls the decision budget; each `ResultQuery.limit` independently controls answer length. A single run owns one study boundary. Multiple extracted places require a user choice and should be run separately before comparison. `max_agent_steps` bounds total decisions, and `max_self_correction_rounds` bounds local retries. Repeating an identical failed call is blocked. Large data objects stay in `Context`; the model receives only handle names and compact summaries.
 
 For an infeasible fixed-budget request, the model can select LSCP, minimum-threshold search, or reachability analysis instead of silently changing a confirmed constraint.
 
@@ -265,4 +267,4 @@ fake = FakeLLM([
 ])
 ```
 
-Run all deterministic tests with `pytest tests -q`. Run `python -m experiments.evaluate_agent_behavior` to evaluate live model branching, diagnostic tool selection, and self-correction; this command uses the configured OpenRouter model.
+Run all deterministic tests with `pytest tests -q`. Run `python -m experiments.evaluate_agent_behavior` to evaluate live model branching, diagnostic tool selection, and self-correction; this command uses the configured language-model provider.

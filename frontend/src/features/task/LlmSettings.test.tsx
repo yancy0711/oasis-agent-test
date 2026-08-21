@@ -10,6 +10,25 @@ afterEach(() => {
 });
 
 describe("visitor model connection", () => {
+  it("uses the configured Gemini model as the default while preserving provider switching", () => {
+    render(<LlmSettings defaults={{
+      provider: "gemini", model: "gemini-3.5-flash-lite",
+      base_url: "https://generativelanguage.googleapis.com/v1beta/openai/",
+    }} />);
+    expect(screen.getByLabelText("Provider")).toHaveValue("gemini");
+    expect(screen.getByRole("button", { name: "Model choices" })).toHaveTextContent("gemini-3.5-flash-lite");
+    expect(screen.getByLabelText("Base URL")).toHaveValue("https://generativelanguage.googleapis.com/v1beta/openai/");
+    expect(screen.getByText(/availability is determined by the OASIS backend location/)).toBeInTheDocument();
+  });
+
+  it("keeps preset Base URLs editable for compatible gateways", () => {
+    render(<LlmSettings defaults={{ provider: "openrouter" }} />);
+    const input = screen.getByLabelText("Base URL");
+    expect(input).not.toBeDisabled();
+    fireEvent.change(input, { target: { value: "https://gateway.example/v1" } });
+    expect(input).toHaveValue("https://gateway.example/v1");
+  });
+
   it("stores only the opaque tested session in UI state", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
       session_id: "opaque-session", provider: "openai", model: "gpt-test", resolved_model: "gpt-test",

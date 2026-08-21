@@ -9,7 +9,7 @@ from api.schemas import (ParseRequest, ParseResponse, PlaceConfirmRequest,
                          RunSnapshotResponse, UiConfigResponse, UploadResponse,
                          PlaceRouteRequest, PointRouteRequest, PointRouteResponse,
                          DataSourceStatusResponse)
-from api.schemas import CoordinateOriginRequest, CoordinateOriginResponse
+from api.schemas import CoordinateOriginRequest, CoordinateOriginResponse, NamedOriginRequest
 from api.schemas import OfficialResourcesResponse
 from api.schemas import (LlmConnectionRequest, LlmConnectionResponse,
                          LlmModelsRequest, LlmModelsResponse, LlmSessionRevokeResponse)
@@ -128,6 +128,12 @@ def create_app(service: OasisService | None = None) -> FastAPI:
             )
         except Exception as exc:
             raise HTTPException(422, str(exc)) from exc
+
+    @router.post("/places/search-origin", response_model=CoordinateOriginResponse)
+    def search_route_origin(request: NamedOriginRequest) -> dict:
+        """Search a named point while preserving the already parsed route task."""
+        try: return app.state.service.search_route_origin(request.query)
+        except Exception as exc: raise HTTPException(422, str(exc)) from exc
 
     @router.post("/uploads", response_model=UploadResponse)
     async def upload_candidates(file: UploadFile = File(...)) -> dict:

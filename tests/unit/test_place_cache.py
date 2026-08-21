@@ -112,6 +112,47 @@ def test_short_administrative_route_query_becomes_study_area(monkeypatch):
     assert administrative is True
 
 
+def test_multiword_administrative_route_origin_prefers_exact_us_city(monkeypatch):
+    miami = _candidate("Miami Beach, Florida, United States", "city", "Florida")
+    wrong = _candidate("Port Ewen, Indiana, United States", "census", "Indiana")
+    monkeypatch.setattr(
+        geocoding, "search_place_candidates", lambda _query, limit=8: [miami],
+    )
+    monkeypatch.setattr(
+        geocoding, "resolve_origin_candidates", lambda _query, limit=8: [wrong],
+    )
+    choices, administrative = geocoding.route_origin_options(
+        "Miami Beach", fallback_language=True,
+    )
+    assert administrative is False
+    assert choices[0]["administrative"] is False
+    assert [choice["place_name"] for choice in choices] == ["Miami Beach, Florida, USA"]
+
+
+def test_non_us_polygon_is_rejected_before_boundary_confirmation(monkeypatch):
+    paris = {
+        "display_name": "Paris, Ile-de-France, France",
+        "addresstype": "city",
+        "geojson": {"type": "Polygon", "coordinates": []},
+        "address": {"city": "Paris", "country": "France", "country_code": "fr"},
+    }
+    monkeypatch.setattr(geocoding, "search_place_candidates", lambda *_args, **_kwargs: [paris])
+    with pytest.raises(ValueError, match="outside the United States"):
+        geocoding.select_place_candidate("Paris")
+
+
+def test_empty_us_search_checks_an_unrestricted_foreign_match(monkeypatch):
+    paris = {
+        "display_name": "Paris, Ile-de-France, France",
+        "addresstype": "city",
+        "address": {"city": "Paris", "country": "France", "country_code": "fr"},
+    }
+    monkeypatch.setattr(geocoding, "search_place_candidates", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(geocoding, "search_origin_candidates", lambda *_args, **_kwargs: [paris])
+    with pytest.raises(ValueError, match="outside the United States"):
+        geocoding.select_place_candidate("Paris, Ile-de-France, France")
+
+
 def test_route_origin_reverse_geocodes_parent_for_cross_county_landmark(monkeypatch):
     """A resolved landmark without an address county remains a usable route origin."""
     park = {

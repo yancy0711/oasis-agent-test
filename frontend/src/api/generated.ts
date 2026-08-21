@@ -224,6 +224,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/places/reverse-origin": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reverse Route Origin
+         * @description Resolve a browser coordinate into supported US city or county choices.
+         */
+        post: operations["reverse_route_origin_v1_places_reverse_origin_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/places/search-origin": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Search Route Origin
+         * @description Search a named point while preserving the already parsed route task.
+         */
+        post: operations["search_route_origin_v1_places_search_origin_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/uploads": {
         parameters: {
             query?: never;
@@ -388,10 +428,47 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * Ambiguity
+         * @description A typed uncertainty that must be confirmed instead of guessed.
+         */
+        Ambiguity: {
+            /**
+             * Field
+             * @enum {string}
+             */
+            field: "place_names" | "n_facilities" | "threshold_minutes" | "analysis_goal" | "mobility_scenario" | "result_queries";
+            /** Candidates */
+            candidates?: string[];
+            /** Question */
+            question: string;
+        };
         /** Body_upload_candidates_v1_uploads_post */
         Body_upload_candidates_v1_uploads_post: {
             /** File */
             file: string;
+        };
+        /**
+         * CoordinateOriginRequest
+         * @description Carry one browser geolocation coordinate for reverse resolution.
+         */
+        CoordinateOriginRequest: {
+            /** Longitude */
+            longitude: number;
+            /** Latitude */
+            latitude: number;
+        };
+        /**
+         * CoordinateOriginResponse
+         * @description Return supported US parent boundaries for one exact route origin.
+         */
+        CoordinateOriginResponse: {
+            /** Outside Us */
+            outside_us: boolean;
+            /** Message */
+            message: string;
+            /** Candidates */
+            candidates?: components["schemas"]["RouteOriginCandidate"][];
         };
         /**
          * DataSourceStatusResponse
@@ -467,7 +544,7 @@ export interface components {
              * Provider
              * @enum {string}
              */
-            provider: "openai" | "openrouter" | "custom" | "local";
+            provider: "gemini" | "openai" | "openrouter" | "custom" | "local";
             /** Base Url */
             base_url: string;
             /** Model */
@@ -508,7 +585,7 @@ export interface components {
              * Provider
              * @enum {string}
              */
-            provider: "openai" | "openrouter" | "custom" | "local";
+            provider: "gemini" | "openai" | "openrouter" | "custom" | "local";
             /** Base Url */
             base_url: string;
             /**
@@ -535,6 +612,14 @@ export interface components {
         LlmSessionRevokeResponse: {
             /** Revoked */
             revoked: boolean;
+        };
+        /**
+         * NamedOriginRequest
+         * @description Carry a user-entered route origin without reparsing the whole task.
+         */
+        NamedOriginRequest: {
+            /** Query */
+            query: string;
         };
         /**
          * OfficialResourcesResponse
@@ -630,29 +715,8 @@ export interface components {
             }[];
             /** Route Origin Candidates */
             route_origin_candidates?: components["schemas"]["RouteOriginCandidate"][];
-        };
-        /** RouteOriginCandidate */
-        RouteOriginCandidate: {
-            /** Candidate Id */
-            candidate_id: string;
-            /** Display Name */
-            display_name: string;
-            /** Place Name */
-            place_name: string;
-            /** Place Type */
-            place_type: string;
-            /** Entity */
-            entity: string;
-            /** @default */
-            context: string;
-            /** @default */
-            positional_hint: string;
-            /** Administrative */
-            administrative?: boolean;
-            /** Longitude */
-            longitude?: number | null;
-            /** Latitude */
-            latitude?: number | null;
+            /** Place Name Options */
+            place_name_options?: string[];
         };
         /**
          * PlaceCandidate
@@ -808,26 +872,6 @@ export interface components {
             };
         };
         /**
-         * RouteOriginSpec
-         * @description Bounded landmark interpretation produced by the language model.
-         */
-        RouteOriginSpec: {
-            /** Entity */
-            entity: string;
-            /** @default */
-            context: string;
-            /** @default */
-            positional_hint: string;
-            /** @default */
-            raw_text: string;
-            /** @default llm */
-            source: "llm" | "fallback";
-            /** Longitude */
-            longitude?: number | null;
-            /** Latitude */
-            latitude?: number | null;
-        };
-        /**
          * RegionalRequirement
          * @description Represent one user-stated minimum facility count in a named subarea.
          */
@@ -846,6 +890,107 @@ export interface components {
             decision_summary: string;
             /** Self Reflection */
             self_reflection: string;
+        };
+        /**
+         * ResultQuery
+         * @description One read-only question over computed results, separate from the decision budget.
+         */
+        ResultQuery: {
+            /**
+             * Metric
+             * @enum {string}
+             */
+            metric: "heat_exposure" | "vulnerability" | "access_disadvantage" | "combined_disadvantage" | "coverage_gap" | "unsupported";
+            /**
+             * Direction
+             * @default highest
+             * @enum {string}
+             */
+            direction: "highest" | "lowest";
+            /**
+             * Limit
+             * @default 5
+             */
+            limit: number;
+            /**
+             * Scope
+             * @default all
+             * @enum {string}
+             */
+            scope: "all" | "vulnerable";
+            /**
+             * Raw Text
+             * @default
+             */
+            raw_text: string;
+        };
+        /**
+         * RouteOriginCandidate
+         * @description Expose one ranked point or administrative interpretation of a route origin.
+         */
+        RouteOriginCandidate: {
+            /** Candidate Id */
+            candidate_id: string;
+            /** Display Name */
+            display_name: string;
+            /** Place Name */
+            place_name: string;
+            /** Place Type */
+            place_type: string;
+            /** Entity */
+            entity: string;
+            /**
+             * Context
+             * @default
+             */
+            context: string;
+            /**
+             * Positional Hint
+             * @default
+             */
+            positional_hint: string;
+            /**
+             * Administrative
+             * @default false
+             */
+            administrative: boolean;
+            /** Longitude */
+            longitude?: number | null;
+            /** Latitude */
+            latitude?: number | null;
+        };
+        /**
+         * RouteOriginSpec
+         * @description Bounded landmark interpretation produced by the language model.
+         */
+        RouteOriginSpec: {
+            /** Entity */
+            entity: string;
+            /**
+             * Context
+             * @default
+             */
+            context: string;
+            /**
+             * Positional Hint
+             * @default
+             */
+            positional_hint: string;
+            /**
+             * Raw Text
+             * @default
+             */
+            raw_text: string;
+            /**
+             * Source
+             * @default llm
+             * @enum {string}
+             */
+            source: "llm" | "fallback";
+            /** Longitude */
+            longitude?: number | null;
+            /** Latitude */
+            latitude?: number | null;
         };
         /**
          * RunAccepted
@@ -1096,9 +1241,15 @@ export interface components {
         TaskSpec: {
             /**
              * Place Name
-             * @description Geocodable US city or county
+             * @description One human-confirmed geocodable US city or county
+             * @default
              */
             place_name: string;
+            /**
+             * Place Names
+             * @description All city or county names extracted from the request; one must be confirmed per run
+             */
+            place_names?: string[];
             /**
              * Intervention
              * @default cooling_center
@@ -1110,7 +1261,7 @@ export interface components {
              * @default facility_siting
              * @enum {string}
              */
-            analysis_goal: "facility_siting" | "heat_review" | "minimum_facilities" | "minimum_threshold" | "reachability_review" | "scenario_comparison" | "sensitivity_analysis";
+            analysis_goal: "facility_siting" | "tract_review" | "heat_review" | "minimum_facilities" | "minimum_threshold" | "reachability_review" | "scenario_comparison" | "sensitivity_analysis";
             /**
              * Candidate Source
              * @default osm
@@ -1168,6 +1319,13 @@ export interface components {
             candidate_amenities?: string[];
             /** @description Structured point to plan from after candidate selection */
             route_origin?: components["schemas"]["RouteOriginSpec"] | null;
+            /**
+             * Result Queries
+             * @description Read-only questions answered after the primary deterministic analysis
+             */
+            result_queries?: components["schemas"]["ResultQuery"][];
+            /** Ambiguities */
+            ambiguities?: components["schemas"]["Ambiguity"][];
             /** Regional Requirements */
             regional_requirements?: components["schemas"]["RegionalRequirement"][];
             /** Sensitivity Thresholds */
@@ -1612,6 +1770,72 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PlaceConfirmResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reverse_route_origin_v1_places_reverse_origin_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CoordinateOriginRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CoordinateOriginResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    search_route_origin_v1_places_search_origin_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NamedOriginRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CoordinateOriginResponse"];
                 };
             };
             /** @description Validation Error */

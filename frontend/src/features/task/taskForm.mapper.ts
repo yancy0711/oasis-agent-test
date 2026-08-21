@@ -3,6 +3,7 @@ import type { TaskFormValues } from "./taskForm.schema";
 
 const DEFAULT_TASK: TaskSpec = {
   place_name: "", intervention: "cooling_center", analysis_goal: "facility_siting",
+  place_names: [], result_queries: [], ambiguities: [],
   candidate_source: "osm", mobility_scenario: "walking", recommendation_rationale: "",
   n_facilities: 10, threshold_minutes: 15, facility_capacity: null, coverage_group: "all",
   candidate_amenities: ["library", "community_centre", "school", "sports_centre", "arts_centre", "place_of_worship"],
@@ -50,7 +51,10 @@ export function toTaskFormValues(task: TaskSpec): TaskFormValues {
 export function toTaskSpec(draft: TaskSpec, values: TaskFormValues, confirmedPlace: string): TaskSpec {
   return {
     ...draft,
+    analysis_goal: values.analysis_goal as TaskSpec["analysis_goal"],
     place_name: confirmedPlace,
+    place_names: [confirmedPlace],
+    ambiguities: [],
     n_facilities: values.n_facilities,
     threshold_minutes: values.threshold_minutes,
     facility_capacity: values.facility_capacity_enabled ? values.facility_capacity : null,

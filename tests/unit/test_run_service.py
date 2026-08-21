@@ -15,6 +15,164 @@ from oasis.services.application import OasisService
 from oasis.services.run_store import RunStore
 
 
+class _ParseLLM:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def structured(self, _system, _user, schema=None):
+        assert schema and schema.get("title") == "TaskSpec"
+        return self.payload
+
+
+def _parse_service(payload) -> OasisService:
+    service = object.__new__(OasisService)
+    service.cfg = {
+        "optimization": {"n_facilities": 10},
+        "accessibility": {"threshold_minutes": 15},
+    }
+    service.profiles = {}
+    service.llm_factory = lambda: _ParseLLM(payload)
+    service.llm_sessions = {}
+    service.lock = threading.Lock()
+    return service
+
+
+def test_parse_requires_one_choice_when_the_model_extracts_multiple_places():
+    service = _parse_service({
+        "place_name": "Phoenix, Arizona, USA",
+        "place_names": ["Phoenix, Arizona, USA", "New York, New York, USA"],
+        "analysis_goal": "facility_siting",
+        "n_facilities": 10,
+        "ambiguities": [{
+            "field": "place_names",
+            "candidates": ["Phoenix, Arizona, USA", "New York, New York, USA"],
+            "question": "Which city should this run use?",
+        }],
+    })
+
+    result = service.parse("Select 10 candidate facilities in Phoenix and NYC.")
+
+    assert result["disposition"] == "needs_clarification"
+    assert result["place_name_options"] == ["Phoenix, Arizona, USA", "New York, New York, USA"]
+    assert "one study area" in result["message"]
+
+
+def test_parse_surfaces_typed_non_place_ambiguity_instead_of_guessing():
+    service = _parse_service({
+        "place_name": "Phoenix, Arizona, USA",
+        "place_names": ["Phoenix, Arizona, USA"],
+        "analysis_goal": "facility_siting",
+        "ambiguities": [{
+            "field": "n_facilities", "candidates": ["5", "10"],
+            "question": "Should the facility budget be 5 or 10?",
+        }],
+    })
+
+    result = service.parse("Improve access in Phoenix with five or ten facilities.")
+
+    assert result["disposition"] == "needs_clarification"
+    assert "5 or 10" in result["message"]
+
+
+def test_unresolved_route_origin_preserves_an_existing_study_area(monkeypatch):
+    service = _parse_service({
+        "place_name": "Phoenix, Arizona, USA",
+        "analysis_goal": "facility_siting",
+        "route_origin": {
+            "entity": "unclear entrance", "context": "Phoenix",
+            "positional_hint": "", "raw_text": "unclear entrance", "source": "llm",
+        },
+    })
+    monkeypatch.setattr(
+        "oasis.services.application.route_origin_options",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("Origin not found.")),
+    )
+
+    result = service.parse("From the unclear entrance in Phoenix, find a facility.")
+
+    assert result["disposition"] == "needs_clarification"
+    assert result["missing_place"] is False
+    assert result["task"]["place_name"] == "Phoenix, Arizona, USA"
+    assert result["task"]["route_origin"] is None
+    assert "study area was preserved" in result["reason"]
+
+
+def test_parse_keeps_supported_work_when_one_result_query_is_unavailable():
+    service = _parse_service({
+        "place_name": "Phoenix, Arizona, USA",
+        "place_names": ["Phoenix, Arizona, USA"],
+        "analysis_goal": "tract_review",
+        "result_queries": [
+            {"metric": "heat_exposure", "limit": 5, "raw_text": "highest heat"},
+            {"metric": "crime_rate", "limit": 5, "raw_text": "crime rate"},
+        ],
+    })
+
+    result = service.parse("Show the five hottest tracts and crime rate in Phoenix.")
+
+    assert result["disposition"] == "quick_diagnostic"
+    assert [query["metric"] for query in result["task"]["result_queries"]] == ["heat_exposure"]
+    assert "crime rate" in result["reason"]
+    assert result["alternative"] == ""
+
+
+def test_minimum_facility_request_is_presented_as_a_quick_diagnostic():
+    service = _parse_service({
+        "place_name": "Washington, District of Columbia, USA",
+        "analysis_goal": "minimum_facilities",
+        "threshold_minutes": 15,
+        "coverage_target": 1.0,
+    })
+    result = service.parse(
+        "How few cooling centers does DC actually need to cover everyone in 15 minutes?"
+    )
+    assert result["disposition"] == "quick_diagnostic"
+
+
+def test_precise_minimum_diagnostic_keeps_labeled_approximate_threshold_bound():
+    task = TaskSpec(
+        place_name="Phoenix, Arizona, USA", analysis_goal="minimum_facilities",
+        n_facilities=10, threshold_minutes=15, coverage_target=1.0,
+    )
+    preview = {
+        "message": (
+            "No number of the retained candidate facilities can cover 100% of the all group "
+            "within 15 minutes. With 10 facilities, the smallest computed threshold is "
+            "131.6 minutes by walking."
+        ),
+        "diagnostics": {"minimum_threshold": {
+            "feasible": True, "minimum_threshold_minutes": 131.6,
+            "n_facilities": 10,
+        }},
+    }
+    ranking = "Top 5 for heat exposure: 1. tract 11001004902 (43.498)."
+    preview["message"] += " " + ranking
+    precise = {
+        "message": "The precise candidate set is infeasible at 15 minutes. " + ranking,
+        "diagnostics": {
+            "minimum_facilities": {"feasible": False},
+            "minimum_threshold": {"feasible": False},
+        },
+    }
+
+    OasisService._carry_preview_diagnostic_bounds(task, preview, precise)
+
+    bound = precise["diagnostics"]["approximate_minimum_threshold"]
+    assert bound["accuracy"] == "approximate_haversine"
+    assert bound["minimum_threshold_minutes"] == 131.6
+    assert "No number of the retained candidate facilities" in precise["message"]
+    assert precise["message"].count(ranking) == 1
+
+
+def test_parse_rejects_only_when_every_requested_result_is_unavailable():
+    service = _parse_service({
+        "place_name": "Phoenix, Arizona, USA",
+        "analysis_goal": "tract_review",
+        "result_queries": [{"metric": "crime_rate", "raw_text": "crime rate"}],
+    })
+    assert service.parse("Rank Phoenix tracts by crime rate.")["disposition"] == "out_of_scope"
+
+
 def test_browser_coordinate_returns_smallest_supported_us_parents_first(monkeypatch):
     service = object.__new__(OasisService)
     monkeypatch.setattr(
@@ -43,15 +201,37 @@ def test_browser_coordinate_outside_us_returns_no_address_prompt(monkeypatch):
     assert "outside the United States" in result["message"]
 
 
+def test_manual_origin_search_preserves_route_semantics(monkeypatch):
+    service = object.__new__(OasisService)
+    monkeypatch.setattr(
+        "oasis.services.application.route_origin_options",
+        lambda *_args, **_kwargs: ([{
+            "candidate_id": "miami", "display_name": "Miami, Florida",
+            "place_name": "Miami, Florida, USA", "place_type": "city",
+            "entity": "Miami", "context": "Florida", "positional_hint": "",
+            "administrative": True, "longitude": -80.19, "latitude": 25.76,
+        }], True),
+    )
+    result = service.search_route_origin("Miami")
+    assert result["candidates"][0]["administrative"] is False
+    assert result["candidates"][0]["place_name"] == "Miami, Florida, USA"
+
+
 def test_public_llm_endpoints_are_fixed_or_explicitly_approved(monkeypatch):
     service = object.__new__(OasisService)
     service.cfg = {"llm": {"allowed_custom_hosts": []}}
-    assert service._validated_llm_url("openai", "https://attacker.example/v1", False) == "https://api.openai.com/v1"
+    assert service._validated_llm_url(
+        "gemini", "https://generativelanguage.googleapis.com/v1beta/openai/", False,
+    ) == "https://generativelanguage.googleapis.com/v1beta/openai/"
+    assert service._validated_llm_url("openai", "https://api.openai.com/v1", False) == "https://api.openai.com/v1"
     monkeypatch.setattr("oasis.services.application.socket.getaddrinfo", lambda *_: [(None, None, None, None, ("8.8.8.8", 443))])
+    with pytest.raises(ValueError, match="not approved"):
+        service._validated_llm_url("openai", "https://attacker.example/v1", False)
     with pytest.raises(ValueError, match="not approved"):
         service._validated_llm_url("custom", "https://models.example/v1", False)
     service.cfg["llm"]["allowed_custom_hosts"] = ["models.example"]
     assert service._validated_llm_url("custom", "https://models.example/v1", False) == "https://models.example/v1"
+    assert service._validated_llm_url("openai", "https://models.example/v1", False) == "https://models.example/v1"
 
 
 def test_remote_visitors_cannot_reach_private_model_endpoints(monkeypatch):

@@ -7,8 +7,9 @@ OASIS is an auditable autonomous GIS and LLM-GIS decision-support agent for eval
 - Policy analysts and planners: compare candidate-facility portfolios under budget, travel-time, capacity, and equity constraints.
 - Public-health teams: inspect population-weighted heat exposure, vulnerable-population coverage, and hard-to-reach areas.
 - Academic researchers: run reproducible efficiency-Gini, mobility, vulnerability, and threshold sensitivity analyses with provenance.
+- Residents and visitors: plan a route from a confirmed point to a selected candidate facility after a study-area run.
 
-OASIS is not a consumer navigation service. It does not verify which facility is open right now, provide emergency advice, search vacant land, or make zoning decisions.
+OASIS is not a real-time navigation or emergency service. Its route planner uses the candidate facilities computed for a confirmed study area; it does not verify live opening status, provide emergency advice, search vacant land, or make zoning decisions.
 
 ## Main capabilities
 
@@ -20,9 +21,24 @@ OASIS is not a consumer navigation service. It does not verify which facility is
 - Vulnerability preprocessing: missingness, direction, normalization, correlation, VIF, PCA, alternative weights, and robustness scans.
 - MapLibre maps, point/address route planning, route heat audit, and optional Mapillary imagery.
 - Reports, charts, provenance, and notify-only source-version checks.
-- OpenAI-compatible BYOK for OpenAI, OpenRouter, approved custom endpoints, and local Ollama/vLLM.
+- OpenAI-compatible BYOK for Gemini, OpenAI, OpenRouter, approved custom endpoints, and local Ollama/vLLM.
 
 Candidate facilities are possible existing service locations, not confirmed cooling centers. Unknown opening hours, fees, access, capacity, and official status remain explicit.
+
+## Supported question types and boundaries
+
+Supported requests fall into four user-facing workflows:
+
+1. **Full analysis:** select existing candidate facilities and evaluate efficiency, coverage, vulnerability, Gini, capacity, environment, and Pareto trade-offs.
+2. **Quick diagnostic:** rank or inspect tracts using available heat exposure, configured vulnerability, candidate accessibility, or a transparent vulnerability-access gap score.
+3. **Route planning:** confirm a point or browser location, prepare candidates in its city or county, and request an ORS route to a nearby selected facility.
+4. **Comparison:** compare registered value profiles, mobility assumptions, saved runs, selected facilities, and efficiency-equity outcomes.
+
+`Needs clarification` and `out of scope` are routing outcomes rather than additional workflows. A request needs clarification when its place, origin, comparison profiles, or decision parameters cannot be confirmed safely.
+
+The built-in tract evidence is limited to Census population and configured vulnerability indicators, Landsat-derived heat and environmental diagnostics, and computed candidate accessibility. A requested property that is not supplied by these sources, for example crime, mortality, observed illness, real-time occupancy, or parcel suitability, is out of scope for the current run. OASIS should suggest an official city/county or research source and require a reviewed data adapter, version, missing-value policy, and indicator direction before that property can enter analysis. It does not silently substitute another dataset.
+
+Request interpretation is schema-first: one `analysis_goal` controls the executable workflow, `result_queries` holds independent read-only answers, `place_names` retains every detected study area for confirmation, and `ambiguities` records fields the model could not safely resolve. One run uses one confirmed city or county; analyze additional places separately and compare the saved runs.
 
 ## Code layout
 
@@ -72,7 +88,7 @@ If a system Python installation cannot resolve GDAL, use
 | [OpenStreetMap](https://www.openstreetmap.org/copyright) and [Nominatim](https://operations.osmfoundation.org/policies/nominatim/) | Candidate facilities and geocoding | Public service; follow usage policies |
 | [openrouteservice](https://api.openrouteservice.org/) | Network matrices and point routes | [Create an account and API key](https://openrouteservice.org/sign-up/) |
 | [Mapillary](https://www.mapillary.com/dashboard/developers) | Optional nearby street-level imagery | Register an app and copy its client token |
-| [OpenRouter](https://openrouter.ai/settings/keys) or [OpenAI](https://platform.openai.com/api-keys) | Optional language-model parsing and orchestration | Create a provider API key, or configure local Ollama |
+| [OpenRouter](https://openrouter.ai/settings/keys), [Google Gemini](https://aistudio.google.com/apikey), or [OpenAI](https://platform.openai.com/api-keys) | Language-model parsing and orchestration | OpenRouter with openai/gpt-4o is the default; create a provider key or configure local Ollama |
 
 For a local language model, install [Ollama](https://ollama.com/download); OASIS does not download models automatically.
 
@@ -85,6 +101,7 @@ Copy-Item .env.example .env
 Relevant keys:
 
 ```dotenv
+GEMINI_API_KEY=
 OPENAI_API_KEY=
 OPENROUTER_API_KEY=
 ORS_API_KEY=
@@ -92,7 +109,7 @@ CENSUS_API_KEY=
 MAPILLARY_ACCESS_TOKEN=
 ```
 
-Only configure the services you use. Mapillary and visitor-provided language models are optional. Never commit the populated `.env`.
+Put the server-default OpenRouter key in `OPENROUTER_API_KEY` inside the project-root `.env`. A visitor may instead enter a provider key in **Preliminary setup**; that key stays only in the browser-scoped backend session. Direct Gemini remains available through `GEMINI_API_KEY`, but access is evaluated from the backend network location and is limited to Google's [supported regions](https://ai.google.dev/gemini-api/docs/available-regions). If unavailable, select OpenRouter, OpenAI, or a local model instead; OASIS never switches providers silently. Gemini free-tier availability and quotas also depend on the selected model, account, and region. Only configure the services you use, and never commit the populated `.env`.
 
 ## Install
 

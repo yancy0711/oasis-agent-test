@@ -8,6 +8,7 @@ type Provider = LlmConnectionInput["provider"];
 type ConnectionState = "idle" | "success" | "failure";
 
 const PRESETS: Record<Provider, { baseUrl: string; model: string }> = {
+  gemini: { baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/", model: "gemini-3.5-flash-lite" },
   openrouter: { baseUrl: "https://openrouter.ai/api/v1", model: "openai/gpt-4o" },
   openai: { baseUrl: "https://api.openai.com/v1", model: "gpt-4o" },
   custom: { baseUrl: "https://", model: "" },
@@ -15,6 +16,7 @@ const PRESETS: Record<Provider, { baseUrl: string; model: string }> = {
 };
 
 const EXAMPLE_MODELS: Partial<Record<Provider, string[]>> = {
+  gemini: ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.7-flash"],
   openai: ["gpt-4o", "gpt-4.1", "gpt-4.1-mini", "gpt-4o-mini"],
   local: ["qwen2.5:3b", "qwen2.5:7b", "llama3.2:3b", "llama3.1:8b", "gemma3:4b", "mistral:7b", "deepseek-r1:7b"],
 };
@@ -34,10 +36,10 @@ function modelGroup(model: string, provider: Provider, discovered: Set<string>) 
 export function LlmSettings({ defaults }: { defaults?: Record<string, unknown> }) {
   const mobile = useMediaQuery("(max-width: 620px)");
   const [settingsOpen, setSettingsOpen] = useState(() => !mobile);
-  const initialProvider = (["openai", "openrouter", "custom", "local"].includes(String(defaults?.provider)) ? String(defaults?.provider) : "openrouter") as Provider;
+  const initialProvider = (["gemini", "openai", "openrouter", "custom", "local"].includes(String(defaults?.provider)) ? String(defaults?.provider) : "openrouter") as Provider;
   const [provider, setProvider] = useState(initialProvider);
   const [baseUrl, setBaseUrl] = useState(String(defaults?.base_url || PRESETS[initialProvider].baseUrl));
-  const [model, setModel] = useState(PRESETS[initialProvider].model);
+  const [model, setModel] = useState(String(defaults?.model || PRESETS[initialProvider].model));
   const [apiKey, setApiKey] = useState("");
   const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
   const [pending, setPending] = useState(false);
@@ -127,16 +129,17 @@ export function LlmSettings({ defaults }: { defaults?: Record<string, unknown> }
       setCopiedCommand(command); window.setTimeout(() => setCopiedCommand(""), 1800);
     } catch { setCopiedCommand(""); }
   };
-  const baseUrlHelp = provider === "openai" ? "Official API root; no editing is needed." : provider === "openrouter" ? "OpenRouter API root; no editing is needed." : provider === "local" ? "For Ollama running on this computer, use http://127.0.0.1:11434/v1." : "Enter the provider's OpenAI-compatible API root, normally an HTTPS address ending in /v1.";
+  const baseUrlHelp = provider === "gemini" ? "Gemini's OpenAI-compatible API root; this remains editable for reviewed gateways." : provider === "openai" ? "Suggested OpenAI-compatible API root; edit it when using an approved gateway." : provider === "openrouter" ? "Suggested OpenRouter API root; edit it when using an approved compatible gateway." : provider === "local" ? "For Ollama running on this computer, use http://127.0.0.1:11434/v1." : "Enter the provider's OpenAI-compatible API root, normally an HTTPS address ending in /v1.";
 
   return <details className="llm-settings" open={settingsOpen} onToggle={(event) => setSettingsOpen(event.currentTarget.open)}>
     <summary><span className="llm-settings__step">Preliminary setup</span><strong>Connect a language model</strong><span className="llm-settings__session">{sessionLabel ?? "server default"}</span></summary>
     <form onSubmit={test}>
       <p className="llm-settings__intro">Please set this before describing the task when you want to use your own model. Otherwise the configured server default is used.</p>
+      {provider === "gemini" && <p className="llm-provider-note">Direct Gemini availability is determined by the OASIS backend location. If Google reports an unsupported region, switch Provider here or run the backend in a supported region.</p>}
       <div className="form-grid form-grid--four">
-        <label className="field"><span>Provider</span><select aria-label="Provider" value={provider} onChange={(event) => chooseProvider(event.target.value as Provider)}><option value="openrouter">OpenRouter</option><option value="openai">OpenAI</option><option value="custom">Custom provider</option><option value="local">Local model</option></select></label>
+        <label className="field"><span>Provider</span><select aria-label="Provider" value={provider} onChange={(event) => chooseProvider(event.target.value as Provider)}><option value="gemini">Gemini</option><option value="openrouter">OpenRouter</option><option value="openai">OpenAI</option><option value="custom">Custom provider</option><option value="local">Local model</option></select></label>
         <div className="field"><span>Model</span><CheckboxDropdown ariaLabel="Model choices" single searchable portal shortcuts options={modelOptions} selected={model ? [cleanModelId(model)] : []} onChange={(values) => setModel(cleanModelId(values[0] ?? ""))} summary={cleanModelId(model) || "Select a model"} emptyMessage={discovering ? "Loading the model catalog..." : "No models match this filter."} footer={<label><span>Exact model ID</span><input aria-label="Exact model ID" value={model} onChange={(event) => setModel(cleanModelId(event.target.value))} placeholder="Type the exact model ID" /></label>} /></div>
-        <label className="field"><span>Base URL</span><input aria-label="Base URL" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} disabled={provider === "openai" || provider === "openrouter"} /><small>{baseUrlHelp}</small></label>
+        <label className="field"><span>Base URL</span><input aria-label="Base URL" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /><small>{baseUrlHelp}</small></label>
         <label className="field"><span>{provider === "local" ? "API key (optional)" : "API key"}</span><input aria-label={provider === "local" ? "API key (optional)" : "API key"} type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} /><small>The key is never saved in browser storage or run output.</small></label>
       </div>
       {provider === "local" && <section className="local-model-setup"><strong>Example setup (Windows PowerShell)</strong><p>Install Ollama, then download the model selected above. These are examples; OASIS does not download models.</p>{["winget install --id Ollama.Ollama -e", `ollama pull ${model || "qwen2.5:3b"}`].map((command) => <div className="copy-command" key={command}><code>{command}</code><button type="button" className="button--secondary" onClick={() => void copy(command)}>Copy{copiedCommand === command && <span className="copy-success" aria-label="Copied">{"\u2713"}</span>}</button></div>)}<p>Start Ollama, keep Base URL as <code>http://127.0.0.1:11434/v1</code>, leave API key empty, and check the installed model list.</p></section>}

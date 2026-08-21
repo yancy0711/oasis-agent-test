@@ -4,10 +4,12 @@ llm:
   base_url: "https://openrouter.ai/api/v1"
   model: "openai/gpt-4o"
   max_tokens: 4096
-  temperature: 0.2
+  temperature: 0.0
+  reasoning_effort: low
+  task_parsing_reasoning_effort: medium
   max_self_correction_rounds: 3
   max_agent_steps: 14
-  # Public visitors may use the fixed OpenAI/OpenRouter endpoints. Add only
+  # Public visitors may use the fixed Gemini/OpenAI/OpenRouter endpoints. Add only
   # administrator-reviewed HTTPS hosts here to enable custom providers remotely.
   allowed_custom_hosts: []
 

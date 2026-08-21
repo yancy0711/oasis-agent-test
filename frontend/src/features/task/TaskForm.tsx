@@ -17,6 +17,7 @@ interface TaskFormProps {
   task: TaskSpec; mode: RoutingMode; ready: boolean; pending: boolean; uploadPending: boolean;
   uploadedName: string | null; profiles: ValueProfile[];
   onModeChange: (mode: RoutingMode) => void; onUpload: (file: File) => void;
+  onResolveAmbiguity?: (index: number, candidate: string) => void;
   onSubmit: (values: TaskFormValues) => void;
 }
 
@@ -63,19 +64,20 @@ const AMENITY_OPTIONS = [
 ] as const;
 const DEFAULT_AMENITIES = AMENITY_OPTIONS.map((option) => option.value);
 
-export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedName, profiles, onModeChange, onUpload, onSubmit }: TaskFormProps) {
+export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedName, profiles, onModeChange, onUpload, onResolveAmbiguity, onSubmit }: TaskFormProps) {
   const { register, handleSubmit, reset, watch, control, setValue, formState: { errors } } = useForm<TaskFormValues>({
     resolver: zodResolver(taskFormSchema), defaultValues: toTaskFormValues(task),
   });
   const editor = useTaskEditor();
   const mobile = useMediaQuery("(max-width: 620px)");
-  const [mobileStepOpen, setMobileStepOpen] = useState(true);
-  const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false);
+  const routeFocused = Boolean(task.route_origin);
+  const [stepOpen, setStepOpen] = useState(true);
+  const [settingsOpen, setSettingsOpen] = useState(!mobile);
   useEffect(() => reset(toTaskFormValues(task)), [task, reset]);
   useEffect(() => {
-    setMobileStepOpen(true);
-    setMobileSettingsOpen(false);
-  }, [task]);
+    setStepOpen(true);
+    setSettingsOpen(!mobile);
+  }, [mobile, routeFocused, task.analysis_goal, task.place_name, task.route_origin?.raw_text]);
   useEffect(() => {
     const apply = (patch: TaskEditorPatch) => Object.entries(patch).forEach(([key, value]) => setValue(key as keyof TaskFormValues, value as never, { shouldDirty: true, shouldValidate: true }));
     editor.register(apply); return () => editor.register(null);
@@ -106,12 +108,9 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
   }
 
   return <form className="panel" onSubmit={handleSubmit(onSubmit)}>
-    <details className="mobile-step-disclosure task-step-disclosure" open={!mobile || mobileStepOpen} onToggle={(event) => {
-      if (mobile) setMobileStepOpen(event.currentTarget.open);
-    }}>
-    <summary><span><span className="form-step">Step 3</span> Review the executable task</span></summary>
+    <details className="mobile-step-disclosure task-step-disclosure" open={stepOpen} onToggle={(event) => setStepOpen(event.currentTarget.open)}>
+    <summary><div className="section-heading"><div><p className="step-heading"><span className="form-step">Step 3</span><span>Task settings</span></p><h2>Review the executable task</h2></div><span className="status">{task.analysis_goal.replaceAll("_", " ")}</span></div></summary>
     <div className="mobile-step-body">
-    <div className="section-heading task-step-heading"><div><p className="eyebrow">Step 3 - Human confirmation</p><h2>Review the executable task</h2></div><span className="status">{task.analysis_goal.replaceAll("_", " ")}</span></div>
 
     {(task.recommended_value_profile || task.recommended_mobility_scenario || task.recommended_sensitivity_thresholds?.length) ? <div className="recommendation-panel">
       <div><strong>Model recommendation</strong><p>{task.recommendation_rationale || "Review and explicitly apply the suggested settings."}</p></div>
@@ -119,11 +118,13 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
     </div> : null}
     {task.route_origin && <div className="route-request-notice"><strong>Route origin</strong><span>{task.route_origin.entity}{task.route_origin.context ? `, ${task.route_origin.context}` : ""}</span>{task.route_origin.positional_hint && <small>Position described by user: {task.route_origin.positional_hint}. The confirmed candidate supplies the route coordinate.</small>}<small>Confirm the inferred city or county and run the candidate selection. The Map tab will then plan to the network-nearest selected facility.</small></div>}
     {task.preference_question && <div className="preference-panel"><strong>{task.preference_question}</strong><div className="button-row">{QUICK_PROFILES.map((profile) => <button type="button" key={profile.name} onClick={() => applyProfile(profile)}>{profile.label}</button>)}</div></div>}
+    {(task.result_queries?.length ?? 0) > 0 && <div className="route-request-notice"><strong>Requested result questions</strong>{task.result_queries?.map((query, index) => <span key={`${query.metric}-${index}`}>{query.limit} {query.scope === "vulnerable" ? "vulnerable " : ""}tract(s) by {query.metric.replaceAll("_", " ")} ({query.direction})</span>)}<small>These answers are read-only outputs and do not change the facility budget.</small></div>}
+    {(task.ambiguities?.length ?? 0) > 0 && <div className="preference-panel"><strong>Confirm the model interpretation</strong>{task.ambiguities?.map((item, index) => { const candidates = item.candidates ?? []; return <div className="ambiguity-choice" key={`${item.field}-${index}`}><p>{item.question}</p>{candidates.length > 0 ? <div className="button-row">{candidates.map((candidate) => <button type="button" key={candidate} onClick={() => onResolveAmbiguity?.(index, candidate)}>{candidate.replaceAll("_", " ")}</button>)}</div> : <small>Edit the corresponding field below, then run the confirmed task.</small>}</div>; })}</div>}
 
-    <details className="task-settings-disclosure" open={!mobile || mobileSettingsOpen} onToggle={(event) => {
-      if (mobile) setMobileSettingsOpen(event.currentTarget.open);
-    }}>
-      <summary><span>Analysis settings</span><small>{heatOnly ? "Heat diagnostic" : `${facilityCount} facilities - ${threshold} min - ${mobility.replaceAll("_", " ")}`}</small></summary>
+    {routeFocused && <div className="route-essential-settings"><label className="field"><InfoLabel label="Travel mode">Used by the point route planner after candidate facilities have been prepared.</InfoLabel><select aria-label="Mobility" {...register("mobility_scenario")}><option value="walking">Walking</option><option value="cycling">Cycling</option><option value="driving">Driving</option></select></label><p>Supporting defaults: {facilityCount} candidate facilities, {threshold} minute planning threshold, and all supported facility types.</p></div>}
+
+    <details className="task-settings-disclosure" open={settingsOpen} onToggle={(event) => setSettingsOpen(event.currentTarget.open)}>
+      <summary><span>{routeFocused ? "Customize supporting analysis" : "Analysis settings"}</span><small>{heatOnly ? "Heat diagnostic" : `${facilityCount} facilities - ${threshold} min - ${mobility.replaceAll("_", " ")}`}</small></summary>
       <div className="task-settings-body">
     {!heatOnly && <>
       <div className="form-grid">
@@ -131,7 +132,7 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
         <label className="field"><span>Threshold (minutes)</span><input type="number" step="0.5" {...register("threshold_minutes", { valueAsNumber: true })} />{errors.threshold_minutes && <small className="error">{errors.threshold_minutes.message}</small>}</label>
         <label className="field"><InfoLabel label="Facility capacity">Limits how many people each selected candidate facility can be assigned. Leave disabled when reliable capacity data are unavailable.</InfoLabel><span className="check-row"><input type="checkbox" {...register("facility_capacity_enabled")} />Apply capacity</span>{hasCapacity && <input aria-label="People per facility" type="number" min="1" step="1" {...register("facility_capacity", { valueAsNumber: true })} />}</label>
         <label className="field"><InfoLabel label="Efficiency–equality trade-off">When enabled, selects the final recommendation from the computed efficiency–Gini frontier. α = 0 emphasizes average gradual access; α = 1 emphasizes equal access. This cannot be combined with a hard coverage target.</InfoLabel><span className="check-row"><input type="checkbox" {...register("equity_alpha_enabled")} />Select final solution by α</span>{hasEquityAlpha && <><input aria-label="Equity alpha" type="range" min="0" max="1" step="0.1" {...register("equity_alpha", { valueAsNumber: true })} /><small>α = {watch("equity_alpha").toFixed(1)} · 0 means efficiency, 1 means equality</small>{errors.equity_alpha && <small className="error">{errors.equity_alpha.message}</small>}</>}</label>
-        <label className="field"><InfoLabel label="Mobility">Chooses the travel mode used to calculate access times between demand and candidate facilities.</InfoLabel><select aria-label="Mobility" {...register("mobility_scenario")}><option value="walking">Walking</option><option value="cycling">Cycling</option><option value="driving">Driving</option><option value="walk_drive_equity">Walk/drive equity</option></select><small>{watch("mobility_scenario") === "walk_drive_equity" ? "Evaluates access across walking and driving populations." : "Used for travel-time routing."}</small></label>
+        {!routeFocused && <label className="field"><InfoLabel label="Mobility">Chooses the travel mode used to calculate access times between demand and candidate facilities.</InfoLabel><select aria-label="Mobility" {...register("mobility_scenario")}><option value="walking">Walking</option><option value="cycling">Cycling</option><option value="driving">Driving</option><option value="walk_drive_equity">Walk/drive equity</option></select><small>{watch("mobility_scenario") === "walk_drive_equity" ? "Evaluates access across walking and driving populations." : "Used for travel-time routing."}</small></label>}
         <label className="field"><InfoLabel label="Execution">Controls routing fidelity: quick is approximate, precise uses the network router, and auto runs preview before precise.</InfoLabel><select aria-label="Execution" value={mode} onChange={(event) => onModeChange(event.target.value as RoutingMode)}><option value="auto">Auto preview + precise</option><option value="quick">Quick approximate</option><option value="precise">Precise network</option></select></label>
         <label className="field"><InfoLabel label="Candidate source">Chooses whether possible facility locations come from OpenStreetMap or an uploaded CSV.</InfoLabel><select aria-label="Candidate source" {...register("candidate_source")}><option value="osm">OpenStreetMap</option><option value="csv">Uploaded CSV</option></select></label>
         <label className="field"><InfoLabel label="Coverage group">Chooses whether coverage requirements apply to every tract or only the configured composite vulnerability priority tracts.</InfoLabel><select aria-label="Coverage group" {...register("coverage_group")}><option value="all">All tracts</option><option value="vulnerable">Vulnerability priority tracts</option></select></label>
@@ -148,7 +149,7 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
         const labels = profiles.filter((profile) => field.value.includes(profile.name)).map((profile) => profile.label);
         return <div className="comparison-profile-picker field field--wide"><InfoLabel label="Value profiles to compare">Each selected profile supplies a different audited weighting scheme. Every profile is solved against the same candidate facilities and travel matrix.</InfoLabel><CheckboxDropdown ariaLabel="Value profiles to compare" options={options} selected={field.value} onChange={field.onChange} summary={`${field.value.length} profiles selected`} detail={labels.length ? labels.join(", ") : "Select at least two profiles"} actions={<><button type="button" className="button--secondary" onClick={() => field.onChange(options.map((option) => option.value))}>Select all</button><button type="button" className="button--secondary" onClick={() => field.onChange(["efficiency_first", "equity_first"].filter((name) => options.some((option) => option.value === name)))}>Efficiency vs equity</button></>} emptyMessage="No registered profiles are available." defaultOpen />{errors.comparison_profiles && <small className="error">{errors.comparison_profiles.message}</small>}</div>;
       }} />}
-      <fieldset className="weights"><legend><InfoLabel label="Value profile">Sets how strongly population, older adults, poverty, heat exposure, and passive built-environment burden influence site selection.</InfoLabel></legend><label className="field compact-field"><InfoLabel label="Apply a registered profile">Loads a saved combination of value weights; choose Custom weights to edit them manually.</InfoLabel><select aria-label="Apply a registered profile" defaultValue="" onChange={(event) => applyProfile(allProfiles.find((profile) => profile.name === event.target.value))}><option value="">Custom weights</option>{allProfiles.map((profile) => <option key={profile.name} value={profile.name}>{profile.label}</option>)}</select></label><div className="form-grid form-grid--weights">
+      <fieldset className={`weights ${routeFocused ? "weights--secondary" : ""}`}><legend><InfoLabel label="Value profile">Sets how strongly population, older adults, poverty, heat exposure, and passive built-environment burden influence site selection.</InfoLabel></legend><label className="field compact-field"><InfoLabel label="Apply a registered profile">Loads a saved combination of value weights; choose Custom weights to edit them manually.</InfoLabel><select aria-label="Apply a registered profile" defaultValue="" onChange={(event) => applyProfile(allProfiles.find((profile) => profile.name === event.target.value))}><option value="">Custom weights</option>{allProfiles.map((profile) => <option key={profile.name} value={profile.name}>{profile.label}</option>)}</select></label><div className="form-grid form-grid--weights">
         <WeightField name="population_density" label="Population" weights={weights} control={control} /><WeightField name="elderly_ratio" label="Older adults" weights={weights} control={control} /><WeightField name="poverty_rate" label="Poverty" weights={weights} control={control} /><WeightField name="heat_exposure" label="Heat exposure" weights={weights} control={control} /><WeightField name="environment_burden" label="Passive environment burden" weights={weights} control={control} />
       </div><div className={`weight-total ${Math.abs(weightTotal - 1) < .0001 ? "weight-total--ready" : "weight-total--warning"}`}><strong>Total: {weightTotal.toFixed(2)}</strong><span>{weightTotal < .9999 ? `Add ${(1 - weightTotal).toFixed(2)} before running.` : "Weights are ready."}</span></div>{errors.weights?.root && <small className="error">{errors.weights.root.message}</small>}</fieldset>
     </>}
@@ -159,8 +160,9 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
       </div>
     </details>
 
-    <div className="form-actions"><span>{ready ? "The confirmed task is ready to run." : "Confirm a study area before running."}</span><button type="submit" disabled={!ready || pending || (source === "csv" && !uploadedName)}>{pending ? "Starting…" : "Run confirmed agent"}</button></div>
     </div>
     </details>
+
+    <div className="form-actions"><span>{ready ? "The confirmed task is ready to run." : "Confirm a study area before running."}</span><button type="submit" disabled={!ready || pending || (source === "csv" && !uploadedName)}>{pending ? "Starting…" : "Run confirmed agent"}</button></div>
   </form>;
 }

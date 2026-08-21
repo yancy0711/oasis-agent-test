@@ -49,7 +49,10 @@ export function AnalysisView({ result, onShowTract }: { result: RunResult; onSho
   const topTracts = rows(heat.top_tracts);
   const facilities = record(diagnostics.minimum_facilities);
   const threshold = record(diagnostics.minimum_threshold);
+  const approximateThreshold = record(diagnostics.approximate_minimum_threshold);
   const reachability = record(diagnostics.reachability_analysis);
+  const resultQueries = rows(record(diagnostics.result_query_answers).answers);
+  const rankedTracts = resultQueries.flatMap((answer) => rows(answer.top_rows));
   const reachabilityOverview = Object.keys(reachability).length ? {
     coverage_group: reachability.coverage_group,
     threshold_minutes: reachability.threshold_minutes,
@@ -75,11 +78,11 @@ export function AnalysisView({ result, onShowTract }: { result: RunResult; onSho
   const missingTotal = rows(vulnerability.missingness).reduce((sum, item) => sum + Number(item.missing_count ?? 0), 0);
   const metricPercent = (value: unknown) => typeof value === "number" ? `${(value * 100).toFixed(1)}%` : "—";
   const heatUrl = publicApiUrl(result.artifacts?.heat_analysis);
-  const hasAny = experiments.length || topTracts.length || Object.keys(facilities).length || Object.keys(threshold).length || Object.keys(reachability).length || Object.keys(scenario).length || Object.keys(vulnerability).length || showValidation || Object.keys(optimization).length || Object.keys(routing).length || failures.length || heatUrl;
+  const hasAny = experiments.length || topTracts.length || rankedTracts.length || Object.keys(facilities).length || Object.keys(threshold).length || Object.keys(approximateThreshold).length || Object.keys(reachability).length || Object.keys(scenario).length || Object.keys(vulnerability).length || showValidation || Object.keys(optimization).length || Object.keys(routing).length || failures.length || heatUrl;
   if (!hasAny) return <p className="empty-tab">No additional diagnostics were produced for this run.</p>;
   return <div className="detail-stack">
     <section className="analysis-overview"><h3>Decision summary</h3><p className="muted">Current outcome first; open the diagnostic sections only when you need methodological detail.</p>
-      {(topTracts.length > 0 || Object.keys(reachability).length > 0) && <p className="diagnostic-answer">{result.message}</p>}
+      {(topTracts.length > 0 || rankedTracts.length > 0 || Object.keys(reachability).length > 0 || Object.keys(facilities).length > 0 || Object.keys(threshold).length > 0 || Object.keys(approximateThreshold).length > 0) && <p className="diagnostic-answer">{result.message}</p>}
       <div className="diagnostic-summary"><div><span>Population coverage</span><strong>{metricPercent(metrics.coverage)}</strong></div><div><span>Gradual access</span><strong>{metricPercent(metrics.gradual_coverage)}</strong></div><div><span>Access Gini</span><strong>{display(metrics.population_weighted_access_gini)}</strong></div><div><span>Missing values</span><strong>{Object.keys(vulnerability).length ? missingTotal : "not audited"}</strong></div></div>
     </section>
     {Object.keys(vulnerability).length > 0 && <section className="vulnerability-analysis"><h3>Vulnerability data quality and robustness</h3><p className="muted">{display(vulnerability.priority_definition)} · active weighting: {display(vulnerability.active_scheme)} · normalization: {display(vulnerability.normalization)}. Indicator directions and missing-value policies come from the audited configuration.</p>
@@ -95,7 +98,13 @@ export function AnalysisView({ result, onShowTract }: { result: RunResult; onSho
     {showValidation && <section><h3>Constraint validation</h3><p className="muted">Checks only explicit hard constraints such as regional minimums and reports conflicts before optimization.</p><DataTable data={[validation]} /></section>}
     {Object.keys(routing).length > 0 && <section className="analysis-section--travel"><h3>Travel matrix analysis</h3><p className="muted">Describes how demand-to-candidate travel times were built, cached, and checked. It is input quality evidence, not a second site recommendation.</p><DataTable data={[routing]} /></section>}
     {(Object.keys(facilities).length > 0 || Object.keys(threshold).length > 0) && <section><h3>Feasibility bounds</h3><DataTable data={[{ ...facilities, ...threshold }]} /></section>}
+    {Object.keys(approximateThreshold).length > 0 && <section><h3>Approximate complementary bound</h3><p className="warning-text">This Haversine screening estimate is retained because the precise ORS matrix is sparse outside the confirmed threshold. It is not a precise network result.</p><DataTable data={[approximateThreshold]} /></section>}
     {Object.keys(reachability).length > 0 && <section><h3>Reachability</h3><p className="muted">Tracts are ranked by travel time to their nearest current candidate facility. Larger values are harder to reach; an empty nearest time means structurally unreachable in the computed matrix.</p><DataTable data={[reachabilityOverview]} />{rows(reachability.hardest_demand).length > 0 && <><h4>Hardest tracts</h4>{onShowTract && <button type="button" className="button--secondary" onClick={() => onShowTract(String(rows(reachability.hardest_demand)[0].GEOID ?? rows(reachability.hardest_demand)[0].demand_id).split(":", 1)[0])}>Show hardest tract on map</button>}<DataTable data={rows(reachability.hardest_demand)} /></>}</section>}
+    {resultQueries.map((answer, index) => {
+      const topRows = rows(answer.top_rows);
+      const computation = record(answer.computation);
+      return topRows.length > 0 && <section key={`${display(answer.metric)}-${index}`}><h3>Requested result: {display(answer.metric_label)}</h3><p>{display(answer.method)}</p><p><strong>Formula:</strong> <code>{display(computation.formula)}</code></p><p className="muted"><strong>Data basis:</strong> {display(computation.data_basis)}</p>{onShowTract && <button type="button" className="button--secondary" onClick={() => onShowTract(String(topRows[0].GEOID))}>Show first-ranked tract on map</button>}<DataTable data={topRows} /></section>;
+    })}
     {topTracts.length > 0 && <section><h3>Highest heat-exposure tracts</h3><DataTable data={topTracts} /></section>}
     {heatUrl && <section><h3>Heat distribution</h3><img className="result-image" src={heatUrl} alt="Heat distribution and spatial autocorrelation" /></section>}
     {Object.keys(scenario).length > 0 && <section><h3>Within-run scenario comparison</h3><DataTable data={rows(scenario.scenarios)} />{rows(scenario.comparisons).length > 0 && <><h4>Changes from baseline</h4><DataTable data={rows(scenario.comparisons)} /></>}</section>}

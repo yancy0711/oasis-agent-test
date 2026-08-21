@@ -65,7 +65,7 @@ export async function getStreetView(latitude: number, longitude: number, radiusM
 }
 
 export interface LlmConnectionInput {
-  provider: "openai" | "openrouter" | "custom" | "local";
+  provider: "gemini" | "openai" | "openrouter" | "custom" | "local";
   base_url: string;
   model: string;
   api_key: string;
@@ -155,6 +155,20 @@ export async function reverseRouteOrigin(
     let detail: unknown;
     try { detail = await response.json(); } catch { detail = await response.text(); }
     throw apiError(detail, "Could not identify the current location.");
+  }
+  return response.json() as Promise<CoordinateOriginResult>;
+}
+
+export async function searchRouteOrigin(query: string): Promise<CoordinateOriginResult> {
+  const response = await fetch("/api/v1/places/search-origin", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query }),
+  });
+  if (!response.ok) {
+    let detail: unknown;
+    try { detail = await response.json(); } catch { detail = await response.text(); }
+    throw apiError(detail, "Could not search for this route origin.");
   }
   return response.json() as Promise<CoordinateOriginResult>;
 }

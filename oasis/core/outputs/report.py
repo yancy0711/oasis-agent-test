@@ -287,6 +287,20 @@ def render_diagnostic_report(recovery: dict | None, diagnostics: dict) -> str:
     lines = ["# Feasibility Diagnostic", ""]
     if recovery: lines += [recovery["diagnosis"], "", f"Next decision: {recovery['question']}"]
     else: lines.append("The requested diagnostic completed successfully.")
+    answers = diagnostics.get("result_query_answers", {}).get("answers", [])
+    if answers:
+        lines.extend(["", "## Requested result queries", ""])
+        for answer in answers:
+            computation = answer.get("computation", {})
+            lines.extend([f"### {answer.get('metric_label', 'Requested metric').title()}",
+                          answer.get("method", ""),
+                          f"Formula: `{computation.get('formula', 'recorded indicator ranking')}`",
+                          f"Data basis: {computation.get('data_basis', '')}"])
+            for row in answer.get("top_rows", []):
+                lines.append(
+                    f"- {row.get('rank')}. Tract {row.get('GEOID')}: "
+                    f"{answer.get('metric_label', 'requested metric')} = {row.get('value'):.3f}"
+                )
     facilities = diagnostics.get("minimum_facilities", {})
     if facilities:
         value = facilities.get("minimum_facilities")
@@ -299,6 +313,15 @@ def render_diagnostic_report(recovery: dict | None, diagnostics: dict) -> str:
         display = f"{value:.1f} minutes" if value is not None else "not achievable with the current travel matrix"
         lines += ["", "## Fixed-budget lower bound", f"- Feasible: {threshold.get('feasible', False)}",
                   f"- Minimum threshold: {display}", f"- Facilities: {threshold.get('n_facilities', 'unknown')}"]
+    approximate_threshold = diagnostics.get("approximate_minimum_threshold", {})
+    if approximate_threshold:
+        value = approximate_threshold.get("minimum_threshold_minutes")
+        display = f"{value:.1f} minutes" if value is not None else "unavailable"
+        lines += ["", "## Approximate complementary bound",
+                  "- Accuracy: Haversine screening estimate; not an ORS network result",
+                  f"- Estimated minimum threshold: {display}",
+                  f"- Facilities: {approximate_threshold.get('n_facilities', 'unknown')}",
+                  f"- Interpretation: {approximate_threshold.get('interpretation', '')}"]
     reachability = diagnostics.get("reachability_analysis", {})
     if reachability:
         lines += ["", "## Reachability review",
@@ -328,11 +351,11 @@ def render_heat_report(task: TaskSpec, summary: dict, lineage: list[Provenance])
     spatial = ("Global Moran's I could not be estimated because the retained tracts lack usable adjacency or temperature variation."
                if moran is None else f"Global Moran's I is {moran:.3f} with a two-sided permutation p-value of {p_value:.3f} "
                f"({stats['permutations']} permutations; {stats['islands']} tract islands).")
-    hottest = "\n".join(f"- Tract {row['GEOID']}: {row['heat_exposure']:.1f} C" for row in summary["top_tracts"])
+    hottest = "\n".join(f"- Tract {row['GEOID']}: {row['heat_exposure']:.1f} °C" for row in summary["top_tracts"])
     sources = "\n".join(f"- {item.source} ({item.tier} tier, {item.record_count} records) {item.notes}" for item in lineage)
     return (f"# Heat Exposure Review — {task.place_name}\n\n## Deterministic findings\n\n"
             f"- Tracts reviewed: {stats['tracts']}\n- Mean temperature: {stats['mean_c']:.1f} °C; range: {stats['minimum_c']:.1f}–{stats['maximum_c']:.1f} °C\n"
-            f"- {spatial}\n\n## Highest-exposure tracts\n\n{hottest}\n\n## Data provenance and interpretation limits\n\n{sources}\n\n"
+            f"- {spatial}\n\n## Highest-exposure tracts\n\n{hottest}\n\n## Measurement basis\n\n{summary.get('evidence_basis', 'Landsat-derived tract heat exposure.')}\n\n## Data provenance and interpretation limits\n\n{sources}\n\n"
             "> Temperatures are Landsat-derived land-surface temperature aggregated to Census tracts. Moran's I measures spatial clustering, not causation.\n")
 
 

@@ -14,7 +14,8 @@ import pandas as pd
 from oasis.agent.context import Context
 from oasis.contracts.domain import Provenance, TaskSpec, ToolError, ToolResult, ValueWeights
 from oasis.core.outputs.charts import heat_analysis_chart, pareto_chart
-from oasis.core.outputs.maps import comparison_map, coverage_map, heat_exposure_map, reachability_map
+from oasis.core.outputs.maps import (comparison_map, coverage_map, heat_exposure_map,
+                                     reachability_map, tract_indicator_map)
 from oasis.core.outputs.report import render_heat_report, render_report
 from oasis.core.cache import scoped_cache
 from oasis.core.cancellation import RunCancelled
@@ -735,8 +736,13 @@ def summarize_heat_exposure(ctx: Context, limit: int = 10) -> ToolResult:
                                          str(out / "heat_analysis.png"), str(out / "heat_report.md"))
     heat_exposure_map(areas, map_path, study["boundary"])
     statistics = heat_analysis_chart(areas, chart_path)
+    methods = areas.get("heat_exposure_method", pd.Series(dtype=str)).value_counts().to_dict()
     summary = {"top_tracts": hottest.to_dict("records"), "tracts_reviewed": len(areas),
                "statistics": statistics, "map": map_path, "analysis_chart": chart_path, "report": report_path}
+    summary["evidence_basis"] = (
+        "Landsat 8/9 Collection 2 Level-2 land-surface temperature, population-weighted where "
+        f"the configured population evidence was valid; recorded aggregation methods: {methods or 'not reported'}."
+    )
     Path(report_path).write_text(render_heat_report(task, summary, ctx.lineage), encoding="utf-8")
     ctx.put("heat_summary", summary)
     return ToolResult(ok=True, tool="summarize_heat_exposure", handle="heat_summary", summary=summary)
@@ -874,6 +880,7 @@ def build_travel_matrix(ctx: Context, demand_handle: str = "demand",
             report.get("tier") == "cache" for report in mode_reports.values()
         ) else "live" if precise else "fallback" if reason else "approximate",
         "mobility_scenario": scenario,
+        "policy_minutes": policy_minutes,
         "modes": list(modes),
         "mode_reports": mode_reports,
         "mode_population_share": composed["mode_population_share"],
@@ -1190,9 +1197,258 @@ def analyze_reachability(ctx: Context, threshold_minutes: float = 15,
                "maximum_tract_coverage": float((reachable_count[mask] > 0).mean()),
                "unserved_demand_ids": [ids[index] for index in np.flatnonzero(mask & (reachable_count == 0))],
                "structurally_unreachable_ids": [ids[index] for index in np.flatnonzero(mask & ~np.isfinite(nearest))],
-               "hardest_demand": rows[:max(1, limit)], "map": map_path}
+               "hardest_demand": rows[:max(1, limit)], "map": map_path,
+               "evidence_basis": (
+                   f"Nearest-candidate travel times use the {(travel.get('routing_report') or {}).get('router', travel.get('router', 'recorded'))} "
+                   f"matrix and the confirmed {threshold_minutes:g}-minute threshold."
+               )}
     ctx.put("reachability_analysis", summary)
     return ToolResult(ok=True, tool="analyze_reachability", handle="reachability_analysis", summary=summary)
+
+
+def _answer_result_query(ctx: Context, request, query_index: int) -> dict:
+    """Evaluate one typed, read-only result query over already computed handles."""
+    task, demand = ctx.get("task"), ctx.get("demand")
+    if request.metric == "unsupported":
+        raise ValueError(
+            "The requested tract property is not available in the approved run evidence; "
+            "add a reviewed data source before ranking it."
+        )
+    areas = demand["areas"].copy().reset_index(drop=True)
+    metric = request.metric
+    labels = {
+        "heat_exposure": "heat exposure",
+        "vulnerability": "composite vulnerability",
+        "access_disadvantage": "access disadvantage",
+        "combined_disadvantage": "combined vulnerability and access disadvantage",
+        "coverage_gap": "population share outside the confirmed access threshold",
+    }
+    heat_methods = areas.get("heat_exposure_method", pd.Series(dtype=str)).value_counts().to_dict()
+    heat_basis = (
+        "Landsat 8/9 Collection 2 Level-2 land-surface temperature, population-weighted where "
+        f"the configured population evidence was valid; recorded aggregation methods: {heat_methods or 'not reported'}."
+    )
+    vulnerability = ctx.get("vulnerability_analysis", {})
+    indicator_names = (vulnerability.get("correlation") or {}).get("indicators", [])
+    active_scheme = vulnerability.get("active_scheme", "configured")
+    active_weights = ((vulnerability.get("weight_sensitivity") or {}).get("schemes") or {}).get(active_scheme, {})
+    indicator_labels = {
+        "elderly_ratio": "elderly ratio", "poverty_rate": "poverty rate",
+        "heat_exposure": "heat exposure", "environment_burden": "environment burden",
+        "population_density": "population density",
+    }
+    weight_terms = [
+        f"{float(weight):.2f} R({indicator_labels.get(str(name), str(name).replace('_', ' '))})"
+        for name, weight in active_weights.items() if isinstance(weight, (int, float)) and float(weight) != 0
+    ]
+    vulnerability_formula = "V_i = " + " + ".join(weight_terms) if weight_terms else "V_i = sum_k beta_k R(x_ik)"
+    vulnerability_basis = (
+        f"The {active_scheme.replace('_', ' ')} vulnerability composite uses audited, "
+        f"percentile-normalized {', '.join(indicator_labels.get(str(name), str(name).replace('_', ' ')) for name in indicator_names) or 'configured indicators'}."
+    )
+    map_indicator = metric
+    if metric == "heat_exposure":
+        values = pd.to_numeric(areas["heat_exposure"], errors="coerce")
+    elif metric == "vulnerability":
+        values = pd.to_numeric(areas["vulnerability_score"], errors="coerce")
+        map_indicator = "vulnerability_score"
+    else:
+        travel, candidates = ctx.get("travel"), ctx.get("candidates")
+        matrix, population, _, _ = _decision_inputs(demand, travel)
+        candidate_ids = candidates["cand_id"].astype(str).tolist()
+        selected_ids = (
+            ctx.get("analysis")["solution"].selected_ids
+            if ctx.has("analysis") else candidate_ids
+        )
+        selected = [index for index, candidate_id in enumerate(candidate_ids)
+                    if candidate_id in set(map(str, selected_ids))]
+        if not selected:
+            raise ValueError("The confirmed analysis has no candidate facilities to rank access")
+        router = (travel.get("routing_report") or {}).get("router", travel.get("router", "recorded travel matrix"))
+        router_label = {
+            "ors": "OpenRouteService network", "ors_sparse": "cached OpenRouteService network",
+            "haversine": "Haversine approximation",
+        }.get(str(router), str(router).replace("_", " "))
+        candidate_basis = "selected facilities" if ctx.has("analysis") else "all retained candidate facilities"
+        access_basis = (
+            f"Travel times come from the {router_label} matrix to {candidate_basis}, using the confirmed "
+            f"{float(task.threshold_minutes):g}-minute threshold."
+        )
+        nearest = np.min(matrix[:, selected], axis=1)
+        disadvantage = np.where(
+            np.isfinite(nearest), np.clip(nearest / float(task.threshold_minutes), 0.0, 1.0), 1.0
+        )
+        base_index = np.asarray(travel.get("base_index", np.arange(len(matrix))), dtype=int)
+        grouped = pd.DataFrame({"base": base_index, "value": disadvantage, "population": population})
+        grouped["weighted"] = grouped["value"] * grouped["population"]
+        totals = grouped.groupby("base", sort=False)[["weighted", "population"]].sum()
+        access = totals["weighted"] / totals["population"].replace(0, np.nan)
+        areas["access_disadvantage"] = pd.Series(access, index=access.index).reindex(areas.index)
+        if metric == "access_disadvantage":
+            values = areas["access_disadvantage"]
+        elif metric == "coverage_gap":
+            gap = np.where(np.isfinite(nearest) & (nearest < float(task.threshold_minutes)), 0.0, 1.0)
+            gap_frame = pd.DataFrame({"base": base_index, "value": gap, "population": population})
+            gap_frame["weighted"] = gap_frame["value"] * gap_frame["population"]
+            gap_totals = gap_frame.groupby("base", sort=False)[["weighted", "population"]].sum()
+            gap_values = gap_totals["weighted"] / gap_totals["population"].replace(0, np.nan)
+            areas["coverage_gap"] = pd.Series(gap_values, index=gap_values.index).reindex(areas.index)
+            values = areas["coverage_gap"]
+        else:
+            vulnerability = pd.to_numeric(areas["vulnerability_score"], errors="coerce")
+            values = (
+                vulnerability.rank(method="average", pct=True)
+                + areas["access_disadvantage"].rank(method="average", pct=True)
+            ) / 2.0
+            areas["combined_disadvantage"] = values
+    areas[map_indicator] = values
+    valid = areas.loc[values.notna()].copy()
+    if request.scope == "vulnerable":
+        vulnerable = np.asarray(demand.get("vulnerable_mask", []), dtype=bool)
+        scope_base = np.asarray(
+            ctx.get("travel", {}).get("base_index", demand.get("base_index", np.arange(len(vulnerable)))),
+            dtype=int,
+        )
+        if len(vulnerable) and len(scope_base) == len(vulnerable):
+            vulnerable_by_area = pd.Series(vulnerable).groupby(scope_base).any()
+            valid = valid.loc[valid.index.map(lambda index: bool(vulnerable_by_area.get(index, False)))]
+    valid = valid.sort_values(map_indicator, ascending=request.direction == "lowest")
+    selected_rows = valid.head(request.limit)
+    wgs84 = selected_rows.to_crs("EPSG:4326")
+    rows = []
+    for rank, (_, row) in enumerate(wgs84.iterrows(), start=1):
+        point = row.geometry.representative_point()
+        item = {
+            "rank": rank,
+            "GEOID": str(row.get("GEOID", "")),
+            "metric": labels[metric],
+            "value": float(row[map_indicator]),
+            "longitude": float(point.x), "latitude": float(point.y),
+        }
+        supporting_fields = {
+            "heat_exposure": ("heat_exposure_c",),
+            "vulnerability": ("vulnerability_score",),
+            "access_disadvantage": ("access_disadvantage",),
+            "combined_disadvantage": ("vulnerability_score", "access_disadvantage"),
+            "coverage_gap": ("coverage_gap",),
+        }[metric]
+        for field in supporting_fields:
+            source = "heat_exposure" if field == "heat_exposure_c" else field
+            item[field] = None if pd.isna(row.get(source)) else float(row[source])
+        rows.append(item)
+    study = ctx.get("study")
+    out = Path(_cfg(ctx, "output").get("dir", "outputs_run")); out.mkdir(parents=True, exist_ok=True)
+    map_path = str(out / f"result_query_{query_index + 1}_{metric}.geojson")
+    tract_indicator_map(areas, map_indicator, map_path, study.get("boundary"))
+    formula = (
+        "S_i = 0.5 rank_pct(V_i) + 0.5 rank_pct(D_i)"
+        if metric == "combined_disadvantage" else
+        "D_i = 1 - max_j[max(0, 1 - d_ij / T)]"
+        if metric == "access_disadvantage" else
+        "C_i = sum_r(P_ir I[d_ir >= T]) / sum_r(P_ir)"
+        if metric == "coverage_gap" else
+        vulnerability_formula
+        if metric == "vulnerability" else
+        "E_i = sum_g(P_g LST_g) / sum_g(P_g)"
+    )
+    terms = {
+        "combined_disadvantage": {
+            "V_i": vulnerability_formula,
+            "D_i": "one minus the best gradual access to the evaluated facilities",
+            "rank_pct": "within-study percentile rank",
+        },
+        "access_disadvantage": {
+            "d_ij": "recorded travel time from demand unit i to candidate j",
+            "T": "confirmed travel-time threshold",
+        },
+        "coverage_gap": {
+            "P_ir": "population represented by travel-matrix row r in tract i",
+            "I": "1 when no evaluated candidate is reachable inside the threshold",
+        },
+        "vulnerability": {"R": "within-study percentile normalization", "beta_k": "confirmed indicator weight"},
+        "heat_exposure": {"P_g": "population in sub-tract unit g", "LST_g": "Landsat land-surface temperature"},
+    }[metric]
+    source_fields = {
+        "heat_exposure": ["demand.areas.heat_exposure", "demand.areas.heat_exposure_method"],
+        "vulnerability": ["demand.areas.vulnerability_score", "vulnerability_analysis.weight_sensitivity"],
+        "access_disadvantage": ["travel.matrix", "candidates.cand_id"],
+        "combined_disadvantage": ["demand.areas.vulnerability_score", "travel.matrix", "candidates.cand_id"],
+        "coverage_gap": ["travel.matrix", "demand.population", "candidates.cand_id"],
+    }[metric]
+    parameters = {}
+    if metric in {"vulnerability", "combined_disadvantage"}:
+        parameters.update(weight_scheme=active_scheme, weights=active_weights)
+    if metric in {"access_disadvantage", "combined_disadvantage", "coverage_gap"}:
+        parameters.update(
+            threshold_minutes=float(task.threshold_minutes),
+            router=(ctx.get("travel", {}).get("routing_report") or {}).get(
+                "router", ctx.get("travel", {}).get("router")
+            ),
+            facilities="selected" if ctx.has("analysis") else "all retained candidates",
+        )
+    if metric == "heat_exposure":
+        parameters["aggregation_methods"] = heat_methods
+    return {
+        "raw_text": request.raw_text,
+        "metric": metric,
+        "metric_label": labels[metric],
+        "direction": request.direction,
+        "scope": request.scope,
+        "top_rows": rows,
+        "map": map_path,
+        "method": (
+            "Ranks the combined within-study vulnerability and access-disadvantage score."
+            if metric == "combined_disadvantage" else
+            "Ranks one minus the best gradual access available to each tract."
+            if metric == "access_disadvantage" else
+            "Ranks the population share without a candidate inside the threshold."
+            if metric == "coverage_gap" else
+            "Ranks the audited tract indicator directly."
+        ),
+        "computation": {
+            "formula": formula,
+            "terms": terms,
+            "parameters": parameters,
+            "source_fields": source_fields,
+            "data_basis": (
+                heat_basis if metric == "heat_exposure" else
+                vulnerability_basis if metric == "vulnerability" else
+                access_basis if metric in {"access_disadvantage", "coverage_gap"} else
+                f"{vulnerability_basis} {access_basis}"
+            ),
+        },
+    }
+
+
+@registry.register(
+    "answer_result_queries",
+    "Answer confirmed read-only result queries over already computed demand, travel, and solution handles.",
+)
+@_guard("answer_result_queries")
+def answer_result_queries(ctx: Context) -> ToolResult:
+    """Answer every confirmed result query without changing the primary decision."""
+    task = ctx.get("task")
+    if not task.result_queries:
+        raise ValueError("No result query was confirmed")
+    answers = [_answer_result_query(ctx, request, index)
+               for index, request in enumerate(task.result_queries)]
+    outputs = ctx.get("outputs", {})
+    report_path = outputs.get("report") if isinstance(outputs, dict) else None
+    if report_path:
+        lines = ["\n## Requested result queries\n"]
+        for answer in answers:
+            lines.extend([f"### {answer['metric_label'].title()}", answer["method"],
+                          f"Formula: `{answer['computation']['formula']}`",
+                          f"Data basis: {answer['computation']['data_basis']}"])
+            for row in answer["top_rows"]:
+                lines.append(
+                    f"- {row['rank']}. Tract {row['GEOID']}: {answer['metric_label']} = {row['value']:.3f}"
+                )
+        with Path(report_path).open("a", encoding="utf-8") as report:
+            report.write("\n".join(lines) + "\n")
+    summary = {"answers": answers, "answered": len(answers)}
+    ctx.put("result_query_answers", summary)
+    return ToolResult(ok=True, tool="answer_result_queries", handle="result_query_answers", summary=summary)
 
 
 @registry.register(
@@ -1232,11 +1488,8 @@ def run_sensitivity_analysis(
     if any(value < 1 or value > len(candidate_ids) for value in counts):
         raise ValueError(f"Facility counts must be between 1 and {len(candidate_ids)}")
     task = ctx.get("task", None)
-    routed_limit = max(
-        [float(getattr(task, "threshold_minutes", max(thresholds))),
-         *map(float, getattr(task, "sensitivity_thresholds", []) or [])]
-    )
-    if max(thresholds) > routed_limit + 1e-9:
+    routed_limit = (travel.get("routing_report") or {}).get("policy_minutes")
+    if routed_limit is not None and max(thresholds) > float(routed_limit) + 1e-9:
         raise ValueError(
             "A sensitivity threshold exceeds the confirmed routed range; revise the task "
             "so the travel matrix is rebuilt for that threshold"

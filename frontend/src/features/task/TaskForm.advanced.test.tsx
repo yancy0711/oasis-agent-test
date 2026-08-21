@@ -7,6 +7,22 @@ import { taskFromDraft } from "./taskForm.mapper";
 afterEach(cleanup);
 
 describe("advanced task editor", () => {
+  it("keeps route tasks simple while leaving advanced controls available", () => {
+    const task = taskFromDraft({
+      place_name: "Phoenix",
+      route_origin: { entity: "Papago Park", context: "Phoenix", positional_hint: "", raw_text: "Papago Park", source: "llm" },
+    });
+    const { container } = render(<TaskEditorProvider><TaskForm task={task} mode="auto" ready pending={false} uploadPending={false} uploadedName={null}
+      profiles={[]} onModeChange={() => undefined} onUpload={() => undefined} onSubmit={() => undefined} /></TaskEditorProvider>);
+    const step = container.querySelector(".task-step-disclosure") as HTMLDetailsElement;
+    expect(screen.getByText("Step 3")).toBeInTheDocument();
+    expect(step.open).toBe(true);
+    expect(screen.getByRole("button", { name: "Run confirmed agent" })).toBeInTheDocument();
+    expect(screen.getByText(/Supporting defaults:/)).toBeInTheDocument();
+    const advanced = container.querySelector(".task-settings-disclosure") as HTMLDetailsElement;
+    expect(advanced.open).toBe(true);
+  });
+
   it("submits untouched default weights", async () => {
     const submit = vi.fn();
     render(<TaskEditorProvider><TaskForm task={taskFromDraft({ place_name: "Phoenix" })} mode="auto" ready pending={false} uploadPending={false} uploadedName={null}
@@ -23,6 +39,40 @@ describe("advanced task editor", () => {
     await waitFor(() => expect(submit).toHaveBeenCalledOnce());
     expect(submit.mock.calls[0][0].weights).toEqual({ population_density: .35, elderly_ratio: .15, poverty_rate: .15, heat_exposure: .2, environment_burden: .15 });
     expect(submit.mock.calls[0][0].candidate_amenities).toEqual(["library", "community_centre", "school", "sports_centre", "arts_centre", "place_of_worship"]);
+  });
+
+  it("shows read-only result questions separately from the facility budget", () => {
+    const task = taskFromDraft({
+      place_name: "Washington, District of Columbia, USA",
+      n_facilities: 10,
+      result_queries: [{
+        metric: "combined_disadvantage", direction: "highest", limit: 5,
+        scope: "all", raw_text: "Which five places need the most attention?",
+      }],
+    });
+    render(<TaskEditorProvider><TaskForm task={task} mode="auto" ready pending={false} uploadPending={false} uploadedName={null}
+      profiles={[]} onModeChange={() => undefined} onUpload={() => undefined} onSubmit={() => undefined} /></TaskEditorProvider>);
+
+    expect(screen.getByText("5 tract(s) by combined disadvantage (highest)")).toBeInTheDocument();
+    expect(screen.getByText(/do not change the facility budget/i)).toBeInTheDocument();
+  });
+
+  it("offers direct choices for a typed model ambiguity", () => {
+    const choose = vi.fn();
+    const task = taskFromDraft({
+      place_name: "San Francisco, California, USA",
+      ambiguities: [{
+        field: "analysis_goal",
+        candidates: ["facility_siting", "minimum_facilities"],
+        question: "Is the count a fixed budget or a minimum-number question?",
+      }],
+    });
+    render(<TaskEditorProvider><TaskForm task={task} mode="auto" ready pending={false} uploadPending={false} uploadedName={null}
+      profiles={[]} onModeChange={() => undefined} onUpload={() => undefined}
+      onResolveAmbiguity={choose} onSubmit={() => undefined} /></TaskEditorProvider>);
+
+    fireEvent.click(screen.getByRole("button", { name: "minimum facilities" }));
+    expect(choose).toHaveBeenCalledWith(0, "minimum_facilities");
   });
 
   it("applies recommendations and submits operating and sensitivity controls", async () => {

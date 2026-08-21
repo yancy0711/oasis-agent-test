@@ -70,10 +70,10 @@ export function PromptInput({ pending, onSubmit, onCancel, onUseLocation }: Prom
       <details className="mobile-step-disclosure" open={!mobile || stepOpen} onToggle={(event) => {
         if (mobile) setStepOpen(event.currentTarget.open);
       }}>
-      <summary><span><span className="form-step">Step 1</span> Describe the cooling-access question</span><InfoLabel label="Describe the cooling-access question">State the US city or county, candidate-facility question, travel threshold, and policy priorities. Unsupported real-time or parcel questions return a suggested official alternative.</InfoLabel></summary>
+      <summary><span className="step-heading step-heading--summary"><span className="form-step">Step 1</span><span>Describe the cooling-access question</span></span><InfoLabel label="Describe the cooling-access question">State the US city or county, candidate-facility question, travel threshold, and policy priorities. Unsupported real-time or parcel questions return a suggested official alternative.</InfoLabel></summary>
       <div className="mobile-step-body">
       <div className="prompt-label">
-        <label htmlFor="prompt"><span className="form-step">Step 1</span> Describe the cooling-access question</label>
+        <label className="step-heading" htmlFor="prompt"><span className="form-step">Step 1</span><span>Describe the cooling-access question</span></label>
         <InfoLabel label="Describe the cooling-access question">State the US city or county, candidate-facility question, travel threshold, and policy priorities. Unsupported real-time or parcel questions return a suggested official alternative.</InfoLabel>
       </div>
       <div className="prompt-audience-tabs" role="tablist" aria-label="Choose how you want to use OASIS">

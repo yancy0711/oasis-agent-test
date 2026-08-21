@@ -2,8 +2,7 @@ import { useRef, useState, type FormEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { PlaceResolveResponse, RouteOriginCandidate, RoutingMode, TaskSpec } from "../../api/models";
 import type { RequestDisposition } from "../../api/models";
-import { getConfig } from "../../api/client";
-import { reverseRouteOrigin } from "../../api/client";
+import { getConfig, reverseRouteOrigin, searchRouteOrigin } from "../../api/client";
 import { configKeys } from "../../api/queryKeys";
 import { useAppStore } from "../../store/appStore";
 import { useStartRun } from "../run/run.mutations";
@@ -14,7 +13,6 @@ import { PromptInput } from "./PromptInput";
 import { LlmSettings } from "./LlmSettings";
 import { TaskForm, type ValueProfile } from "./TaskForm";
 import { taskFromDraft, toTaskSpec } from "./taskForm.mapper";
-import { useMediaQuery } from "../../hooks/useMediaQuery";
 import type { TaskFormValues } from "./taskForm.schema";
 import {
   useConfirmPlace,
@@ -31,10 +29,10 @@ export function TaskWorkspace() {
   const [originRefinement, setOriginRefinement] = useState("");
   const [selectedRouteOriginId, setSelectedRouteOriginId] = useState<string | null>(null);
   const [routeOriginCandidates, setRouteOriginCandidates] = useState<RouteOriginCandidate[]>([]);
+  const [placeNameOptions, setPlaceNameOptions] = useState<string[]>([]);
   const [uploadedName, setUploadedName] = useState<string | null>(null);
   const [decision, setDecision] = useState<{ disposition: RequestDisposition; reason: string; alternative: string } | null>(null);
   const [draftLocked, setDraftLocked] = useState(false);
-  const mobile = useMediaQuery("(max-width: 620px)");
   const [routeStepOpen, setRouteStepOpen] = useState(true);
   const parseController = useRef<AbortController | null>(null);
   const confirmedPlace = useAppStore((state) => state.confirmedPlace);
@@ -70,9 +68,25 @@ export function TaskWorkspace() {
     ?? uploadMutation.error ?? startMutation.error;
 
   async function resolve(name: string) {
-    const value = await resolveMutation.mutateAsync(name);
-    setResolution(value);
-    return value;
+    try {
+      const value = await resolveMutation.mutateAsync(name);
+      setResolution(value);
+      return value;
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason);
+      if (message.includes("outside the United States") || message.includes("supports US city and county")) {
+        resolveMutation.reset();
+        setTask(null);
+        setResolution(null);
+        setDecision({
+          disposition: "out_of_scope",
+          reason: message,
+          alternative: "Choose a city or county in the United States.",
+        });
+        return null;
+      }
+      throw reason;
+    }
   }
 
   async function analyze(prompt: string) {
@@ -82,17 +96,31 @@ export function TaskWorkspace() {
     setConfirmedPlace(null);
     setResolution(null);
     setRouteOriginCandidates([]);
+    setPlaceNameOptions([]);
     setSelectedRouteOriginId(null);
     setDraftLocked(false);
     try {
       const parsed = await parseMutation.mutateAsync({ prompt, signal: controller.signal });
       if (controller.signal.aborted) return;
-      setDecision({ disposition: parsed.disposition, reason: parsed.reason, alternative: parsed.alternative });
+      const parsedDecision = {
+        disposition: parsed.disposition,
+        reason: parsed.reason,
+        alternative: parsed.alternative,
+      };
       setRouteOriginCandidates(parsed.route_origin_candidates ?? []);
-      if (!parsed.task) { setTask(null); return; }
+      setPlaceNameOptions(parsed.place_name_options ?? []);
+      if (!parsed.task) { setDecision(parsedDecision); setTask(null); return; }
       const nextTask = taskFromDraft(parsed.task);
       setTask(nextTask);
-      if (nextTask.place_name && !(parsed.route_origin_candidates?.length)) await resolve(nextTask.place_name);
+      if (nextTask.place_name && !(parsed.route_origin_candidates?.length) && !(parsed.place_name_options?.length)) {
+        setDecision({
+          disposition: "needs_clarification",
+          reason: "Checking that the study area is a supported US city or county.",
+          alternative: "",
+        });
+        const resolved = await resolve(nextTask.place_name);
+        if (resolved) setDecision(parsedDecision);
+      } else setDecision(parsedDecision);
     } catch (reason) {
       if (!(reason instanceof DOMException && reason.name === "AbortError")) throw reason;
     } finally {
@@ -119,6 +147,26 @@ export function TaskWorkspace() {
     if (resolution) await confirmResolution(resolution, candidateId);
   }
 
+  async function chooseStudyArea(placeName: string) {
+    const remainingAmbiguities = task?.ambiguities?.filter((item) => item.field !== "place_names") ?? [];
+    setConfirmedPlace(null);
+    setResolution(null);
+    setTask((current) => current ? {
+      ...current, place_name: placeName, place_names: [placeName], ambiguities: remainingAmbiguities,
+    } : current);
+    setPlaceNameOptions([]);
+    setDecision({
+      disposition: "needs_clarification",
+      reason: remainingAmbiguities.length
+        ? remainingAmbiguities.map((item) => item.question).join(" ")
+        : `Resolving ${placeName} as the single study area for this run.`,
+      alternative: remainingAmbiguities.length
+        ? "Review the corresponding editable task fields before running."
+        : "Run the other named area separately if a cross-city comparison is required.",
+    });
+    await resolve(placeName);
+  }
+
   function submitManualPlace(event: FormEvent) {
     event.preventDefault();
     const value = manualPlace.trim();
@@ -143,6 +191,7 @@ export function TaskWorkspace() {
       },
     } : current);
     const resolved = await resolve(candidate.place_name);
+    if (!resolved) return;
     if (resolved.selected) {
       await confirmResolution(resolved, resolved.selected.candidate_id);
       setResolution(null);
@@ -233,10 +282,28 @@ export function TaskWorkspace() {
     );
   }
 
-  function refineRouteOrigin(event: FormEvent) {
+  async function refineRouteOrigin(event: FormEvent) {
     event.preventDefault();
     const value = originRefinement.trim();
-    if (value) void analyze(`I'm at ${value}. How can I find the nearest cooling facility?`);
+    if (!value || candidateSelectionLocked) return;
+    try {
+      const result = await searchRouteOrigin(value);
+      setSelectedRouteOriginId(null);
+      setRouteOriginCandidates(result.candidates);
+      setDecision({
+        disposition: "needs_clarification",
+        reason: result.message,
+        alternative: result.candidates.length
+          ? "Choose one origin below; the existing route-planning task is unchanged."
+          : "Enter a more specific US address or landmark.",
+      });
+    } catch (reason) {
+      setDecision({
+        disposition: "needs_clarification",
+        reason: reason instanceof Error ? reason.message : "Could not search for this route origin.",
+        alternative: "Enter a more specific US address or landmark.",
+      });
+    }
   }
 
   async function upload(file: File) {
@@ -256,6 +323,69 @@ export function TaskWorkspace() {
     });
   }
 
+  function resolveAmbiguity(index: number, candidate: string) {
+    setTask((current) => {
+      if (!current) return current;
+      const ambiguity = current.ambiguities?.[index];
+      if (!ambiguity) return current;
+      const next: TaskSpec = { ...current };
+      let applied = false;
+      const normalizedCandidate = candidate.trim().toLowerCase().replaceAll(" ", "_");
+      const goalAliases: Partial<Record<string, TaskSpec["analysis_goal"]>> = {
+        fixed_facility_budget: "facility_siting",
+        fixed_budget: "facility_siting",
+        calculate_minimum_number: "minimum_facilities",
+        minimum_facility_count: "minimum_facilities",
+      };
+      if (ambiguity.field === "n_facilities") {
+        const value = Number(candidate);
+        if (Number.isInteger(value) && value >= 1 && value <= 100) {
+          next.n_facilities = value;
+          applied = true;
+        }
+      } else if (ambiguity.field === "threshold_minutes") {
+        const value = Number(candidate);
+        if (Number.isFinite(value) && value > 0) {
+          next.threshold_minutes = value;
+          applied = true;
+        }
+      }
+      else if (ambiguity.field === "mobility_scenario" && ["walking", "cycling", "driving", "walk_drive_equity"].includes(candidate)) {
+        next.mobility_scenario = candidate as TaskSpec["mobility_scenario"];
+        applied = true;
+      } else if (ambiguity.field === "analysis_goal" && [
+        "facility_siting", "tract_review", "heat_review", "minimum_facilities",
+        "minimum_threshold", "reachability_review", "scenario_comparison", "sensitivity_analysis",
+      ].includes(normalizedCandidate)) {
+        next.analysis_goal = normalizedCandidate as TaskSpec["analysis_goal"];
+        applied = true;
+      } else if (ambiguity.field === "analysis_goal" && goalAliases[normalizedCandidate]) {
+        next.analysis_goal = goalAliases[normalizedCandidate]!;
+        applied = true;
+      } else if (ambiguity.field === "result_queries") {
+        const metric = normalizedCandidate;
+        if (["heat_exposure", "vulnerability", "access_disadvantage", "combined_disadvantage", "coverage_gap"].includes(metric)) {
+          next.result_queries = [{ metric: metric as NonNullable<TaskSpec["result_queries"]>[number]["metric"], direction: "highest", limit: 5, scope: "all", raw_text: ambiguity.question }];
+          applied = true;
+        }
+      }
+      if (!applied) return current;
+      const remaining = (current.ambiguities ?? []).filter((_, itemIndex) => itemIndex !== index);
+      next.ambiguities = remaining;
+      setDecision({
+        disposition: remaining.length ? "needs_clarification" : (
+          ["heat_review", "reachability_review", "tract_review", "minimum_facilities", "minimum_threshold"].includes(next.analysis_goal)
+            ? "quick_diagnostic" : "full_analysis"
+        ),
+        reason: remaining.length
+          ? "Another interpretation still needs confirmation."
+          : "The model interpretation is ready for boundary and task confirmation.",
+        alternative: remaining.map((item) => item.question).join(" "),
+      });
+      return next;
+    });
+  }
+
   return (
     <div className="task-workspace">
       <section className="panel panel--hero">
@@ -268,13 +398,11 @@ export function TaskWorkspace() {
       </section>
 
       {task && routeOriginCandidates.length > 0 && (
-        <details className="panel mobile-step-panel" data-study-area-step open={!mobile || routeStepOpen} onToggle={(event) => {
-          if (mobile) setRouteStepOpen(event.currentTarget.open);
-        }}>
+        <details className="panel mobile-step-panel" data-study-area-step open={routeStepOpen} onToggle={(event) => setRouteStepOpen(event.currentTarget.open)}>
           <summary>
           <div className="section-heading">
             <div>
-              <p className="eyebrow">Step 2 - Route origin</p>
+              <p className="step-heading"><span className="form-step">Step 2</span><span>Route origin</span></p>
               <h2>Confirm the intended location</h2>
             </div>
             <span className={`status ${confirmedPlace ? "status--success" : "status--warning"}`}>
@@ -303,7 +431,28 @@ export function TaskWorkspace() {
         </details>
       )}
 
-      {task && !task.place_name && routeOriginCandidates.length === 0 && (
+      {task && placeNameOptions.length > 1 && (
+        <section className="panel" data-study-area-step>
+          <div className="section-heading">
+            <div>
+              <p className="step-heading"><span className="form-step">Step 2</span><span>Study area</span></p>
+              <h2>Choose one area for this run</h2>
+            </div>
+            <span className="status status--warning">Confirmation required</span>
+          </div>
+          <p className="muted">Each area needs its own boundary, data lineage, travel matrix, and result. Saved runs can be compared afterward.</p>
+          <div className="candidate-list">
+            {placeNameOptions.map((placeName) => (
+              <button className="candidate-card" key={placeName} type="button" onClick={() => void chooseStudyArea(placeName)}>
+                <strong>{placeName}</strong>
+                <span>Use as this run's study area</span>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {task && !task.place_name && routeOriginCandidates.length === 0 && placeNameOptions.length === 0 && (
         <form className="panel inline-form" data-study-area-step onSubmit={submitManualPlace}>
           <label htmlFor="manual-place">The request needs a US city or county</label>
           <input id="manual-place" value={manualPlace} onChange={(event) => setManualPlace(event.target.value)} />
@@ -329,6 +478,7 @@ export function TaskWorkspace() {
           uploadPending={uploadMutation.isPending}
           uploadedName={uploadedName}
           profiles={profiles}
+          onResolveAmbiguity={resolveAmbiguity}
           onModeChange={setMode}
           onUpload={(file) => void upload(file)}
           onSubmit={run}

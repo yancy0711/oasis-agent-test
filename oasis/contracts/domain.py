@@ -62,11 +62,39 @@ class RouteOriginSpec(BaseModel):
     latitude: float | None = Field(None, ge=-90, le=90)
 
 
+class ResultQuery(BaseModel):
+    """One read-only question over computed results, separate from the decision budget."""
+
+    metric: Literal[
+        "heat_exposure", "vulnerability", "access_disadvantage",
+        "combined_disadvantage", "coverage_gap", "unsupported",
+    ]
+    direction: Literal["highest", "lowest"] = "highest"
+    limit: int = Field(5, ge=1, le=50)
+    scope: Literal["all", "vulnerable"] = "all"
+    raw_text: str = ""
+
+
+class Ambiguity(BaseModel):
+    """A typed uncertainty that must be confirmed instead of guessed."""
+
+    field: Literal[
+        "place_names", "n_facilities", "threshold_minutes", "analysis_goal",
+        "mobility_scenario", "result_queries",
+    ]
+    candidates: list[str] = Field(default_factory=list, max_length=10)
+    question: str = Field(min_length=1)
+
+
 class TaskSpec(BaseModel):
     """Structured, human-confirmable task extracted from natural language."""
-    place_name: str = Field(..., description="Geocodable US city or county")
+    place_name: str = Field("", description="One human-confirmed geocodable US city or county")
+    place_names: list[str] = Field(
+        default_factory=list, max_length=5,
+        description="All city or county names extracted from the request; one must be confirmed per run",
+    )
     intervention: Literal["cooling_center", "mobile_clinic", "monitoring_station"] = "cooling_center"
-    analysis_goal: Literal["facility_siting", "heat_review", "minimum_facilities",
+    analysis_goal: Literal["facility_siting", "tract_review", "heat_review", "minimum_facilities",
                            "minimum_threshold", "reachability_review", "scenario_comparison",
                            "sensitivity_analysis"] = "facility_siting"
     candidate_source: Literal["osm", "csv"] = "osm"
@@ -95,6 +123,11 @@ class TaskSpec(BaseModel):
     route_origin: RouteOriginSpec | None = Field(
         None, description="Structured point to plan from after candidate selection"
     )
+    result_queries: list[ResultQuery] = Field(
+        default_factory=list, max_length=8,
+        description="Read-only questions answered after the primary deterministic analysis",
+    )
+    ambiguities: list[Ambiguity] = Field(default_factory=list, max_length=8)
     regional_requirements: list[RegionalRequirement] = Field(default_factory=list)
     sensitivity_thresholds: list[float] = Field(default_factory=list, max_length=12)
     sensitivity_facility_counts: list[int] = Field(default_factory=list, max_length=12)

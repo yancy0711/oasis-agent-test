@@ -58,6 +58,10 @@ def _tract_properties(row: pd.Series, indicator: str) -> dict[str, Any]:
         ("mean_ndvi", "mean_ndvi", 3, 1),
         ("mean_ndbi", "mean_ndbi", 3, 1),
         ("mean_albedo", "mean_albedo", 3, 1),
+        ("vulnerability_score", "vulnerability_score", 3, 1),
+        ("access_disadvantage", "access_disadvantage", 3, 1),
+        ("combined_disadvantage", "combined_disadvantage", 3, 1),
+        ("coverage_gap", "coverage_gap", 3, 1),
         ("nearest_candidate_minutes", "nearest_candidate_minutes", 1, 1),
         ("reachable_candidates", "reachable_candidates", 0, 1),
         ("reachability_rank", "reachability_rank", 0, 1),
@@ -272,6 +276,16 @@ def heat_exposure_map(
 ) -> str:
     """Write a standalone tract heat-exposure dataset for the MapLibre client."""
     return _write_map(tracts, out_path, indicator="heat_exposure", boundary=boundary)
+
+
+def tract_indicator_map(
+    tracts: gpd.GeoDataFrame,
+    indicator: str,
+    out_path: str,
+    boundary: gpd.GeoDataFrame | None = None,
+) -> str:
+    """Write one requested tract-level diagnostic using the standard map contract."""
+    return _write_map(tracts, out_path, indicator=indicator, boundary=boundary)
 
 
 def reachability_map(

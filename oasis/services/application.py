@@ -125,17 +125,18 @@ class OasisService:
 
     def _validated_llm_url(self, provider: str, base_url: str, allow_private: bool) -> str:
         presets = {
+            "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
             "openai": "https://api.openai.com/v1",
             "openrouter": "https://openrouter.ai/api/v1",
         }
-        if provider in presets:
+        if provider in presets and base_url.rstrip("/") == presets[provider].rstrip("/"):
             return presets[provider]
         parsed = urlparse(base_url)
         if parsed.scheme not in ({"http", "https"} if provider == "local" else {"https"}) or not parsed.hostname:
             raise ValueError("Custom providers require an HTTPS base URL; local providers may use HTTP.")
         allowed_hosts = {str(value).lower() for value in self.cfg.get("llm", {}).get("allowed_custom_hosts", [])}
-        if provider == "custom" and not allow_private and parsed.hostname.lower() not in allowed_hosts:
-            raise ValueError("This custom endpoint is not approved by the server administrator. Use OpenAI, OpenRouter, or ask the administrator to allow its host.")
+        if provider != "local" and not allow_private and parsed.hostname.lower() not in allowed_hosts:
+            raise ValueError("This endpoint is not approved by the server administrator. Use the provider default or ask the administrator to allow its host.")
         try:
             addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))}
         except OSError as exc:
@@ -154,8 +155,8 @@ class OasisService:
     ) -> dict[str, Any]:
         """Validate one provider and retain its secret only in process memory."""
         provider = provider.lower()
-        if provider not in {"openai", "openrouter", "custom", "local"}:
-            raise ValueError("Choose OpenAI, OpenRouter, custom HTTPS, or a local model.")
+        if provider not in {"gemini", "openai", "openrouter", "custom", "local"}:
+            raise ValueError("Choose Gemini, OpenAI, OpenRouter, custom HTTPS, or a local model.")
         if not model.strip():
             raise ValueError("Model is required.")
         if provider != "local" and not api_key.strip():
@@ -229,8 +230,8 @@ class OasisService:
     ) -> dict[str, Any]:
         """Discover models from an explicitly configured endpoint without retaining its key."""
         provider = provider.lower()
-        if provider not in {"openai", "openrouter", "custom", "local"}:
-            raise ValueError("Choose OpenAI, OpenRouter, custom HTTPS, or a local model.")
+        if provider not in {"gemini", "openai", "openrouter", "custom", "local"}:
+            raise ValueError("Choose Gemini, OpenAI, OpenRouter, custom HTTPS, or a local model.")
         if provider not in {"local", "openrouter"} and not api_key.strip():
             raise ValueError("Enter an API key before checking available models.")
         endpoint = self._validated_llm_url(provider, base_url, allow_private)
@@ -277,6 +278,7 @@ class OasisService:
                 "message": scope.alternative, "reason": scope.reason,
                 "alternative": scope.alternative,
                 "route_origin_candidates": [],
+                "place_name_options": [],
                 "events": [{"kind": "scope", "stage": "request routing",
                             "message": scope.reason, "data": {"disposition": scope.disposition}}],
             }
@@ -288,8 +290,41 @@ class OasisService:
         except MissingPlaceError as exc:
             task = TaskSpec(**{**exc.task_data, "place_name": ""}).model_dump(mode="json")
             message, missing_place = str(exc), True
+        unsupported = [
+            query for query in task.get("result_queries", []) if query.get("metric") == "unsupported"
+        ]
+        supported = [
+            query for query in task.get("result_queries", []) if query.get("metric") != "unsupported"
+        ]
+        unsupported_notice = ""
+        if unsupported and (supported or task.get("analysis_goal") != "tract_review"):
+            labels = "; ".join(str(query.get("raw_text") or "unsupported property") for query in unsupported)
+            task["result_queries"] = supported
+            unsupported_notice = (
+                "Some requested properties were omitted because the approved run data do not contain them: "
+                f"{labels}"
+            )
+            task["notes"] = f"{str(task.get('notes') or '').strip()} [{unsupported_notice}]".strip()
+        elif unsupported:
+            question = unsupported[0].get("raw_text") or prompt
+            return {
+                "disposition": "out_of_scope", "task": None, "missing_place": False,
+                "message": (
+                    "OASIS does not have an approved tract-level indicator for this property. "
+                    "Use an official city, county, or research dataset and add it through a reviewed data adapter before analysis."
+                ),
+                "reason": f"The requested property is outside the currently available data: {question}",
+                "alternative": (
+                    "Use an official source for the requested attribute, document its version and direction, "
+                    "then add it to the audited preprocessing configuration."
+                ),
+                "route_origin_candidates": [],
+                "place_name_options": [],
+                "events": [event.model_dump(mode="json") for event in orch.ctx.history],
+            }
         route_origin = task.get("route_origin")
         route_candidates = []
+        route_origin_error = ""
         if route_origin:
             try:
                 entity = route_origin["entity"]
@@ -321,8 +356,10 @@ class OasisService:
                     message = "Choose the intended route origin, then confirm its city or county study area."
                 missing_place = False
             except ValueError as exc:
-                task = TaskSpec(**{**task, "place_name": ""}).model_dump(mode="json")
-                message, missing_place = str(exc), True
+                task = TaskSpec(**{**task, "route_origin": None}).model_dump(mode="json")
+                route_origin_error = str(exc)
+                message = route_origin_error
+                missing_place = not bool(str(task.get("place_name") or "").strip())
         if (not missing_place and task.get("analysis_goal") == "scenario_comparison"
                 and len(task.get("comparison_profiles") or []) < 2):
             return {
@@ -332,19 +369,54 @@ class OasisService:
                 "alternative": "For an efficiency and inequality comparison, start with Efficiency first and Equity first.",
                 "events": [event.model_dump(mode="json") for event in orch.ctx.history],
             }
-        disposition = "needs_clarification" if missing_place or route_candidates else (
-            "quick_diagnostic" if task.get("analysis_goal") in {"heat_review", "reachability_review"}
+        place_name_options = list(dict.fromkeys(
+            str(value).strip() for value in task.get("place_names", []) if str(value).strip()
+        ))
+        if len(place_name_options) > 1:
+            return {
+                "disposition": "needs_clarification", "task": task, "missing_place": False,
+                "message": "Choose one study area for this run.",
+                "reason": (
+                    "The request names multiple study areas. Each run keeps one boundary, data lineage, "
+                    "travel matrix, and optimization result."
+                ),
+                "alternative": "Run the other area separately, then compare the saved runs.",
+                "route_origin_candidates": route_candidates, "place_name_options": place_name_options,
+                "events": [event.model_dump(mode="json") for event in orch.ctx.history],
+            }
+        ambiguities = [item for item in task.get("ambiguities", []) if item.get("field") != "place_names"]
+        if ambiguities:
+            questions = " ".join(str(item.get("question", "")).strip() for item in ambiguities).strip()
+            return {
+                "disposition": "needs_clarification", "task": task, "missing_place": False,
+                "message": questions or "Confirm the ambiguous task fields before running.",
+                "reason": "The language model identified uncertainty instead of silently guessing.",
+                "alternative": questions or "Choose an option in the task confirmation panel.",
+                "route_origin_candidates": route_candidates,
+                "place_name_options": place_name_options,
+                "events": [event.model_dump(mode="json") for event in orch.ctx.history],
+            }
+        disposition = "needs_clarification" if missing_place or route_candidates or route_origin_error else (
+            "quick_diagnostic" if task.get("analysis_goal") in {
+                "heat_review", "reachability_review", "tract_review",
+                "minimum_facilities", "minimum_threshold",
+            }
             else "full_analysis"
         )
         reason = ("Choose the intended point and confirm how it should be interpreted." if route_candidates else
+                  "The route origin could not be resolved; the confirmed study area was preserved." if route_origin_error else
                   "A city or county is required before analysis." if missing_place else
                   "The named location is administrative, so it is being treated as the study area." if route_origin and not task.get("route_origin") else
                   "This reachability request prepares candidate facilities and then opens the existing point route planner." if route_origin else
                   "This request uses a bounded diagnostic workflow." if disposition == "quick_diagnostic" else
                   "This request uses the complete candidate facility analysis.")
+        if unsupported_notice:
+            reason = f"{reason} {unsupported_notice}"
         return {"disposition": disposition, "task": task, "missing_place": missing_place,
-                "message": message, "reason": reason, "alternative": message if missing_place else "",
+                "message": message, "reason": reason,
+                "alternative": message if missing_place or route_origin_error else "",
                 "route_origin_candidates": route_candidates,
+                "place_name_options": [],
                 "events": [event.model_dump(mode="json") for event in orch.ctx.history]}
 
     @staticmethod
@@ -438,6 +510,30 @@ class OasisService:
             "message": (
                 "Location found. Choose the smallest applicable city, town, village, "
                 "or county boundary."
+            ),
+            "candidates": candidates,
+        }
+
+    def search_route_origin(self, query: str) -> dict:
+        """Search a manually refined origin without invoking task classification again."""
+        choices, _ = route_origin_options(query.strip(), fallback_language=True)
+        candidates = []
+        for choice in choices:
+            if choice.get("longitude") is None or choice.get("latitude") is None:
+                continue
+            candidate = dict(choice)
+            # The user entered this value in the route-origin field. Even an
+            # administrative match therefore means its representative point,
+            # not a request to replace the task with an area-level diagnostic.
+            candidate["administrative"] = False
+            candidates.append(candidate)
+        return {
+            "outside_us": False,
+            "message": (
+                "Choose the intended route origin. Administrative matches use their "
+                "representative map coordinate until a more exact address is supplied."
+                if candidates else
+                "No US address or landmark matched this route-origin search."
             ),
             "candidates": candidates,
         }
@@ -700,9 +796,15 @@ class OasisService:
         self._add_artifact(manifest, "heat_analysis", heat.get("analysis_chart"), root)
         if "report" not in manifest: self._add_artifact(manifest, "report", heat.get("report"), root)
         diagnostics = payload.get("diagnostics") or {}
-        for handle in ("minimum_facilities", "minimum_threshold", "reachability_analysis", "scenario_comparison"):
+        for handle in ("minimum_facilities", "minimum_threshold", "reachability_analysis",
+                       "scenario_comparison", "result_query_answers"):
             if "map" not in manifest:
-                self._add_artifact(manifest, "map", (diagnostics.get(handle) or {}).get("map"), root)
+                diagnostic = diagnostics.get(handle) or {}
+                map_path = diagnostic.get("map")
+                if handle == "result_query_answers":
+                    answers = diagnostic.get("answers") or []
+                    map_path = answers[0].get("map") if answers else None
+                self._add_artifact(manifest, "map", map_path, root)
         if "report" not in manifest and (payload.get("recovery") or diagnostics):
             report = root / "feasibility_diagnostic.md"; report.parent.mkdir(parents=True, exist_ok=True)
             report.write_text(render_diagnostic_report(payload.get("recovery"), diagnostics), encoding="utf-8")
@@ -755,8 +857,50 @@ class OasisService:
         return {name: f"/v1/runs/{run_id}/artifacts/"
                       f"{'preview_' if preview else ''}{name}" for name in manifest}
 
+    @staticmethod
+    def _carry_preview_diagnostic_bounds(
+        task: TaskSpec, prior_preview: dict | None, payload: dict
+    ) -> None:
+        """Keep an explicitly labeled screening bound that sparse ORS cannot recompute."""
+        if task.analysis_goal != "minimum_facilities" or not prior_preview:
+            return
+        precise_diagnostics = payload.setdefault("diagnostics", {})
+        precise_facilities = precise_diagnostics.get("minimum_facilities") or {}
+        precise_threshold = precise_diagnostics.get("minimum_threshold") or {}
+        preview_threshold = (prior_preview.get("diagnostics") or {}).get("minimum_threshold") or {}
+        if (
+            precise_facilities.get("feasible")
+            or precise_threshold.get("feasible")
+            or not preview_threshold.get("feasible")
+        ):
+            return
+        screening = deepcopy(preview_threshold)
+        screening["accuracy"] = "approximate_haversine"
+        screening["interpretation"] = (
+            "Screening estimate retained from the approximate phase because the ORS "
+            "matrix is sparse outside the confirmed travel threshold."
+        )
+        precise_diagnostics["approximate_minimum_threshold"] = screening
+        prefix = str(payload.get("message") or "").strip()
+        preview_facilities = (prior_preview.get("diagnostics") or {}).get("minimum_facilities") or {}
+        coverage_target = float(preview_facilities.get("coverage_target", 1.0))
+        coverage_group = str(preview_facilities.get("coverage_group", "all")).replace("_", " ")
+        confirmed_threshold = float(preview_facilities.get("threshold_minutes", task.threshold_minutes))
+        minutes = float(screening["minimum_threshold_minutes"])
+        facilities = int(screening.get("n_facilities", task.n_facilities))
+        preview_message = (
+            f"No number of the retained candidate facilities can cover {coverage_target:.0%} "
+            f"of the {coverage_group} group within {confirmed_threshold:g} minutes. With "
+            f"{facilities} facilities, the smallest computed threshold is {minutes:.1f} "
+            f"minutes by {task.mobility_scenario.replace('_', ' ')}."
+        )
+        supplement = " The approximate Haversine screening result is retained"
+        supplement += f": {preview_message}"
+        payload["message"] = prefix + supplement
+
     def _execute_phase(
-        self, run_id: str, task: TaskSpec, spec: RunSpec, phase: str, *, preview: bool
+        self, run_id: str, task: TaskSpec, spec: RunSpec, phase: str, *, preview: bool,
+        prior_preview: dict | None = None,
     ) -> tuple[str, dict]:
         """Execute one auditable phase and return its terminal payload."""
         root = Path(self.cfg["output"]["dir"]) / "api_runs" / run_id / phase
@@ -809,6 +953,8 @@ class OasisService:
             for point in analysis.get("points", [])
         ]
         internal["task"] = spec.task.model_dump(mode="json")
+        if phase == "precise":
+            self._carry_preview_diagnostic_bounds(task, prior_preview, internal)
         internal["metrics"] = self._metrics(orch, internal)
         routing = internal.get("routing_status") or {}
         router_used = routing.get("router")
@@ -866,6 +1012,22 @@ class OasisService:
         payload = self._public(internal)
         payload["task"] = spec.task.model_dump(mode="json")
         payload["artifacts"] = self._publish_artifacts(run_id, phase, manifest, preview=preview)
+        if (
+            phase == "precise" and prior_preview
+            and "map" not in payload["artifacts"]
+            and (prior_preview.get("artifacts") or {}).get("map")
+        ):
+            payload["artifacts"]["map"] = prior_preview["artifacts"]["map"]
+            payload.setdefault("diagnostics", {}).setdefault(
+                "approximate_map", {}
+            ).update({
+                "retained": True,
+                "accuracy": "approximate_haversine",
+                "interpretation": (
+                    "The precise diagnostic produced no replacement map, so the "
+                    "approximate phase map remains visible."
+                ),
+            })
         status = "succeeded" if payload["ok"] else "awaiting_hitl" if payload.get("recovery") else "failed"
         return status, payload
 
@@ -1055,8 +1217,15 @@ class OasisService:
             for phase in phases:
                 control.token.check()
                 self.store.update(run_id, phase=phase, progress=None)
+                prior_preview = (
+                    self.store.snapshot(run_id).get("preview_result")
+                    if spec.mode == "auto" and phase == "precise"
+                    else None
+                )
                 status, payload = self._execute_phase(
-                    run_id, task, spec, phase, preview=spec.mode == "auto" and phase == "quick"
+                    run_id, task, spec, phase,
+                    preview=spec.mode == "auto" and phase == "quick",
+                    prior_preview=prior_preview,
                 )
                 control.token.check()
                 if spec.mode == "auto" and phase == "quick":

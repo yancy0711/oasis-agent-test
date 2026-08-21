@@ -16,7 +16,7 @@ class ParseRequest(BaseModel):
 class LlmConnectionRequest(BaseModel):
     """Test and retain one visitor-supplied model credential in memory only."""
 
-    provider: Literal["openai", "openrouter", "custom", "local"]
+    provider: Literal["gemini", "openai", "openrouter", "custom", "local"]
     base_url: str = Field(min_length=1, max_length=500)
     model: str = Field(min_length=1, max_length=200)
     api_key: SecretStr = Field(default=SecretStr(""), max_length=1000)
@@ -37,7 +37,7 @@ class LlmConnectionResponse(BaseModel):
 class LlmModelsRequest(BaseModel):
     """Request model discovery from one user-configured endpoint."""
 
-    provider: Literal["openai", "openrouter", "custom", "local"]
+    provider: Literal["gemini", "openai", "openrouter", "custom", "local"]
     base_url: str = Field(min_length=1, max_length=500)
     api_key: SecretStr = Field(default=SecretStr(""), max_length=1000)
 
@@ -94,6 +94,12 @@ class CoordinateOriginRequest(BaseModel):
     latitude: float = Field(ge=-90, le=90)
 
 
+class NamedOriginRequest(BaseModel):
+    """Carry a user-entered route origin without reparsing the whole task."""
+
+    query: str = Field(min_length=2, max_length=300)
+
+
 class CoordinateOriginResponse(BaseModel):
     """Return supported US parent boundaries for one exact route origin."""
 
@@ -113,6 +119,7 @@ class ParseResponse(BaseModel):
     alternative: str = ""
     events: list[dict[str, Any]] = Field(default_factory=list)
     route_origin_candidates: list[RouteOriginCandidate] = Field(default_factory=list)
+    place_name_options: list[str] = Field(default_factory=list)
 
 
 class PlaceRequest(BaseModel):

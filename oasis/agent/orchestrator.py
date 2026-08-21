@@ -1,12 +1,13 @@
 """LLM orchestration for structured parsing, planning, repair, and explanation."""
 from __future__ import annotations
-import json, logging, os, pathlib, re
+import json, logging, math, os, pathlib, re
 from typing import Any
 from oasis.agent.context import Context
 from oasis.agent.scope import route_origin_from_prompt
 from oasis.core.cancellation import RunCancelled
-from oasis.contracts.domain import (AgentAction, AgentPlan, PlanStep, RecoveryProposal, ResultNarrative, TaskSpec,
-                           ToolError, ToolResult)
+from oasis.contracts.domain import (AgentAction, AgentPlan, OperatingWindow, PlanStep, RecoveryProposal,
+                           RegionalRequirement, ResultNarrative, RouteOriginSpec, TaskSpec,
+                           ToolError, ToolResult, ValueWeights)
 from oasis.services.registry import registry
 
 log = logging.getLogger(__name__)
@@ -27,6 +28,365 @@ def load_prompt(name: str) -> str:
     return (PROMPT_DIR / f"{name}.md").read_text(encoding="utf-8")
 
 
+def _slug(value: Any) -> str:
+    """Normalize one provider enum token without interpreting user prose."""
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _normalize_result_queries(
+    value: Any, user_prompt: str, adjustments: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Converge provider JSON variants into valid typed read-only queries."""
+    if value in (None, ""):
+        return []
+    items = value if isinstance(value, list) else [value]
+    normalized: list[dict[str, Any]] = []
+    for item in items:
+        query = {"metric": item} if isinstance(item, str) else dict(item) if isinstance(item, dict) else {}
+        metric = _slug(query.get("metric"))
+        metric_aliases = {
+            "heat": "heat_exposure", "temperature": "heat_exposure",
+            "composite_vulnerability": "vulnerability", "vulnerability_score": "vulnerability",
+            "inequality": "access_disadvantage", "access_inequality": "access_disadvantage",
+            "equity_access_gap": "combined_disadvantage",
+            "vulnerability_access_gap": "combined_disadvantage",
+            "combined_vulnerability_access_gap": "combined_disadvantage",
+        }
+        supported = {
+            "heat_exposure", "vulnerability", "access_disadvantage",
+            "combined_disadvantage", "coverage_gap",
+        }
+        metric = metric_aliases.get(metric, metric)
+        query["metric"] = metric if metric in supported else "unsupported"
+        direction = _slug(query.get("direction", "highest"))
+        direction_aliases = {
+            "greatest": "highest", "most": "highest", "maximum": "highest", "max": "highest",
+            "desc": "highest", "descending": "highest", "largest": "highest", "higher": "highest", "top": "highest",
+            "least": "lowest", "minimum": "lowest", "min": "lowest", "smallest": "lowest",
+            "asc": "lowest", "ascending": "lowest", "lower": "lowest", "bottom": "lowest",
+        }
+        query["direction"] = direction_aliases.get(direction, direction)
+        if query["direction"] not in {"highest", "lowest"}:
+            query["direction"] = "highest"
+            if adjustments is not None:
+                adjustments.append(f"invalid result direction '{direction}' replaced with highest")
+        try:
+            raw_limit = float(query.get("limit", 5))
+            if not math.isfinite(raw_limit) or not raw_limit.is_integer():
+                raise ValueError
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            limit = 5
+            if adjustments is not None:
+                adjustments.append("invalid result limit replaced with 5")
+        bounded_limit = min(50, max(1, limit))
+        if bounded_limit != limit and adjustments is not None:
+            adjustments.append(f"result limit {limit} clamped to {bounded_limit}")
+        query["limit"] = bounded_limit
+        scope = _slug(query.get("scope", "all"))
+        scope_aliases = {
+            "vulnerable_only": "vulnerable", "priority": "vulnerable",
+            "priority_tracts": "vulnerable", "population": "all", "everyone": "all",
+        }
+        query["scope"] = scope_aliases.get(scope, scope)
+        if query["scope"] not in {"all", "vulnerable"}:
+            query["scope"] = "all"
+            if adjustments is not None:
+                adjustments.append(f"invalid result scope '{scope}' replaced with all")
+        query["raw_text"] = str(query.get("raw_text") or query.get("question") or user_prompt).strip()
+        query.pop("question", None)
+        normalized.append(query)
+    return normalized[:8]
+
+
+def _append_note(raw: dict[str, Any], note: str) -> None:
+    """Append one concise, user-visible parser adjustment without duplicating it."""
+    current = str(raw.get("notes") or "").strip()
+    if note not in current:
+        raw["notes"] = f"{current} [{note}]".strip()
+
+
+def _bounded_number(
+    value: Any, cast, minimum: float, maximum: float | None = None, *, strict_minimum: bool = False,
+) -> int | float | None:
+    """Return one finite bounded number, or None when it cannot satisfy the field contract."""
+    try:
+        parsed = float(value)
+        if isinstance(value, bool) or not math.isfinite(parsed) or (cast is int and not parsed.is_integer()):
+            return None
+        number = cast(parsed)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    below = number <= minimum if strict_minimum else number < minimum
+    if below or (maximum is not None and number > maximum):
+        return None
+    return number
+
+
+def _single_explicit_number(user_prompt: str, patterns: tuple[str, ...]) -> int | float | None:
+    """Extract one unnegated scalar only when all matching phrases agree on its value."""
+    values: list[float] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, user_prompt, re.I):
+            before = user_prompt[max(0, match.start() - 35):match.start()]
+            if re.search(r"\b(?:not|no|without|exclude|excluding|avoid|avoiding)\b[^.!?;]*$", before, re.I):
+                continue
+            values.append(float(match.group(1)))
+    unique = list(dict.fromkeys(values))
+    return unique[0] if len(unique) == 1 else None
+
+
+def _mentioned_profile_names(user_prompt: str, profiles: dict[str, Any]) -> list[str]:
+    """Find deliberate profile references while abstaining on negation and generic one-word labels."""
+    text = re.sub(r"[-_]+", " ", user_prompt.lower())
+    matches: list[str] = []
+    for name, profile in profiles.items():
+        name_phrase = re.sub(r"[-_]+", " ", name.lower()).strip()
+        label_phrase = re.sub(r"[-_]+", " ", str(profile.get("label", "")).lower()).strip()
+        phrases = [name_phrase]
+        if len(label_phrase.split()) >= 2:
+            phrases.append(label_phrase)
+        for phrase in dict.fromkeys(item for item in phrases if item):
+            pattern = r"(?<!\w)" + r"\s+".join(map(re.escape, phrase.split())) + r"(?!\w)"
+            for match in re.finditer(pattern, text, re.I):
+                before = text[max(0, match.start() - 45):match.start()]
+                after = text[match.end():min(len(text), match.end() + 25)]
+                if re.search(r"\b(?:not|do not|don't|without|exclude|excluding|avoid)\b[^.!?;]*$", before, re.I):
+                    continue
+                deliberate = len(phrase.split()) >= 2 or re.search(
+                    r"\b(?:use|apply|choose|select|profile|weights?|setting)\b[^.!?;]*$", before, re.I,
+                ) or re.search(r"^\s*(?:profile|weights?|setting)\b", after, re.I)
+                if deliberate:
+                    matches.append(name)
+                    break
+            if name in matches:
+                break
+    return list(dict.fromkeys(matches))
+
+
+def _normalize_ambiguities(value: Any) -> list[dict[str, Any]]:
+    """Keep only typed, answerable ambiguities; optional malformed entries cannot fail parsing."""
+    allowed = {
+        "place_names", "n_facilities", "threshold_minutes", "analysis_goal",
+        "mobility_scenario", "result_queries",
+    }
+    aliases = {"place_name": "place_names", "places": "place_names", "result_query": "result_queries"}
+    items = value if isinstance(value, list) else []
+    result: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        field = aliases.get(_slug(item.get("field")), _slug(item.get("field")))
+        question = str(item.get("question") or "").strip()
+        if field not in allowed or not question:
+            continue
+        candidates = item.get("candidates") if isinstance(item.get("candidates"), list) else []
+        result.append({
+            "field": field,
+            "candidates": [str(candidate).strip() for candidate in candidates if str(candidate).strip()][:10],
+            "question": question,
+        })
+    return result[:8]
+
+
+def _converge_task_payload(raw: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
+    """Converge unsafe provider variants before strict TaskSpec validation."""
+    enum_rules = {
+        "intervention": (
+            {"cooling_center", "mobile_clinic", "monitoring_station"},
+            {"cooling_centre": "cooling_center", "cooling_facility": "cooling_center"},
+            "cooling_center",
+        ),
+        "analysis_goal": (
+            {"facility_siting", "tract_review", "heat_review", "minimum_facilities", "minimum_threshold",
+             "reachability_review", "scenario_comparison", "sensitivity_analysis"},
+            {"site_selection": "facility_siting", "siting": "facility_siting", "optimization": "facility_siting",
+             "equity_analysis": "tract_review", "vulnerability_analysis": "tract_review",
+             "diagnostic": "tract_review", "comparison": "scenario_comparison"},
+            "facility_siting",
+        ),
+        "candidate_source": ({"osm", "csv"}, {"openstreetmap": "osm", "upload": "csv"}, "osm"),
+        "mobility_scenario": (
+            {"walking", "cycling", "driving", "walk_drive_equity"},
+            {"walk": "walking", "on_foot": "walking", "bike": "cycling", "biking": "cycling",
+             "drive": "driving", "car": "driving"},
+            "walking",
+        ),
+        "coverage_group": (
+            {"all", "vulnerable"},
+            {"vulnerable_only": "vulnerable", "priority": "vulnerable", "everyone": "all"},
+            "all",
+        ),
+    }
+    for field, (allowed, aliases, default) in enum_rules.items():
+        original = raw.get(field)
+        if original in (None, ""):
+            raw[field] = default
+            continue
+        value = aliases.get(_slug(original), _slug(original))
+        if value not in allowed:
+            raw[field] = default
+            _append_note(raw, f"invalid {field} '{original}' replaced with {default}")
+        else:
+            raw[field] = value
+
+    numeric_rules = {
+        "n_facilities": (int, 1, 100, defaults["n_facilities"], False),
+        "threshold_minutes": (float, 0.0, None, defaults["threshold_minutes"], True),
+        "coverage_target": (float, 0.0, 1.0, None, False),
+        "equity_alpha": (float, 0.0, 1.0, None, False),
+        "facility_capacity": (float, 0.0, None, None, True),
+    }
+    for field, (cast, minimum, maximum, default, strict_minimum) in numeric_rules.items():
+        value = raw.get(field)
+        if value in (None, ""):
+            raw[field] = default
+            continue
+        number = _bounded_number(
+            value, cast, minimum, maximum, strict_minimum=strict_minimum,
+        )
+        if number is None:
+            raw[field] = default
+            _append_note(raw, f"invalid {field} '{value}' replaced with {default}")
+            continue
+        raw[field] = number
+
+    mobility_aliases = enum_rules["mobility_scenario"][1]
+    recommended_mode = raw.get("recommended_mobility_scenario")
+    if recommended_mode in (None, ""):
+        raw["recommended_mobility_scenario"] = None
+    else:
+        normalized_mode = mobility_aliases.get(_slug(recommended_mode), _slug(recommended_mode))
+        if normalized_mode in enum_rules["mobility_scenario"][0]:
+            raw["recommended_mobility_scenario"] = normalized_mode
+        else:
+            raw["recommended_mobility_scenario"] = None
+            _append_note(raw, f"invalid recommended mobility '{recommended_mode}' omitted")
+
+    for field in ("place_name", "candidate_file", "recommended_value_profile", "operating_window"):
+        if field == "operating_window":
+            continue
+        value = raw.get(field)
+        if value is not None and not isinstance(value, str):
+            raw[field] = str(value) if field == "place_name" else None
+            _append_note(raw, f"invalid {field} value normalized")
+    amenities = raw.get("candidate_amenities")
+    if not isinstance(amenities, list):
+        raw["candidate_amenities"] = [
+            "library", "community_centre", "school", "sports_centre",
+            "arts_centre", "place_of_worship",
+        ]
+        if amenities not in (None, ""):
+            _append_note(raw, "invalid candidate amenities replaced with supported defaults")
+    else:
+        raw["candidate_amenities"] = list(dict.fromkeys(
+            _slug(item) for item in amenities if _slug(item)
+        ))
+
+    def bounded_numbers(field: str, cast, minimum: float, maximum: float | None, maximum_items: int) -> None:
+        values = raw.get(field)
+        if values in (None, ""):
+            raw[field] = []
+            return
+        if not isinstance(values, list):
+            values = [values]
+        normalized = []
+        for value in values:
+            try:
+                parsed = float(value)
+                if not math.isfinite(parsed) or (cast is int and not parsed.is_integer()):
+                    raise ValueError
+                number = cast(parsed)
+                if number < minimum or (maximum is not None and number > maximum):
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                _append_note(raw, f"invalid value omitted from {field}")
+                continue
+            if number not in normalized:
+                normalized.append(number)
+        raw[field] = normalized[:maximum_items]
+
+    bounded_numbers("sensitivity_thresholds", float, 1e-9, None, 12)
+    bounded_numbers("recommended_sensitivity_thresholds", float, 1e-9, None, 12)
+    bounded_numbers("sensitivity_facility_counts", int, 1, 100, 12)
+    bounded_numbers("recommended_sensitivity_facility_counts", int, 1, 100, 12)
+    profiles = raw.get("comparison_profiles")
+    raw["comparison_profiles"] = (
+        list(dict.fromkeys(str(value).strip() for value in profiles if str(value).strip()))[:6]
+        if isinstance(profiles, list) else []
+    )
+
+    for field, model in (("route_origin", RouteOriginSpec), ("operating_window", OperatingWindow)):
+        value = raw.get(field)
+        if value in (None, ""):
+            raw[field] = None
+            continue
+        try:
+            raw[field] = model.model_validate(value).model_dump(mode="json")
+        except Exception:
+            raw[field] = None
+            _append_note(raw, f"invalid {field} omitted")
+    requirements = raw.get("regional_requirements")
+    valid_requirements = []
+    for item in requirements if isinstance(requirements, list) else []:
+        try:
+            valid_requirements.append(RegionalRequirement.model_validate(item).model_dump())
+        except Exception:
+            _append_note(raw, "invalid regional requirement omitted")
+    raw["regional_requirements"] = valid_requirements
+    if raw.get("weights") is not None and not isinstance(raw.get("weights"), dict):
+        raw["weights"] = None
+        _append_note(raw, "invalid weights omitted")
+
+    raw["ambiguities"] = _normalize_ambiguities(raw.get("ambiguities"))
+    if raw.get("coverage_target") is not None and raw.get("equity_alpha") is not None:
+        raw["ambiguities"].append({
+            "field": "analysis_goal",
+            "candidates": ["hard coverage target", "efficiency-equality trade-off"],
+            "question": "Should this run enforce the coverage target or select from the efficiency-Gini trade-off?",
+        })
+        raw["equity_alpha"] = None
+        _append_note(raw, "equity alpha held for confirmation because a hard coverage target is active")
+    return raw
+
+
+def _matching_profile(weights: Any, profiles: dict[str, Any], tolerance: float = 0.005) -> str | None:
+    """Match complete structured weights numerically instead of comparing JSON text."""
+    if not isinstance(weights, dict):
+        return None
+    try:
+        numeric = {key: float(value) for key, value in weights.items()}
+        if numeric and all(0.0 <= value <= 100.0 for value in numeric.values()) and math.isclose(
+            sum(numeric.values()), 100.0, abs_tol=0.5, rel_tol=0.0,
+        ):
+            numeric = {key: value / 100.0 for key, value in numeric.items()}
+        candidate = ValueWeights(**numeric).model_dump()
+    except Exception:
+        return None
+    matches = []
+    for name, profile in profiles.items():
+        try:
+            expected = ValueWeights(**profile.get("weights", {})).model_dump()
+        except Exception:
+            continue
+        if all(math.isclose(candidate[key], expected[key], abs_tol=tolerance, rel_tol=0.0) for key in expected):
+            matches.append(name)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _normalize_place_names(value: Any, place_name: Any) -> list[str]:
+    """Normalize the LLM's explicit place list without geocoding inside the parser."""
+    values = value if isinstance(value, list) else [value] if isinstance(value, str) else []
+    if not values and isinstance(place_name, str) and place_name.strip():
+        values = [place_name]
+    result: list[str] = []
+    for item in values:
+        name = str(item).strip()
+        if name and name.casefold() not in {existing.casefold() for existing in result}:
+            result.append(name)
+    return result[:5]
+
+
 class LLMClient:
     """OpenAI-compatible Chat Completions client."""
 
@@ -35,9 +395,12 @@ class LLMClient:
         from openai import OpenAI
         self.cfg = cfg
         provider = str(cfg.get("provider", "openrouter")).lower()
-        if provider not in {"openrouter", "openai", "custom", "local"}:
+        if provider not in {"gemini", "openrouter", "openai", "custom", "local"}:
             raise ValueError(f"Unsupported LLM provider: {provider}")
-        env_name = "OPENAI_API_KEY" if provider == "openai" else "OPENROUTER_API_KEY"
+        env_name = {
+            "gemini": "GEMINI_API_KEY", "openai": "OPENAI_API_KEY",
+            "openrouter": "OPENROUTER_API_KEY",
+        }.get(provider, "OPENAI_API_KEY")
         api_key = api_key or cfg.get("_session_api_key") or os.getenv(env_name)
         if provider == "local" and not api_key:
             api_key = "local-model"
@@ -49,7 +412,7 @@ class LLMClient:
         self.client = OpenAI(base_url=cfg.get("base_url", "https://openrouter.ai/api/v1"), api_key=api_key,
                              default_headers=headers or None)
 
-    def _completion(self, system: str, user: str, *, mode: str):
+    def _completion(self, system: str, user: str, *, mode: str, schema: dict | None = None):
         """Return one provider response through a bounded structured-output strategy."""
         if mode == "prompt":
             system = (
@@ -57,18 +420,25 @@ class LLMClient:
                 + "\n\nReturn exactly one valid JSON object. Start with { and end with }. "
                   "Do not include markdown, analysis, comments, or explanatory text."
             )
+            if schema:
+                system += "\nThe JSON must satisfy this schema:\n" + json.dumps(schema)
         kwargs = dict(
             model=self.cfg["model"], messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             max_tokens=self.cfg.get("max_tokens", 4096), temperature=self.cfg.get("temperature", 0.0))
-        if mode == "json":
+        if mode == "schema" and schema:
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "oasis_structured_response", "schema": schema},
+            }
+        elif mode == "json":
             kwargs["response_format"] = {"type": "json_object"}
         elif mode == "tool":
             kwargs["tools"] = [{
                 "type": "function",
                 "function": {
                     "name": "submit_json",
-                    "description": "Submit the requested result as a JSON-encoded object.",
-                    "parameters": {
+                    "description": "Submit the requested structured result.",
+                    "parameters": schema or {
                         "type": "object",
                         "properties": {
                             "payload": {
@@ -86,10 +456,21 @@ class LLMClient:
             }
             kwargs["parallel_tool_calls"] = False
         if self.cfg.get("provider") == "openrouter":
+            effort = (
+                self.cfg.get("task_parsing_reasoning_effort", "medium")
+                if schema and schema.get("title") == "TaskSpec"
+                else self.cfg.get("reasoning_effort", "low")
+            )
             kwargs["extra_body"] = {
-                "provider": {"require_parameters": False},
-                "reasoning": {"effort": "low", "exclude": True},
+                "provider": {"require_parameters": mode == "schema"},
+                "reasoning": {"effort": effort, "exclude": True},
             }
+        elif self.cfg.get("provider") == "gemini":
+            kwargs["reasoning_effort"] = (
+                self.cfg.get("task_parsing_reasoning_effort", "medium")
+                if schema and schema.get("title") == "TaskSpec"
+                else self.cfg.get("reasoning_effort", "low")
+            )
         return self.client.chat.completions.create(**kwargs)
 
     @staticmethod
@@ -151,14 +532,34 @@ class LLMClient:
             "Try the request again or choose a model that supports structured JSON output."
         )
 
-    def _structured_response(self, system: str, user: str) -> tuple[dict, Any]:
+    @staticmethod
+    def _non_retryable_provider_error(exc: Exception) -> str | None:
+        """Translate provider failures that no structured-output retry can repair."""
+        detail = str(exc)
+        lowered = detail.lower()
+        if "user location is not supported for the api use" in lowered:
+            return (
+                "Gemini rejected the request because the OASIS backend's network location is not "
+                "supported by the Gemini Developer API. This is a provider-region restriction, not "
+                "a JSON-format error. In Preliminary setup, choose OpenRouter, OpenAI, or a local "
+                "model, or run the backend in a Gemini-supported region."
+            )
+        return None
+
+    def _structured_response(
+        self, system: str, user: str, schema: dict | None = None,
+    ) -> tuple[dict, Any]:
         """Try JSON mode, forced function calling, then a JSON-only prompt."""
         failures = []
-        for mode in ("json", "tool", "prompt"):
+        modes = ("schema", "json", "tool", "prompt") if schema else ("json", "tool", "prompt")
+        for mode in modes:
             try:
-                response = self._completion(system, user, mode=mode)
+                response = self._completion(system, user, mode=mode, schema=schema)
                 return self._json_payload(response), response
             except Exception as exc:
+                terminal = self._non_retryable_provider_error(exc)
+                if terminal:
+                    raise RuntimeError(terminal) from exc
                 failures.append(exc)
         detail = str(failures[-1]) if failures else "unknown structured-output failure"
         raise ValueError(
@@ -166,9 +567,9 @@ class LLMClient:
             f"function-call, and prompt compatibility attempts: {detail}"
         ) from failures[-1]
 
-    def structured(self, system: str, user: str) -> dict:
+    def structured(self, system: str, user: str, schema: dict | None = None) -> dict:
         """Call the LLM and parse JSON across OpenAI-compatible provider variants."""
-        return self._structured_response(system, user)[0]
+        return self._structured_response(system, user, schema=schema)[0]
 
     def probe(self, system: str, user: str) -> tuple[dict, str]:
         """Return a parsed probe plus the model identifier reported by the provider."""
@@ -194,55 +595,163 @@ class Orchestrator:
         defaults = {"n_facilities": self.cfg.get("optimization", {}).get("n_facilities", 10),
                     "threshold_minutes": self.cfg.get("accessibility", {}).get("threshold_minutes", 15)}
         runtime = {"defaults": defaults, "value_profiles": self.cfg.get("value_profiles", {})}
-        raw = self.llm.structured(load_prompt("task_parsing"),
-                                  f"Runtime configuration: {json.dumps(runtime)}\nUser request: {user_prompt}")
-        explicit_facilities = re.search(
-            r"\b(?:select|choose|site|locate|open|recommend)\s+(?:up\s+to\s+)?(\d+)\b",
-            user_prompt, re.I,
-        ) or re.search(
-            r"\b(\d+)\s+(?:candidate\s+)?(?:cooling[- ]?)?"
-            r"(?:centers?|centres?|facilities|sites?)\b",
-            user_prompt, re.I,
+        raw = self.llm.structured(
+            load_prompt("task_parsing"),
+            f"Runtime configuration: {json.dumps(runtime)}\nUser request: {user_prompt}",
+            schema=TaskSpec.model_json_schema(),
         )
-        if explicit_facilities:
-            raw["n_facilities"] = int(explicit_facilities.group(1))
-        explicit_minutes = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:-\s*)?(?:minutes?|mins?)\b",
-                                     user_prompt, re.I)
-        if explicit_minutes: raw["threshold_minutes"] = float(explicit_minutes.group(1))
+        if not isinstance(raw, dict):
+            raw = {}
+        route_origin_field_supplied = "route_origin" in raw
+        notes = raw.get("notes")
+        if isinstance(notes, list):
+            raw["notes"] = "; ".join(str(item) for item in notes if str(item).strip())
+        elif isinstance(notes, dict):
+            raw["notes"] = json.dumps(notes, sort_keys=True)
+        elif not isinstance(notes, str):
+            raw["notes"] = "" if notes is None else str(notes)
+        llm_count = raw.get("n_facilities")
+        llm_threshold = raw.get("threshold_minutes")
+        legacy_query = raw.pop("tract_ranking", None)
+        query_adjustments: list[str] = []
+        raw["result_queries"] = _normalize_result_queries(
+            raw.get("result_queries") or legacy_query, user_prompt, query_adjustments
+        )
+        for adjustment in query_adjustments:
+            _append_note(raw, adjustment)
+        legacy_places = raw.pop("study_areas", None)
+        raw["place_names"] = _normalize_place_names(
+            raw.get("place_names") or legacy_places, raw.get("place_name")
+        )
+        if raw["place_names"]:
+            raw["place_name"] = raw["place_names"][0]
+        raw = _converge_task_payload(raw, defaults)
+        ambiguities = list(raw["ambiguities"])
+        if len(raw["place_names"]) > 1 and not any(
+            isinstance(item, dict) and item.get("field") == "place_names" for item in ambiguities
+        ):
+            ambiguities.append({
+                "field": "place_names", "candidates": raw["place_names"],
+                "question": "Which study area should this run use?",
+            })
+        if raw.get("analysis_goal") == "tract_review" and not raw["result_queries"]:
+            ambiguities.append({
+                "field": "result_queries", "candidates": [
+                    "heat exposure", "vulnerability", "access disadvantage",
+                    "combined disadvantage", "coverage gap",
+                ],
+                "question": "Which available tract metric should be ranked?",
+            })
+        raw["ambiguities"] = ambiguities
+        has_structured_counts = bool(
+            raw.get("regional_requirements") or raw.get("sensitivity_facility_counts")
+        )
+        explicit_count = None if has_structured_counts else _single_explicit_number(user_prompt, (
+            r"\b(?:select|choose|site|locate|open|recommend)\s+(?:up\s+to\s+)?(-?\d+)\b",
+            r"(?<![\w.])(-?\d+)\s+(?:candidate\s+)?(?:cooling[- ]?)?"
+            r"(?:centers?|centres?|facilities|sites?)\b",
+        ))
+        if explicit_count is not None:
+            bounded_count = _bounded_number(explicit_count, int, 1, 100)
+            parsed_count = raw.get("n_facilities")
+            valid_llm_count = _bounded_number(llm_count, int, 1, 100)
+            if bounded_count is None:
+                fallback_count = int(parsed_count)
+                _append_note(raw, (
+                    f"requested facility count {explicit_count:g} is outside the supported range "
+                    f"1-100; retained {fallback_count}"
+                ))
+                ambiguities.append({
+                    "field": "n_facilities", "candidates": [str(fallback_count)],
+                    "question": (
+                        f"OASIS supports 1 to 100 facilities per run. Continue with {fallback_count}, "
+                        "or divide the study into separate runs?"
+                    ),
+                })
+            else:
+                if valid_llm_count is not None and valid_llm_count != bounded_count:
+                    ambiguities.append({
+                        "field": "n_facilities",
+                        "candidates": [str(valid_llm_count), str(bounded_count)],
+                        "question": (
+                            f"Should this run select {valid_llm_count} or {bounded_count} facilities?"
+                        ),
+                    })
+                raw["n_facilities"] = bounded_count
+            if bounded_count is not None and raw.get("analysis_goal") == "minimum_facilities":
+                ambiguities.append({
+                    "field": "analysis_goal",
+                    "candidates": ["facility_siting", "minimum_facilities"],
+                    "question": (
+                        "Is the stated facility count a fixed siting budget, or should OASIS calculate "
+                        "the minimum number required?"
+                    ),
+                })
+        explicit_threshold = None if raw.get("sensitivity_thresholds") else _single_explicit_number(
+            user_prompt,
+            (r"(?<![\w.])(-?\d+(?:\.\d+)?)\s*(?:-\s*)?(?:minutes?|mins?)\b",),
+        )
+        if explicit_threshold is not None:
+            bounded_threshold = _bounded_number(
+                explicit_threshold, float, 0, strict_minimum=True,
+            )
+            parsed_threshold = raw.get("threshold_minutes")
+            valid_llm_threshold = _bounded_number(
+                llm_threshold, float, 0, strict_minimum=True,
+            )
+            if bounded_threshold is None:
+                fallback_threshold = float(parsed_threshold)
+                _append_note(raw, (
+                    f"requested threshold {explicit_threshold:g} minutes is not positive; "
+                    f"retained {fallback_threshold:g} minutes"
+                ))
+                ambiguities.append({
+                    "field": "threshold_minutes", "candidates": [f"{fallback_threshold:g}"],
+                    "question": (
+                        f"Travel time must be positive. Continue with "
+                        f"{fallback_threshold:g} minutes?"
+                    ),
+                })
+            else:
+                if (valid_llm_threshold is not None and not math.isclose(
+                    valid_llm_threshold, bounded_threshold, abs_tol=1e-9
+                )):
+                    ambiguities.append({
+                        "field": "threshold_minutes",
+                        "candidates": [
+                            f"{valid_llm_threshold:g}", f"{bounded_threshold:g}",
+                        ],
+                        "question": (
+                            f"Should this run use a {valid_llm_threshold:g}-minute or "
+                            f"{bounded_threshold:g}-minute threshold?"
+                        ),
+                    })
+                raw["threshold_minutes"] = bounded_threshold
         route_origin = raw.get("route_origin")
-        if not isinstance(route_origin, dict) or not str(route_origin.get("entity") or "").strip():
-            fallback_origin = route_origin_from_prompt(user_prompt)
+        fallback_origin = route_origin_from_prompt(user_prompt)
+        model_entity = str(route_origin.get("entity") or "").strip() if isinstance(route_origin, dict) else ""
+        destination_as_origin = bool(re.fullmatch(
+            r"(?:the\s+)?(?:nearest|closest)?\s*(?:cooling\s+)?"
+            r"(?:cent(?:er|re)|facility|facilities|site|sites)",
+            model_entity,
+            re.I,
+        ))
+        if fallback_origin and (
+            not route_origin_field_supplied or not model_entity or destination_as_origin
+        ):
             route_origin = ({
                 "entity": fallback_origin, "context": "", "positional_hint": "",
                 "raw_text": fallback_origin, "source": "fallback",
-            } if fallback_origin else None)
+            })
         if route_origin:
             raw["route_origin"] = route_origin
             raw["analysis_goal"] = "facility_siting"
-            raw["candidate_source"] = "osm"
-            if not explicit_facilities:
+            # A point-route request prepares candidates and then routes from the
+            # confirmed origin. It must not inherit a model-invented hard
+            # study-area coverage constraint, which would turn routing into LSCP.
+            raw["coverage_target"] = None
+            if explicit_count is None:
                 raw["n_facilities"] = defaults["n_facilities"]
-            raw["candidate_amenities"] = [
-                "library", "community_centre", "school", "sports_centre",
-                "arts_centre", "place_of_worship",
-            ]
-        asks_for_count = re.search(r"\b(how many|minimum|fewest|least number|smallest number)\b", user_prompt, re.I)
-        if raw.get("analysis_goal") == "minimum_facilities" and not asks_for_count:
-            raw["analysis_goal"] = "facility_siting"
-        nullable_defaults = {"intervention": "cooling_center", "analysis_goal": "facility_siting",
-                             "candidate_source": "osm", "candidate_amenities": ["library", "community_centre", "school", "sports_centre", "arts_centre", "place_of_worship"],
-                             "route_origin": None,
-                             "mobility_scenario": "walking", "recommended_mobility_scenario": None,
-                             "recommended_value_profile": None, "recommendation_rationale": "",
-                             "operating_window": None, "coverage_group": "all",
-                             "regional_requirements": [], "sensitivity_thresholds": [],
-                             "sensitivity_facility_counts": [],
-                             "recommended_sensitivity_thresholds": [],
-                             "recommended_sensitivity_facility_counts": [],
-                             "comparison_profiles": [],
-                             "preference_question": "", "notes": ""}
-        for field, default in nullable_defaults.items():
-            if raw.get(field) is None: raw[field] = default
         for field in ("notes", "recommendation_rationale", "preference_question"):
             value = raw.get(field)
             if isinstance(value, list):
@@ -251,17 +760,6 @@ class Orchestrator:
                 raw[field] = json.dumps(value, sort_keys=True)
             elif not isinstance(value, str):
                 raw[field] = "" if value is None else str(value)
-        if not isinstance(raw.get("mobility_scenario"), str) or not raw["mobility_scenario"].strip():
-            raw["mobility_scenario"] = "walking"
-        for field in ("recommended_mobility_scenario", "recommended_value_profile",
-                      "operating_window", "coverage_target", "weights"):
-            if isinstance(raw.get(field), str) and not raw[field].strip():
-                raw[field] = None
-        for field in ("regional_requirements", "sensitivity_thresholds",
-                      "sensitivity_facility_counts", "recommended_sensitivity_thresholds",
-                      "recommended_sensitivity_facility_counts"):
-            if raw.get(field) in (None, ""):
-                raw[field] = []
         equity_mode = re.search(
             r"\b(?:walk[-_ ]?drive[-_ ]?equity|car[- ]?(?:access|availability)[-_ ]?equity)\b",
             user_prompt, re.I,
@@ -278,59 +776,60 @@ class Orchestrator:
             mode for mode, pattern in mode_patterns.items()
             if re.search(pattern, user_prompt, re.I)
         ]
-        if equity_mode:
-            raw["mobility_scenario"] = "walk_drive_equity"
-        elif len(detected_modes) == 1:
-            raw["mobility_scenario"] = detected_modes[0]
-        elif not detected_modes:
-            raw["mobility_scenario"] = "walking"
-        applied = []
-        count = raw.get("n_facilities")
-        if isinstance(count, float) and count.is_integer():
-            raw["n_facilities"] = int(count)
-        elif isinstance(count, bool) or not isinstance(count, int):
-            raw["n_facilities"] = defaults["n_facilities"]; applied.append("n_facilities")
-        threshold = raw.get("threshold_minutes")
-        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
-            raw["threshold_minutes"] = defaults["threshold_minutes"]; applied.append("threshold_minutes")
-        if applied: raw["notes"] = f"{raw.get('notes', '')} [runtime defaults: {', '.join(applied)}]".strip()
+        explicit_mode = "walk_drive_equity" if equity_mode else detected_modes[0] if len(detected_modes) == 1 else None
+        if explicit_mode:
+            ambiguities = [
+                item for item in ambiguities
+                if not (isinstance(item, dict) and item.get("field") == "mobility_scenario")
+            ]
+            if raw.get("mobility_scenario") != explicit_mode:
+                raw["mobility_scenario"] = explicit_mode
+                _append_note(raw, f"explicit travel mode '{explicit_mode}' retained from the request")
         profiles, weights = runtime["value_profiles"], raw.get("weights")
         normalized_prompt = re.sub(r"[-_]+", " ", user_prompt.lower())
-        mentioned_profiles = [
-            name for name, profile in profiles.items()
-            if re.sub(r"[-_]+", " ", name.lower()) in normalized_prompt
-            or re.sub(r"[-_]+", " ", str(profile.get("label", name)).lower()) in normalized_prompt
-        ]
+        mentioned_profiles = _mentioned_profile_names(user_prompt, profiles)
+        compares_efficiency_equity = bool(
+            re.search(r"\bcompare\b", normalized_prompt)
+            and re.search(r"\b(efficien(?:cy|t)|coverage|access)\b", normalized_prompt)
+            and re.search(r"\b(equit(?:y|able)|inequal(?:ity)?|gini|fairness)\b", normalized_prompt)
+        )
+        if compares_efficiency_equity:
+            raw["analysis_goal"] = "scenario_comparison"
+            raw["result_queries"] = [
+                query for query in raw.get("result_queries", [])
+                if not (
+                    isinstance(query, dict)
+                    and re.search(r"\bcompare\b", str(query.get("raw_text") or ""), re.I)
+                    and re.search(
+                        r"\b(?:inequal(?:ity)?|equity|gini|fairness)\b",
+                        str(query.get("raw_text") or ""),
+                        re.I,
+                    )
+                )
+            ]
         if raw.get("analysis_goal") == "scenario_comparison":
             selected_profiles = list(dict.fromkeys(mentioned_profiles))
-            compares_efficiency_equity = (
-                re.search(r"\b(efficien(?:cy|t)|coverage|access)\b", normalized_prompt)
-                and re.search(r"\b(equit(?:y|able)|inequal(?:ity)?|gini|fairness)\b", normalized_prompt)
-            )
             if len(selected_profiles) < 2 and compares_efficiency_equity:
                 selected_profiles = [
                     name for name in ("efficiency_first", "equity_first") if name in profiles
                 ]
             raw["comparison_profiles"] = selected_profiles
-        profile_by_weights = {
-            json.dumps(profile["weights"], sort_keys=True): name
-            for name, profile in profiles.items()
-        }
-        known = list(profile_by_weights)
-        weight_key = json.dumps(weights, sort_keys=True) if weights is not None else None
-        explicit_profile = any(
-            token.lower() in user_prompt.lower()
-            for name, profile in profiles.items()
-            for token in (name, profile.get("label", name))
-        )
-        if weight_key is not None and weight_key not in known:
+        explicit_profile_names = list(dict.fromkeys(mentioned_profiles))
+        matched_profile = _matching_profile(weights, profiles)
+        if len(explicit_profile_names) == 1:
+            selected_profile = explicit_profile_names[0]
+            raw["recommended_value_profile"] = selected_profile
             raw["weights"] = None
-            raw["notes"] = f"{raw.get('notes', '')} [unregistered weights require HITL]".strip()
-        elif weight_key is not None and not explicit_profile:
-            raw["recommended_value_profile"] = raw.get("recommended_value_profile") or profile_by_weights[weight_key]
+        elif weights is not None and matched_profile is None:
+            raw["weights"] = None
+            _append_note(raw, "unregistered weights require HITL (human confirmation)")
+        elif weights is not None:
+            raw["recommended_value_profile"] = raw.get("recommended_value_profile") or matched_profile
             raw["weights"] = None
         if raw.get("recommended_value_profile") not in profiles:
             raw["recommended_value_profile"] = None
+        raw["ambiguities"] = _normalize_ambiguities(ambiguities)
+        raw = _converge_task_payload(raw, defaults)
         place = raw.get("place_name")
         self.ctx.record("parse", "Natural-language request parsed into a proposed task.",
                         fields={k: raw.get(k) for k in ("place_name", "analysis_goal", "candidate_source", "n_facilities",
@@ -340,8 +839,11 @@ class Orchestrator:
                                                         "sensitivity_thresholds", "sensitivity_facility_counts",
                                                         "recommended_sensitivity_thresholds",
                                                         "recommended_sensitivity_facility_counts",
-                                                        "regional_requirements", "preference_question", "notes")})
-        if not isinstance(place, str) or not place.strip(): raise MissingPlaceError(raw)
+                                                        "regional_requirements", "place_names", "result_queries", "ambiguities",
+                                                        "preference_question", "notes")})
+        if not isinstance(place, str) or not place.strip():
+            partial = TaskSpec(**{**raw, "place_name": ""}).model_dump(mode="json")
+            raise MissingPlaceError(partial)
         raw["place_name"] = place.strip()
         return TaskSpec(**raw)
 
@@ -446,12 +948,27 @@ class Orchestrator:
         return action
 
     def _goal_handle(self, task: TaskSpec) -> str:
-        """Return the Context handle that proves the requested analysis is complete."""
-        return {"facility_siting": "outputs", "heat_review": "heat_summary",
+        """Return the handle proving the primary executable goal is complete."""
+        return {"facility_siting": "outputs", "tract_review": "result_query_answers", "heat_review": "heat_summary",
                 "minimum_facilities": "minimum_facilities", "minimum_threshold": "minimum_threshold",
                 "reachability_review": "reachability_analysis",
                 "scenario_comparison": "scenario_comparison",
                 "sensitivity_analysis": "sensitivity_results"}[task.analysis_goal]
+
+    def _is_complete(self, task: TaskSpec) -> bool:
+        """Require the primary handle and every confirmed read-only result query."""
+        if not self.ctx.has(self._goal_handle(task)):
+            return False
+        if (
+            task.analysis_goal == "minimum_facilities"
+            and not self.ctx.get("minimum_facilities", {}).get("feasible")
+            and not self.ctx.has("minimum_threshold")
+        ):
+            return False
+        if not task.result_queries:
+            return True
+        answers = self.ctx.get("result_query_answers", {}).get("answers", [])
+        return len(answers) == len(task.result_queries)
 
     def _validated_changes(self, task: TaskSpec, changes: dict[str, Any]) -> dict[str, Any]:
         """Keep only typed human-editable changes proposed by the model."""
@@ -547,14 +1064,57 @@ class Orchestrator:
         return proposal
     def _completion_tool(self, task: TaskSpec) -> str | None:
         """Return the next deterministic dependency or finalizer for a confirmed goal."""
+        primary_ready = self.ctx.has(self._goal_handle(task))
+        if (
+            task.result_queries
+            and not self.ctx.has("result_query_answers")
+            and (task.analysis_goal == "tract_review" or primary_ready)
+        ):
+            if not self.ctx.has("study"): return "resolve_study_area"
+            if not self.ctx.has("demand"): return "prepare_demand"
+            metrics = {query.metric for query in task.result_queries}
+            if metrics & {"access_disadvantage", "combined_disadvantage", "coverage_gap"}:
+                if not self.ctx.has("candidates"): return (
+                    "load_candidate_sites" if task.candidate_source == "csv" else "fetch_candidate_sites"
+                )
+                if not self.ctx.has("travel"): return "build_travel_matrix"
+            return "answer_result_queries"
+        if task.analysis_goal == "tract_review":
+            return None
         if task.analysis_goal == "heat_review":
             if not self.ctx.has("study"): return "resolve_study_area"
             if not self.ctx.has("demand"): return "prepare_demand"
             return "summarize_heat_exposure"
+        if task.analysis_goal in {"minimum_facilities", "minimum_threshold", "reachability_review"}:
+            if not self.ctx.has("study"): return "resolve_study_area"
+            if not self.ctx.has("demand"): return "prepare_demand"
+            if not self.ctx.has("candidates"): return (
+                "load_candidate_sites" if task.candidate_source == "csv" else "fetch_candidate_sites"
+            )
+            if not self.ctx.has("travel"): return "build_travel_matrix"
+            if task.analysis_goal == "minimum_facilities":
+                if not self.ctx.has("minimum_facilities"):
+                    return "find_minimum_facilities"
+                if (
+                    not self.ctx.get("minimum_facilities", {}).get("feasible")
+                    and not self.ctx.has("minimum_threshold")
+                ):
+                    return "find_minimum_threshold"
+                return None
+            return {
+                "minimum_threshold": "find_minimum_threshold",
+                "reachability_review": "analyze_reachability",
+            }[task.analysis_goal]
+        if task.analysis_goal in {"sensitivity_analysis", "scenario_comparison"}:
+            if not self.ctx.has("study"): return "resolve_study_area"
+            if not self.ctx.has("demand"): return "prepare_demand"
+            if not self.ctx.has("candidates"): return (
+                "load_candidate_sites" if task.candidate_source == "csv" else "fetch_candidate_sites"
+            )
+            if not self.ctx.has("travel"): return "build_travel_matrix"
         if task.analysis_goal == "sensitivity_analysis":
-            return "run_sensitivity_analysis" if self.ctx.has("travel") else None
+            return "run_sensitivity_analysis"
         if task.analysis_goal == "scenario_comparison":
-            if not self.ctx.has("travel"): return None
             if not self.ctx.has("built_environment"): return "prepare_built_environment"
             return "compare_value_profiles"
         if task.analysis_goal != "facility_siting": return None
@@ -565,7 +1125,8 @@ class Orchestrator:
         if getattr(solution, "solver_status", None) not in {"Optimal", "Feasible"}: return None
         if self.ctx.has("demand") and not self.ctx.has("built_environment"):
             return "prepare_built_environment"
-        return "generate_outputs"
+        if not self.ctx.has("outputs"): return "generate_outputs"
+        return None
 
     def _complete_constraint_diagnostics(self, task: TaskSpec, results: list[ToolResult],
                                          steps: list[PlanStep]) -> None:
@@ -617,19 +1178,53 @@ class Orchestrator:
     def interpret_results(self, task: TaskSpec) -> ResultNarrative:
         """Generate two evidence-grounded paragraphs from compact result metadata."""
         analysis = self.ctx.get("analysis")
+        solution = analysis["solution"]
+        quality = self.ctx.get("quality", {})
+        vulnerability = self.ctx.get("vulnerability_analysis", {})
+        routing = self.ctx.get("travel", {}).get("routing_report", {})
+        query_answers = self.ctx.get("result_query_answers", {}).get("answers", [])
         evidence = {
-            "task": task.model_dump(mode="json"),
-            "solution": analysis["solution"].model_dump(mode="json"),
+            "task": {
+                "place_name": task.place_name, "analysis_goal": task.analysis_goal,
+                "n_facilities": task.n_facilities, "threshold_minutes": task.threshold_minutes,
+                "mobility_scenario": task.mobility_scenario, "coverage_target": task.coverage_target,
+                "equity_alpha": task.equity_alpha,
+            },
+            "solution": {
+                "profile_name": solution.profile_name, "selected_ids": solution.selected_ids,
+                "covered_ratio": solution.covered_ratio,
+                "vulnerable_covered_ratio": solution.vulnerable_covered_ratio,
+                "mean_access_score": solution.mean_access_score,
+                "population_weighted_access_gini": solution.population_weighted_access_gini,
+                "mean_travel_minutes": solution.mean_travel_minutes,
+                "solver_status": solution.solver_status,
+            },
             "frontier": [{"alpha": p.alpha, "efficiency_metric": p.efficiency_metric,
                           "equity_metric": p.equity_metric,
-                          "population_weighted_gini": p.population_weighted_gini,
-                          "covered_population": p.solution.covered_population} for p in analysis["frontier"]],
-            "quality": self.ctx.get("quality", {}),
-            "vulnerability_analysis": self.ctx.get("vulnerability_analysis", {}),
-            "built_environment": self.ctx.get("built_environment", {}),
-            "routing": self.ctx.get("travel", {}).get("routing_report", {}),
-            "provenance": [p.model_dump(mode="json") for p in self.ctx.lineage],
-            "indicators_used": ["population_density", "elderly_ratio", "poverty_rate", "heat_exposure", "environment_burden", "vulnerability_score"],
+                          "population_weighted_gini": p.population_weighted_gini}
+                         for p in analysis["frontier"]],
+            "quality": {
+                "operating_hours": quality.get("operating_hours"),
+                "public_access": quality.get("public_access"),
+                "heat": quality.get("heat"),
+            },
+            "vulnerability_diagnostics": {
+                "active_scheme": vulnerability.get("active_scheme"),
+                "missingness": vulnerability.get("missingness"),
+                "high_correlations": (vulnerability.get("correlation") or {}).get("high_pairs"),
+                "vif": vulnerability.get("vif"),
+                "weight_comparisons": (vulnerability.get("weight_sensitivity") or {}).get("comparisons"),
+            },
+            "result_queries": [{
+                "metric": answer.get("metric"), "top_rows": answer.get("top_rows"),
+                "computation": answer.get("computation"),
+            } for answer in query_answers],
+            "routing": {
+                "router": routing.get("router"), "mobility_scenario": routing.get("mobility_scenario"),
+                "fallback": routing.get("fallback"), "accuracy": routing.get("accuracy"),
+            },
+            "provenance": [{"source": p.source, "tier": p.tier, "record_count": p.record_count}
+                           for p in self.ctx.lineage],
         }
         self.ctx.record("explanation", "Requesting an evidence-grounded interpretation from the model.")
         narrative = ResultNarrative(**self.llm.structured(load_prompt("result_interpretation"), json.dumps(evidence)))
@@ -674,6 +1269,19 @@ class Orchestrator:
 
     def _completion_message(self, task: TaskSpec) -> str:
         """Return a direct deterministic answer for bounded diagnostic goals."""
+        query_parts = []
+        if task.result_queries and self.ctx.has("result_query_answers"):
+            for answer in self.ctx.get("result_query_answers", {}).get("answers", []):
+                rows = answer.get("top_rows", [])
+                ranking = ", ".join(
+                    f"{row.get('rank')}. tract {row.get('GEOID')} ({float(row.get('value')):.3f})"
+                    for row in rows
+                )
+                if ranking:
+                    query_parts.append(
+                        f"Top {len(rows)} for {answer.get('metric_label')}: {ranking}."
+                    )
+        query_suffix = (" " + " ".join(query_parts)) if query_parts else ""
         if task.analysis_goal == "heat_review" and self.ctx.has("heat_summary"):
             summary = self.ctx.get("heat_summary")
             top = summary.get("top_tracts", [])
@@ -681,8 +1289,9 @@ class Orchestrator:
                 row = top[0]
                 return (
                     f"Tract {row.get('GEOID')} has the highest reported heat "
-                    f"exposure in this run at {float(row.get('heat_exposure')):.1f} C "
-                    f"among {summary.get('tracts_reviewed', 'the retained')} tracts."
+                    f"exposure in this run at {float(row.get('heat_exposure')):.1f} °C "
+                    f"among {summary.get('tracts_reviewed', 'the retained')} tracts. "
+                    f"Basis: {summary.get('evidence_basis', 'the recorded Landsat heat-exposure indicator')}"
                 )
         if task.analysis_goal == "reachability_review" and self.ctx.has("reachability_analysis"):
             summary = self.ctx.get("reachability_analysis")
@@ -695,13 +1304,83 @@ class Orchestrator:
                 return (
                     f"Tract {row.get('demand_id')} is the hardest to reach: it is {nearest}. "
                     f"{unserved} demand unit(s) have no candidate within the confirmed "
-                    f"{float(summary.get('threshold_minutes', task.threshold_minutes)):g}-minute threshold."
+                    f"{float(summary.get('threshold_minutes', task.threshold_minutes)):g}-minute threshold. "
+                    f"Basis: {summary.get('evidence_basis', 'the recorded nearest-candidate travel matrix')}"
                 )
+        if task.analysis_goal == "minimum_facilities" and self.ctx.has("minimum_facilities"):
+            summary = self.ctx.get("minimum_facilities")
+            if summary.get("feasible"):
+                return (
+                    f"At least {int(summary['minimum_facilities'])} candidate facilities are required "
+                    f"to cover {float(summary.get('coverage_target', 1.0)):.0%} of the "
+                    f"{str(summary.get('coverage_group', 'all')).replace('_', ' ')} group within "
+                    f"{float(summary['threshold_minutes']):g} minutes."
+                ) + query_suffix
+            threshold = self.ctx.get("minimum_threshold", {})
+            if threshold.get("feasible"):
+                return (
+                    f"No number of the retained candidate facilities can cover "
+                    f"{float(summary.get('coverage_target', 1.0)):.0%} of the "
+                    f"{str(summary.get('coverage_group', 'all')).replace('_', ' ')} group within "
+                    f"{float(summary['threshold_minutes']):g} minutes. With "
+                    f"{int(threshold['n_facilities'])} facilities, the smallest computed threshold is "
+                    f"{float(threshold['minimum_threshold_minutes']):.1f} minutes by "
+                    f"{task.mobility_scenario.replace('_', ' ')}."
+                ) + query_suffix
+            return (
+                "The retained candidate set cannot meet the requested coverage at the confirmed "
+                "threshold, and no feasible alternative threshold exists in the computed matrix."
+            ) + query_suffix
+        if task.analysis_goal == "minimum_threshold" and self.ctx.has("minimum_threshold"):
+            summary = self.ctx.get("minimum_threshold")
+            if summary.get("feasible"):
+                return (
+                    f"A threshold of at least {float(summary['minimum_threshold_minutes']):.1f} minutes "
+                    f"is required with {int(summary['n_facilities'])} facilities to cover "
+                    f"{float(summary.get('coverage_target', 1.0)):.0%} of the "
+                    f"{str(summary.get('coverage_group', 'all')).replace('_', ' ')} group."
+                )
+            return "No feasible threshold was found in the computed travel matrix for the confirmed facility budget."
+        if task.result_queries and self.ctx.has("result_query_answers"):
+            answers = self.ctx.get("result_query_answers").get("answers", [])
+            parts = []
+            for answer in answers:
+                rows = answer.get("top_rows", [])
+                ranking = ", ".join(
+                    f"{row.get('rank')}. tract {row.get('GEOID')} ({float(row.get('value')):.3f})"
+                    for row in rows
+                )
+                parts.append(f"Top {len(rows)} for {answer.get('metric_label')}: {ranking}")
+            siting = ""
+            if task.analysis_goal == "facility_siting" and self.ctx.has("analysis"):
+                selected = self.ctx.get("analysis").get("solution").selected_ids
+                siting = f"Selected {len(selected)} candidate facilities. "
+            return siting + " ".join(parts)
         return f"{task.analysis_goal.replace('_', ' ')} completed."
 
     def run(self, task: TaskSpec, explain: bool = True) -> dict[str, Any]:
         """Observe results and select one bounded registered action at a time."""
         self.ctx.put("task", task)
+        if task.analysis_goal == "tract_review" and not task.result_queries:
+            recovery = RecoveryProposal(
+                diagnosis="A tract review needs at least one confirmed result metric.",
+                question=(
+                    "Choose heat exposure, vulnerability, access disadvantage, combined disadvantage, "
+                    "or coverage gap before running."
+                ),
+                suggested_changes={},
+            )
+            self.ctx.record(
+                "hitl", "The run stopped before the agent loop because no tract metric was confirmed.",
+                diagnosis=recovery.diagnosis, question=recovery.question, suggested_changes={},
+            )
+            return {
+                "ok": False, "paused": True, "message": recovery.diagnosis,
+                "failed_tool": "hitl", "plan": AgentPlan(steps=[], reasoning="No executable tract query."),
+                "results": [], "lineage": self.ctx.lineage, "outputs": None, "heat_summary": None,
+                "diagnostics": {}, "narrative": None, "recovery": recovery,
+                "history": self.ctx.history,
+            }
         results: list[ToolResult] = []; steps: list[PlanStep] = []; recovery = None; message = ""
         failed_calls: set[str] = set(); completed_calls: set[str] = set(); repeated_calls: set[str] = set()
         max_steps = self.cfg.get("max_agent_steps", self.cfg.get("llm", {}).get("max_agent_steps", 14))
@@ -709,7 +1388,7 @@ class Orchestrator:
         closure_attempted: set[str] = set()
         for index in range(1, max_steps + 1):
             self.ctx.check_cancelled()
-            if self.ctx.has(goal_handle):
+            if self._is_complete(task):
                 ok = True; message = self._completion_message(task)
                 self.ctx.record("decision", f"Verified completed result handle: {goal_handle}.",
                                 kind="finish", args={}, step_index=index, suggested_changes={})
@@ -733,7 +1412,7 @@ class Orchestrator:
                 self.ctx.record("observation", "The next model action failed typed validation.",
                                 "agent_decision", error=str(exc)); break
             if action.kind == "finish":
-                if self.ctx.has(self._goal_handle(task)):
+                if self._is_complete(task):
                     ok, message = True, action.message; break
                 self.ctx.record("observation", "The requested result is not complete; another tool action is required.",
                                 missing_handle=self._goal_handle(task)); continue
@@ -793,7 +1472,7 @@ class Orchestrator:
             self.ctx.progress("Finalizing: packaging result", 1, 2, unit="stages")
         diagnostic_handles = ["constraint_validation", "minimum_facilities", "minimum_threshold",
                               "reachability_analysis", "scenario_comparison", "sensitivity_results",
-                              "vulnerability_analysis"]
+                              "vulnerability_analysis", "result_query_answers"]
         diagnostics = {name: json.loads(json.dumps(self.ctx.get(name), default=lambda value: value.model_dump(mode="json")))
                        for name in diagnostic_handles if self.ctx.has(name)}
         plan = AgentPlan(steps=steps, reasoning="Actions were selected from observations one step at a time.")

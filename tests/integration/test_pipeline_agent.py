@@ -22,7 +22,7 @@ class FakeLLM:
         """Store the ordered canned response queue."""
         self.canned = list(canned)
 
-    def structured(self, system, user):
+    def structured(self, system, user, schema=None):
         """Return and remove the next canned structured response."""
         return self.canned.pop(0)
 
@@ -104,7 +104,8 @@ def test_agent_parser_uses_runtime_defaults_for_vague_numbers():
     cfg = {"optimization": {"n_facilities": 7}, "accessibility": {"threshold_minutes": 12}}
     task = Orchestrator(fake, cfg).parse_task("Site some cooling centers in DC")
     assert task.n_facilities == 7 and task.threshold_minutes == 12
-    assert "runtime defaults: n_facilities, threshold_minutes" in task.notes
+    assert "invalid n_facilities 'some' replaced with 7" in task.notes
+    assert "runtime defaults" not in task.notes
 
 
 def test_agent_parser_rejects_unregistered_llm_weights():
@@ -268,6 +269,7 @@ def test_build_travel_matrix_uses_sparse_ors_path(monkeypatch):
     result = registry.get("build_travel_matrix").fn(ctx=ctx)
     assert result.ok and result.summary["router"] == "ors_sparse"
     assert result.summary["tier"] == "cache" and result.summary["live_pairs"] == 0
+    assert ctx.get("travel")["routing_report"]["policy_minutes"] == 15
     assert seen["eligible"].all() and seen["fallback"].shape == (2, 1)
     assert result.provenance.tier == "cache"
 
