@@ -846,6 +846,7 @@ def build_travel_matrix(ctx: Context, demand_handle: str = "demand",
                     max_concurrency=cfg.get("ors_max_concurrency", 2),
                     max_inflight_routes=cfg.get("ors_max_inflight_routes", 3500),
                     max_requests=cfg.get("ors_max_requests", 500),
+                    max_block_route_expansion=cfg.get("ors_max_block_route_expansion", 1.5),
                     request_interval_s=cfg.get("ors_request_interval_s", 1.6),
                     cache_version=cfg.get("ors_cache_version", "v2"),
                     cache_ttl_days=cfg.get("ors_matrix_ttl_days", 30),
@@ -1699,7 +1700,7 @@ def generate_outputs(ctx: Context, output_dir: str | None = None, indicator: str
 
 
 def run_tool_chain(cfg: dict, task: TaskSpec, output_dir: str | None = None, ctx: Context | None = None) -> dict:
-    """Execute the exact six-tool baseline without an LLM."""
+    """Execute the exact seven-tool baseline without an LLM."""
     ctx = ctx or Context(); ctx.put("config", cfg); ctx.put("task", task)
     calls = [
         ("resolve_study_area", {"place_name": task.place_name}),

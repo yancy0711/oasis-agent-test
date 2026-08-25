@@ -1035,13 +1035,18 @@ class OasisService:
         self, run_id: str, payload: dict, exc: Exception, *, preview: bool
     ) -> None:
         """Finish successfully with an honest warning when ORS cannot refine a result."""
+        reason = str(exc)
+        guard_note = (
+            " This is an OASIS request-volume guard, not an error returned by ORS."
+            if "planned ORS requests" in reason else ""
+        )
         warning = (
             "The full study-area ORS matrix was unavailable, so the completed approximate "
-            f"selection result has been retained. Reason: {exc} Point route planning remains "
-            "available because it sends only a small shortlist to ORS. "
-            "Choose a smaller city study area for a full ORS selection matrix. "
-            "Change mobility only when that matches the policy question; driving does not "
-            "bypass the study-area safeguard."
+            f"selection result has been retained. Reason: {reason}{guard_note} Point route "
+            "planning remains available because it sends only a small shortlist to ORS. "
+            "For a full ORS matrix, reduce the travel threshold, choose fewer candidate "
+            "facility types, upload a smaller reviewed candidate set, or use a smaller "
+            "study area. Change mobility only when that matches the policy question."
         )
         retained = deepcopy(payload)
         retained["message"] = warning
@@ -1228,6 +1233,11 @@ class OasisService:
                     prior_preview=prior_preview,
                 )
                 control.token.check()
+                if phase == "precise" and status != "succeeded":
+                    diagnosis = str((payload.get("recovery") or {}).get("diagnosis") or "")
+                    if "Precise mode requires ORS" in diagnosis:
+                        self._fail_run(run_id, spec, phase, RuntimeError(diagnosis), task)
+                        return
                 if spec.mode == "auto" and phase == "quick":
                     self.store.update(run_id, preview_result=payload, progress=None)
                     if status == "succeeded":

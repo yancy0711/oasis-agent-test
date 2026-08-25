@@ -51,6 +51,8 @@ accessibility:
   ors_matrix_ttl_days: 30
   ors_cache_max_gb: 2
   ors_max_requests: 500
+  # Repack dense matrices when doing so adds at most 50% extra routes.
+  ors_max_block_route_expansion: 1.5
   ors_request_interval_s: 1.6
   ors_timeout_s: 60
 

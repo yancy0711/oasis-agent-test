@@ -179,6 +179,7 @@ class TravelTimeMatrixBuilder:
         tile_size_m: float | None = 3000,
         max_routes_per_request: int = 2500,
         max_requests: int = 500,
+        max_block_route_expansion: float = 1.5,
         max_concurrency: int = 2,
         max_inflight_routes: int = 3500,
         coordinate_precision: int = 5,
@@ -195,6 +196,8 @@ class TravelTimeMatrixBuilder:
             raise ValueError("max_inflight_routes must be between 1 and 3500")
         if max_requests < 1:
             raise ValueError("max_requests must be positive")
+        if max_block_route_expansion < 1:
+            raise ValueError("max_block_route_expansion must be at least 1")
         self.backend = backend
         self.cache = cache
         self.source_chunk_size = source_chunk_size
@@ -202,6 +205,7 @@ class TravelTimeMatrixBuilder:
         self.tile_size_m = tile_size_m
         self.max_routes_per_request = max_routes_per_request
         self.max_requests = max_requests
+        self.max_block_route_expansion = float(max_block_route_expansion)
         self.max_concurrency = max_concurrency
         self.max_inflight_routes = max_inflight_routes
         self.coordinate_precision = coordinate_precision
@@ -378,16 +382,42 @@ class TravelTimeMatrixBuilder:
                 block_route_limit,
                 self.destination_chunk_size,
             )
-            report["planned_requests"] = len(blocks)
-            report["planned_routes"] = sum(
+            block_strategy = "tiled" if self.tile_size_m is not None else "compact"
+            planned_routes = sum(
                 len(sources) * len(destinations)
                 for sources, destinations in blocks
             )
+            if len(blocks) > self.max_requests and self.tile_size_m is not None:
+                compact_blocks = plan_sparse_blocks(
+                    demand,
+                    missing,
+                    self.source_chunk_size,
+                    None,
+                    block_route_limit,
+                    self.destination_chunk_size,
+                )
+                compact_routes = sum(
+                    len(sources) * len(destinations)
+                    for sources, destinations in compact_blocks
+                )
+                route_expansion = compact_routes / max(int(missing.sum()), 1)
+                if (
+                    len(compact_blocks) < len(blocks)
+                    and route_expansion <= self.max_block_route_expansion
+                ):
+                    blocks = compact_blocks
+                    planned_routes = compact_routes
+                    block_strategy = "compact_after_guard"
+            report["planned_requests"] = len(blocks)
+            report["planned_routes"] = planned_routes
+            report["block_strategy"] = block_strategy
+            report["route_expansion_ratio"] = planned_routes / max(int(missing.sum()), 1)
             report["max_concurrency"] = self.max_concurrency
             report["max_inflight_routes"] = self.max_inflight_routes
             if len(blocks) > self.max_requests:
                 return self._fallback(
-                    f"planned requests {len(blocks)} exceed guard {self.max_requests}",
+                    f"planned ORS requests {len(blocks)} exceed automatic guard "
+                    f"{self.max_requests} after safe block packing",
                     fallback,
                     report,
                     allow_fallback,
@@ -523,6 +553,7 @@ def sparse_network_matrix(
     tile_size_m: float = 3000,
     max_routes_per_request: int = 2500,
     max_requests: int = 500,
+    max_block_route_expansion: float = 1.5,
     max_concurrency: int = 2,
     max_inflight_routes: int = 3500,
     request_interval_s: float = 1.6,
@@ -593,6 +624,7 @@ def sparse_network_matrix(
             tile_size_m=tile_size_m,
             max_routes_per_request=max_routes_per_request,
             max_requests=max_requests,
+            max_block_route_expansion=max_block_route_expansion,
             max_concurrency=max_concurrency,
             max_inflight_routes=max_inflight_routes,
             coordinate_precision=coordinate_precision,

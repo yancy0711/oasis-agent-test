@@ -101,6 +101,35 @@ def test_builder_plans_and_reuses_without_http_or_sqlite():
     assert np.array_equal(matrix, reused)
 
 
+def test_builder_compacts_a_dense_tiled_plan_before_request_guard():
+    """Dense driving-like masks should be repacked instead of failing on tiny tiles."""
+    demand = _gdf([
+        (-112.0, 33.0), (-112.1, 33.0), (-112.2, 33.0), (-112.3, 33.0),
+    ])
+    supply = _gdf([(-112.05, 33.05), (-112.25, 33.05)])
+    backend = FakeBackend()
+    builder = TravelTimeMatrixBuilder(
+        backend,
+        MemoryCache(),
+        source_chunk_size=2,
+        destination_chunk_size=2,
+        tile_size_m=1000,
+        max_routes_per_request=4,
+        max_requests=2,
+        max_concurrency=1,
+        max_inflight_routes=4,
+    )
+
+    matrix, report = builder.build(
+        demand, supply, np.ones((4, 2), dtype=bool), allow_fallback=False,
+    )
+
+    assert np.all(matrix == 5)
+    assert report["block_strategy"] == "compact_after_guard"
+    assert report["planned_requests"] == 2
+    assert report["route_expansion_ratio"] == 1
+
+
 def test_builder_checkpoints_completed_pair_before_cancellation():
     """A completed backend block is cached before cancellation is observed."""
     token = CancellationToken()

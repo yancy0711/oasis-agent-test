@@ -94,7 +94,7 @@ def test_sparse_matrix_falls_back_when_request_guard_is_exceeded(monkeypatch, tm
         demand, supply, mask, fallback_matrix=fallback, api_key="test",
         source_chunk_size=1, max_routes_per_request=1, max_requests=1,
     )
-    assert report["router"] == "haversine" and "exceed guard" in report["reason"]
+    assert report["router"] == "haversine" and "exceed automatic guard" in report["reason"]
     assert np.array_equal(matrix, fallback)
 
 

@@ -58,29 +58,33 @@ print(result["outputs"])
 
 ## 3. Baseline and diagnostic tools
 
-The deterministic pipeline keeps its fixed six-tool baseline. The agent can additionally select generic diagnostic tools. Large GeoDataFrames and NumPy arrays never enter an LLM prompt. Each tool
+The deterministic pipeline keeps its fixed seven-tool baseline. The agent can additionally select diagnostic tools that match the confirmed question. Large GeoDataFrames and NumPy arrays never enter an LLM prompt. Each tool
 stores them in `Context` under a stable handle and returns a lightweight
 `ToolResult`.
 
 | Step | Registered tool | Reads | Stores | Main work |
 |---:|---|---|---|---|
 | 1 | `resolve_study_area` | `place_name` | `study` | OSM boundary and Census state/county FIPS |
-| 2 | `prepare_demand` | `study` | `demand` | ACS/TIGER, WorldPop-weighted Landsat heat, environment indices, vulnerability diagnostics |
-| 3 | `fetch_candidate_sites` | `study` | `candidates` | OSM library/community-centre/school points |
-| 4 | `build_travel_matrix` | `demand`, `candidates` | `travel` | ORS or declared Haversine travel minutes plus diagnostics |
-| 5 | `optimize_sites` | `demand`, `candidates`, `travel` | `analysis` | Gradual coverage/allocation, optional capacity, and efficiency–Gini sweep |
-| 6 | `generate_outputs` | `study`, `demand`, `candidates`, `analysis` | `outputs` | MapLibre GeoJSON, Pareto chart, and Markdown report |
-
+| 2 | `prepare_demand` | `study` | `demand` | ACS/TIGER, WorldPop-weighted Landsat heat, and vulnerability diagnostics |
+| 3 | `prepare_built_environment` | `demand` | `demand`, `built_environment` | Landsat NDVI, NDBI, albedo, and an auditable passive-environment burden diagnostic |
+| 4 | `fetch_candidate_sites` | `study` | `candidates` | OSM library/community-centre/school points |
+| 5 | `build_travel_matrix` | `demand`, `candidates` | `travel` | ORS or declared Haversine travel minutes plus diagnostics |
+| 6 | `optimize_sites` | `demand`, `candidates`, `travel` | `analysis` | Gradual coverage/allocation, optional capacity, and efficiency-Gini sweep |
+| 7 | `generate_outputs` | `study`, `demand`, `candidates`, `analysis`, `built_environment` | `outputs` | MapLibre GeoJSON, Pareto chart, and Markdown report |
 The additional agent-selectable tools are:
 
 | Tool | Question answered |
 |---|---|
 | `validate_constraints` | Are global and regional count requirements arithmetically consistent? |
+| `load_candidate_sites` | Use a reviewed candidate CSV instead of OpenStreetMap candidates. |
+| `summarize_heat_exposure` | Which prepared tracts have the highest heat exposure without selecting facilities? |
 | `find_minimum_facilities` | At a fixed threshold, what is the LSCP facility lower bound? |
 | `find_minimum_threshold` | At a fixed budget, what is the smallest matrix-supported feasible threshold? |
 | `analyze_reachability` | Which tracts are hardest, unserved, or structurally unreachable? |
 | `answer_result_queries` | Answer one or more typed, read-only tract questions and publish formula, terms, parameters, source fields, and top rows. |
+| `run_sensitivity_analysis` | How do confirmed counts and thresholds change coverage, Gini, and travel outcomes? |
 | `compare_scenarios` | How do the last two successful optimization scenarios differ? |
+| `compare_value_profiles` | How do two or more confirmed value profiles differ on one shared spatial baseline? |
 
 ### Step 1: resolve the study area
 
@@ -122,7 +126,15 @@ pipeline then applies explicit missing-value and direction rules, percentile
 normalization, correlation/VIF and PCA diagnostics, and marks the top quartile
 of the active composite score as priority tracts.
 
-### Step 3: fetch candidate facilities
+### Step 3: prepare built-environment diagnostics
+
+```python
+registry.get("prepare_built_environment").fn(ctx=ctx)
+```
+
+This step derives tract-level Landsat NDVI, NDBI, and albedo where imagery is available, then records a transparent passive-environment burden diagnostic. If imagery cannot be acquired, it records an explicit neutral fallback and provenance rather than inventing spatial variation.
+
+### Step 4: fetch candidate facilities
 
 ```python
 registry.get("fetch_candidate_sites").fn(
@@ -134,7 +146,7 @@ registry.get("fetch_candidate_sites").fn(
 An empty OSM result is returned as a structured `ToolError`, allowing the
 agent to repair the amenity list without receiving raw geospatial objects.
 
-### Step 4: build accessibility
+### Step 5: build accessibility
 
 ```python
 registry.get("build_travel_matrix").fn(ctx=ctx)
@@ -147,14 +159,14 @@ When `router: ors`, deterministic guards run before the production sparse-routin
 3. Build the complete Haversine fallback and an optimistic lower bound.
 4. Keep pairs within `20 * 1.5 = 30` minutes as ORS-eligible.
 5. Eligible-pair counts above `ors_max_eligible_pairs` use Haversine and print a warning.
-6. Planned requests above `ors_max_requests` use Haversine and print a warning.
+6. If tiled planning exceeds `ors_max_requests`, safely repack a dense matrix when the added route work stays within `ors_max_block_route_expansion`; otherwise retain Haversine with an explicit warning.
 7. Read eligible pairs from `data/cache/places/<place_slug>/ors/v1/pair_durations.sqlite`.
 8. Request ORS blocks only for missing pairs; a complete cache yields `live_pairs=0`.
 9. Print in-place progress bars for the cache scan and live ORS request blocks.
 
 Every fallback reason and the actual cache/live tier are recorded in provenance.
 
-### Step 5: optimize and sweep trade-offs
+### Step 6: optimize and sweep trade-offs
 
 ```python
 registry.get("optimize_sites").fn(
@@ -177,7 +189,7 @@ minimum-network-time site among the optimized sites and returns route geometry.
 Tract-intersection length weighting then reports route LST and available
 environment indices. This audit does not alter ORS routing or the siting objective.
 
-### Step 6: generate the three outputs
+### Step 7: generate the three outputs
 
 ```python
 registry.get("generate_outputs").fn(ctx=ctx, output_dir="outputs_run")
@@ -186,7 +198,7 @@ registry.get("generate_outputs").fn(ctx=ctx, output_dir="outputs_run")
 The report uses only solver results, the clarified `TaskSpec`, and accumulated
 `Provenance` records.
 
-## 4. Manual six-tool execution
+## 4. Manual seven-tool execution
 
 This is the non-LLM equivalence check for `run_pipeline()`:
 
@@ -211,6 +223,7 @@ ctx.put("task", task)
 calls = [
     ("resolve_study_area", {"place_name": task.place_name}),
     ("prepare_demand", {}),
+    ("prepare_built_environment", {}),
     ("fetch_candidate_sites", {"amenities": task.candidate_amenities}),
     ("build_travel_matrix", {}),
     ("optimize_sites", {
@@ -228,7 +241,7 @@ for name, args in calls:
         break
 ```
 
-The automated version is `test_cli_pipeline_matches_manual_six_tool_chain()`
+The automated version is `test_cli_pipeline_matches_manual_seven_tool_chain()`
 in `tests/integration/test_pipeline_agent.py`. It runs both paths on the same synthetic geospatial
 data and compares the complete serialized `SiteSolution` objects.
 

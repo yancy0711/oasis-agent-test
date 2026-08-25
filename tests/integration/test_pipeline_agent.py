@@ -202,8 +202,8 @@ def test_run_agent_performs_parse_hitl_observe_and_act():
     assert result["results"][0].ok
 
 
-def test_cli_pipeline_matches_manual_six_tool_chain(monkeypatch, tmp_path):
-    """Verify CLI and manual six-tool execution produce the same solution."""
+def test_cli_pipeline_matches_manual_seven_tool_chain(monkeypatch, tmp_path):
+    """Verify CLI and manual seven-tool execution produce the same solution."""
     geoids = ["06037000100", "06037000200", "06037000300"]
     tracts = gpd.GeoDataFrame({"GEOID": geoids}, geometry=[
         box(-118.30, 34.00, -118.28, 34.02), box(-118.20, 34.00, -118.18, 34.02),
@@ -222,7 +222,8 @@ def test_cli_pipeline_matches_manual_six_tool_chain(monkeypatch, tmp_path):
     monkeypatch.setattr(workflow, "fetch_heat_exposure", lambda *args, **kwargs: (heat, Provenance(source="fake heat", record_count=3)))
     monkeypatch.setattr(workflow, "fetch_candidates", lambda *args: (candidates, None))
 
-    cfg = {"llm": {}, "accessibility": {"router": "haversine", "threshold_minutes": 15},
+    cfg = {"llm": {}, "data": {"landsat_environment_indices": {"enabled": False}},
+           "accessibility": {"router": "haversine", "threshold_minutes": 15},
            "optimization": {"n_facilities": 1, "solver_time_limit_s": 5},
            "output": {"dir": str(tmp_path / "pipeline")}}
     pipeline = run_pipeline(cfg, "Test County, USA", validate_place=False)
@@ -233,6 +234,7 @@ def test_cli_pipeline_matches_manual_six_tool_chain(monkeypatch, tmp_path):
     ctx = Context(); ctx.put("config", cfg); ctx.put("task", task)
     calls = [
         ("resolve_study_area", {"place_name": task.place_name}), ("prepare_demand", {}),
+        ("prepare_built_environment", {}),
         ("fetch_candidate_sites", {"amenities": task.candidate_amenities}), ("build_travel_matrix", {}),
         ("optimize_sites", {"n_facilities": 1, "threshold_minutes": 15,
                             "weights": task.weights.model_dump()}),

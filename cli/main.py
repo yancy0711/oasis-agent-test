@@ -64,7 +64,7 @@ def run_pipeline(
     threshold_minutes: float | None = None,
     verbose: bool = False,
 ) -> dict:
-    """Confirm geography, then run the deterministic six-tool pipeline."""
+    """Confirm geography, then run the deterministic seven-tool pipeline."""
     opt, access = cfg.get("optimization", {}), cfg.get("accessibility", {})
     selected_profile = profile or opt.get("value_profile", "balanced")
     task = TaskSpec(

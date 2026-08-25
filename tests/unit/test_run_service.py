@@ -317,6 +317,27 @@ class _FallbackOrchestrator(_RoutingOrchestrator):
         return payload
 
 
+class _ReturnedRoutingFailureOrchestrator(_RoutingOrchestrator):
+    """Return the strict-routing guard as a structured agent failure."""
+
+    def run(self, task):
+        payload = super().run(task)
+        if self.cfg["accessibility"]["router"] == "ors":
+            diagnosis = (
+                "Precise mode requires ORS for every mobility profile: "
+                "{'driving': 'planned ORS requests 1363 exceed automatic guard 500 "
+                "after safe block packing'}"
+            )
+            payload.update(
+                ok=False, paused=True, message=diagnosis,
+                failed_tool="build_travel_matrix",
+                recovery={
+                    "diagnosis": diagnosis, "question": "Adjust routing inputs.",
+                    "suggested_changes": {},
+                },
+            )
+        return payload
+
 class _LargePreviewOrchestrator(_RoutingOrchestrator):
     """Publish a quick matrix that is too large for automatic ORS refinement."""
 
@@ -417,6 +438,21 @@ def test_auto_retains_approximate_result_when_precise_routing_fails(tmp_path, mo
     finally:
         service.executor.shutdown(wait=True)
 
+
+def test_auto_retains_preview_when_precise_guard_is_returned_as_agent_failure(tmp_path, monkeypatch):
+    """A returned strict-routing failure must not become an unactionable HITL state."""
+    service = _service(tmp_path, monkeypatch, _ReturnedRoutingFailureOrchestrator)
+    try:
+        task = TaskSpec(place_name="Phoenix", mobility_scenario="driving")
+        run_id = service.start_run(task, "auto")["run_id"]
+        snapshot = _terminal(service, run_id)
+        assert snapshot["status"] == "succeeded"
+        assert snapshot["preview_result"]["execution"]["accuracy"] == "approximate"
+        assert snapshot["preview_result"].get("recovery") is None
+        assert "OASIS request-volume guard" in snapshot["preview_result"]["message"]
+        assert "reduce the travel threshold" in snapshot["preview_result"]["message"]
+    finally:
+        service.executor.shutdown(wait=True)
 
 def test_auto_skips_precise_phase_when_quick_pair_count_exceeds_limit(tmp_path, monkeypatch):
     """Large metros must return their preview without repeating an impossible phase."""
