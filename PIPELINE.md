@@ -262,7 +262,7 @@ user prompt
 
 `n_facilities` controls the decision budget; each `ResultQuery.limit` independently controls answer length. A single run owns one study boundary. Multiple extracted places require a user choice and should be run separately before comparison. `max_agent_steps` bounds total decisions, and `max_self_correction_rounds` bounds local retries. Repeating an identical failed call is blocked. Large data objects stay in `Context`; the model receives only handle names and compact summaries.
 
-For an infeasible fixed-budget request, the model can select LSCP, minimum-threshold search, or reachability analysis instead of silently changing a confirmed constraint.
+For an infeasible fixed-budget request, the model can select LSCP, minimum-threshold search, or reachability analysis instead of silently changing a confirmed constraint. The minimum-threshold probes share one configured total time budget, publish progress before each solve, and retain an explicitly labeled best feasible bound if the search times out. Web runs execute in killable child processes; the parent writes a five-second heartbeat while preserving the timestamp of the last real stage update.
 
 ```powershell
 python -m cli.main --mode agent --prompt "At a strict 15-minute threshold, how many Phoenix cooling centers are required for full tract coverage?"

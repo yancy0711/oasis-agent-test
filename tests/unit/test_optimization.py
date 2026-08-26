@@ -5,6 +5,8 @@ behaviors are guaranteed vs model-decided.
 """
 import numpy as np
 import pytest
+from types import SimpleNamespace
+import oasis.core.optimization.models as optimization_models
 from oasis.contracts.domain import ValueWeights
 from oasis.core.optimization.models import (_solve_mclp_selection, build_demand_weights, gradual_coverage_matrix, population_weighted_gini,
                                        minimum_coverage_threshold, solve_lscp, solve_mclp)
@@ -267,3 +269,30 @@ def test_minimum_threshold_search_uses_observed_matrix_breakpoints():
         np.array([[5., 20.], [20., 5.]]), np.ones(2), np.array([True, False]),
         ["a", "b"], n_facilities=1, coverage_target=1.0)
     assert threshold == 20.0 and solution is not None and len(solution.selected_ids) == 1
+def test_minimum_threshold_search_has_one_total_budget_and_pre_solve_progress(monkeypatch):
+    """Repeated LSCP probes must share one deadline and report before blocking."""
+    ticks = iter([0.0, 0.0, 100.0, 100.0])
+    probe_limits = []
+    events = []
+
+    monkeypatch.setattr(optimization_models, "monotonic", lambda: next(ticks))
+
+    def fake_lscp(*args, **kwargs):
+        probe_limits.append(args[-1])
+        return SimpleNamespace(solver_status="Infeasible", selected_ids=[])
+
+    monkeypatch.setattr(optimization_models, "solve_lscp", fake_lscp)
+    diagnostics = {}
+    threshold, solution = minimum_coverage_threshold(
+        np.array([[5.0, 20.0]]), np.ones(1), np.array([True]), ["a", "b"],
+        n_facilities=1, time_limit_s=120, total_time_limit_s=10,
+        progress_callback=lambda label, done, total: events.append((label, done, total)),
+        search_diagnostics=diagnostics,
+    )
+
+    assert threshold is None and solution is None
+    assert probe_limits == [5]
+    assert events[0] == ("Minimum-threshold search", 0, 2)
+    assert events[-1] == ("Minimum-threshold search", 1, 2)
+    assert diagnostics["status"] == "time_limit"
+    assert diagnostics["probes"] == 1

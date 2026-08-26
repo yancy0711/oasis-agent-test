@@ -15,15 +15,13 @@ const AUDIENCES: Record<PromptAudience, {
   research: {
     label: "Research and planning",
     audience: "For planners, public-health teams, and researchers.",
-    description: "Analyze a US city or county using candidate selection, equity, heat, or reachability workflows.",
+    description: "Analyze a US city or county through facility siting, value-profile comparison, heat exposure, or accessibility assessment.",
     placeholder: "Select 10 candidate cooling facilities in Phoenix within a 15-minute walk.",
     examples: [
-      { label: "Candidate selection", prompt: "Select 10 candidate cooling facilities in Phoenix, Arizona within a 15-minute walking threshold." },
-      { label: "Equity trade-off", prompt: "Compare efficiency and access inequality when selecting 10 candidate cooling facilities in Phoenix within a 15-minute walk." },
-      { label: "Heat review", prompt: "Do not optimize sites. Only show which Phoenix communities have the highest heat exposure." },
-      { label: "Reachability review", prompt: "Which Phoenix tracts are hardest to reach from the current candidate facilities within 15 minutes?" },
-      { label: "Needs clarification", prompt: "Help me improve cooling access." },
-      { label: "Outside scope", prompt: "Which Phoenix cooling centers are open right now?" },
+      { label: "Candidate facility siting", prompt: "Select 10 candidate cooling facilities in Phoenix, Arizona within a 15-minute walking threshold." },
+      { label: "Value profile comparison", prompt: "Compare efficiency and access inequality when selecting 10 candidate cooling facilities in Phoenix within a 15-minute walk." },
+      { label: "Heat exposure assessment", prompt: "Do not optimize sites. Only show which Phoenix communities have the highest heat exposure." },
+      { label: "Accessibility gap assessment", prompt: "Which Phoenix tracts are hardest to reach from the current candidate facilities within 15 minutes?" },
     ],
   },
   personal: {

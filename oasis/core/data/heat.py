@@ -78,6 +78,7 @@ def _readable_items(
     items: list,
     max_workers: int = 1,
     cancel_check: Callable[[], None] | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> list:
     """Keep readable scenes, probing independent headers in bounded threads."""
     if not items:
@@ -85,11 +86,15 @@ def _readable_items(
     worker_count = min(8, max(1, int(max_workers)), len(items))
     if worker_count == 1:
         valid = []
-        for item in items:
+        for index, item in enumerate(items):
             if cancel_check:
                 cancel_check()
+            if progress_callback:
+                progress_callback("Landsat heat: validating scene files", index, len(items))
             if _item_is_readable(item):
                 valid.append(item)
+        if progress_callback:
+            progress_callback("Landsat heat: validating scene files", len(items), len(items))
     else:
         readable = [False] * len(items)
         with ThreadPoolExecutor(
@@ -101,10 +106,14 @@ def _readable_items(
                 for index, item in enumerate(items)
             }
             try:
-                for future in as_completed(futures):
+                for completed, future in enumerate(as_completed(futures), start=1):
                     if cancel_check:
                         cancel_check()
                     readable[futures[future]] = future.result()
+                    if progress_callback:
+                        progress_callback(
+                            "Landsat heat: validating scene files", completed, len(items)
+                        )
             except Exception:
                 for future in futures:
                     future.cancel()
@@ -576,6 +585,7 @@ def fetch_heat_exposure(
             items,
             max_workers=readable_workers,
             cancel_check=cancel_check,
+            progress_callback=progress_callback,
         )
         metric_crs = pick_metric_crs(study)
         if cancel_check:

@@ -646,10 +646,11 @@ def prepare_built_environment(
 def fetch_candidate_sites(ctx: Context, amenities: list[str], study_handle: str = "study") -> ToolResult:
     """Fetch candidate facility points for the requested OSM amenities."""
     study = ctx.get(study_handle)
-    ctx.progress("Candidate facilities: reading OpenStreetMap data", 0, 2, unit="stages")
+    ctx.progress("Candidate facilities: querying OpenStreetMap", 0, 3, unit="stages")
     with scoped_cache(study["cache_scope"]): candidates, error = fetch_candidates(study["boundary"], amenities)
     if error: return ToolResult(ok=False, tool="fetch_candidate_sites", error=error)
-    ctx.progress("Candidate facilities: checking access and opening hours", 1, 2, unit="stages")
+    ctx.progress("Candidate facilities: received candidate records", 1, 3, unit="stages")
+    ctx.progress("Candidate facilities: checking access and opening hours", 2, 3, unit="stages")
     potential = len(candidates)
     candidates, access = _filter_candidate_access(candidates)
     candidates, hours = _filter_candidate_hours(ctx, candidates)
@@ -679,7 +680,7 @@ def fetch_candidate_sites(ctx: Context, amenities: list[str], study_handle: str 
                f"floor area proxy: {capacity_summary['relative_floor_area_proxy_sites']}"),
     )
     ctx.put("candidates", candidates, prov)
-    ctx.progress("Candidate facilities: ready", 2, 2, unit="stages")
+    ctx.progress("Candidate facilities: ready", 3, 3, unit="stages")
     return ToolResult(ok=True, tool="fetch_candidate_sites", handle="candidates", provenance=prov,
                       summary={"candidates": len(candidates), "amenities": amenities,
                                "public_access": access, "operating_hours": hours,
@@ -1129,15 +1130,24 @@ def find_minimum_threshold(ctx: Context, n_facilities: int = 10,
     demand, candidates, travel = ctx.get("demand"), ctx.get("candidates"), ctx.get("travel")
     matrix, population, vulnerable, _ = _decision_inputs(demand, travel)
     candidate_ids = candidates["cand_id"].astype(str).tolist(); mask = _coverage_mask(demand, coverage_group, travel)
+    optimization = _cfg(ctx, "optimization")
+    search_diagnostics = {}
     threshold, solution = minimum_coverage_threshold(
         matrix, population, vulnerable, candidate_ids,
-        n_facilities, coverage_target, mask, _cfg(ctx, "optimization").get("solver_time_limit_s", 120), ctx.progress)
+        n_facilities, coverage_target, mask,
+        optimization.get("solver_time_limit_s", 120), ctx.progress,
+        total_time_limit_s=optimization.get("minimum_threshold_total_time_limit_s", 90),
+        search_diagnostics=search_diagnostics,
+        cancel_check=ctx.check_cancelled,
+    )
     current = ctx.get("task", None)
     summary = {"feasible": threshold is not None, "minimum_threshold_minutes": threshold,
                "current_threshold_minutes": getattr(current, "threshold_minutes", None),
                "threshold_gap_minutes": (threshold - current.threshold_minutes if threshold is not None and current else None),
                "n_facilities": n_facilities, "coverage_target": coverage_target,
                "coverage_group": coverage_group,
+               "search": search_diagnostics,
+               "search_complete": search_diagnostics.get("status") == "complete",
                "selected_ids": solution.selected_ids if solution else []}
     study = ctx.get("study", {})
     if solution and threshold is not None and study and "areas" in demand:
@@ -1675,14 +1685,14 @@ def generate_outputs(ctx: Context, output_dir: str | None = None, indicator: str
     base = Path(output_dir or _cfg(ctx, "output").get("dir", "outputs_run"))
     out = base if output_dir else base / study["cache_scope"]; out.mkdir(parents=True, exist_ok=True)
     paths = {"map": str(out / "coverage_map.geojson"), "pareto": str(out / "pareto.png"), "report": str(out / "report.md")}
-    ctx.progress("Outputs: writing interactive map", 0, 3, unit="artifacts")
+    ctx.progress("Outputs: writing interactive map", 0, 4, unit="artifacts")
     coverage_map(
         demand["areas"], candidates, analysis["solution"], indicator, paths["map"],
         study["boundary"], task=task,
     )
-    ctx.progress("Outputs: rendering Pareto chart", 1, 3, unit="artifacts")
+    ctx.progress("Outputs: rendering Pareto chart", 1, 4, unit="artifacts")
     pareto_chart(analysis["points"], analysis["frontier"], paths["pareto"])
-    ctx.progress("Outputs: writing method report", 2, 3, unit="artifacts")
+    ctx.progress("Outputs: writing method report", 2, 4, unit="artifacts")
     Path(paths["report"]).write_text(render_report(
         task, analysis["solution"], analysis["frontier"], ctx.lineage,
         model_context={
@@ -1694,8 +1704,9 @@ def generate_outputs(ctx: Context, output_dir: str | None = None, indicator: str
             "vulnerability": ctx.get("vulnerability_analysis", {}),
         },
     ), encoding="utf-8")
-    ctx.progress("Outputs ready", 3, 3, unit="artifacts")
+    ctx.progress("Outputs: registering artifacts", 3, 4, unit="artifacts")
     ctx.put("outputs", paths)
+    ctx.progress("Outputs ready", 4, 4, unit="artifacts")
     return ToolResult(ok=True, tool="generate_outputs", handle="outputs", summary=paths)
 
 

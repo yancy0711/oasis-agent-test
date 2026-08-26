@@ -32,6 +32,7 @@ class LlmConnectionResponse(BaseModel):
     latency_ms: int
     expires_in_seconds: int
     structured_output: bool
+    compatibility_attempts: int = 1
 
 
 class LlmModelsRequest(BaseModel):
@@ -297,12 +298,18 @@ class RunProgress(BaseModel):
     cache_hits: int = 0
     remote_pairs: int = 0
     inflight_pairs: int = 0
+    stage_started_at: str | None = None
+    activity_at: str | None = None
+    heartbeat_at: str | None = None
+    stage_elapsed_seconds: float = 0.0
+    last_activity_seconds: float = 0.0
 
 
 class PublicAgentEvent(BaseModel):
     """Expose one ordered, observable agent event."""
 
     seq: int | None = None
+    created_at: str | None = None
     kind: str = "agent"
     stage: str
     message: str

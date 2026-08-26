@@ -72,7 +72,7 @@ export interface LlmConnectionInput {
 }
 export interface LlmConnectionResult {
   session_id: string; provider: string; model: string; latency_ms: number;
-  resolved_model: string; expires_in_seconds: number; structured_output: boolean;
+  resolved_model: string; expires_in_seconds: number; structured_output: boolean; compatibility_attempts: number;
 }
 
 export async function testLlmConnection(input: LlmConnectionInput): Promise<LlmConnectionResult> {

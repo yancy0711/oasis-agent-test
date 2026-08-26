@@ -42,3 +42,7 @@ def test_report_explains_active_and_diagnostic_only_equations():
     assert "minimum rank correlation was 0.900" in report
     assert "poverty_rate had 1 missing tract" in report
     assert "heat_exposure and mean_ndvi" in report
+    assert "Candidate Facility Selection Report — Phoenix" in report
+    assert "Efficiency–Equity Trade-off" in report
+    for corrupted_lead in ("\u00e2", "\u00ce", "\u00c2", "\ufffd"):
+        assert corrupted_lead not in report

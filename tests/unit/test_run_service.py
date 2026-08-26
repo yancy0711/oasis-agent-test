@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -247,7 +248,8 @@ def test_connection_success_requires_a_completion_from_the_selected_model(monkey
     class ProbeClient:
         def __init__(self, config):
             seen.update(config)
-        def probe(self, _system, _user):
+        def probe(self, _system, _user, schema=None):
+            assert schema and schema.get("title") == "TaskSpec"
             return {
                 "place_name": "Phoenix, Arizona, USA",
                 "analysis_goal": "facility_siting",
@@ -270,9 +272,77 @@ def test_connection_success_requires_a_completion_from_the_selected_model(monkey
     assert seen["model"] == "deepseek/deepseek-v4-flash-latest"
     assert result["resolved_model"] == "deepseek/deepseek-v4-flash-202608"
     assert result["structured_output"] is True
+    assert result["compatibility_attempts"] == 1
     stored = service.llm_sessions[result["session_id"]]["config"]
     assert stored["max_tokens"] == 1024
 
+
+def test_connection_probe_retries_one_semantically_wrong_json_response(monkeypatch):
+    """A valid JSON object with wrong task values gets one bounded correction attempt."""
+    responses = [
+        {
+            "place_name": "Phoenix, Arizona, USA", "analysis_goal": "facility_siting",
+            "n_facilities": 10, "threshold_minutes": 15, "mobility_scenario": "walking",
+        },
+        {
+            "place_name": "Phoenix, Arizona, USA", "analysis_goal": "facility_siting",
+            "n_facilities": "2", "threshold_minutes": 15, "mobility_scenario": "walking",
+        },
+    ]
+
+    class ProbeClient:
+        def __init__(self, _config):
+            pass
+
+        def probe(self, _system, _user, schema=None):
+            assert schema and schema.get("title") == "TaskSpec"
+            return responses.pop(0), "provider/resolved-model"
+
+    service = object.__new__(OasisService)
+    service.cfg = {"llm": {"max_tokens": 4096}}
+    service.lock = threading.Lock()
+    service.llm_sessions = {}
+    service._validated_llm_url = lambda *_: "https://openrouter.ai/api/v1"
+    monkeypatch.setattr("oasis.services.application.LLMClient", ProbeClient)
+
+    result = service.test_llm_connection(
+        "openrouter", "https://openrouter.ai/api/v1", "provider/model", "test-key",
+    )
+
+    assert result["compatibility_attempts"] == 2
+    assert not responses
+
+def test_connection_probe_retries_one_transient_structured_output_failure(monkeypatch):
+    """An empty/text compatibility failure is retried inside one connection test."""
+    calls = 0
+
+    class ProbeClient:
+        def __init__(self, _config):
+            pass
+
+        def probe(self, _system, _user, schema=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ValueError("The selected model returned empty content instead of JSON.")
+            return {
+                "place_name": "Phoenix, Arizona, USA", "analysis_goal": "facility_siting",
+                "n_facilities": 2, "threshold_minutes": 15, "mobility_scenario": "walking",
+            }, "provider/resolved-model"
+
+    service = object.__new__(OasisService)
+    service.cfg = {"llm": {"max_tokens": 4096}}
+    service.lock = threading.Lock()
+    service.llm_sessions = {}
+    service._validated_llm_url = lambda *_: "https://openrouter.ai/api/v1"
+    monkeypatch.setattr("oasis.services.application.LLMClient", ProbeClient)
+
+    result = service.test_llm_connection(
+        "openrouter", "https://openrouter.ai/api/v1", "provider/model", "test-key",
+    )
+
+    assert calls == 2
+    assert result["compatibility_attempts"] == 2
 
 class _RoutingOrchestrator:
     """Return the router declared by the phase configuration."""
@@ -631,6 +701,51 @@ def test_run_store_survives_reopen_and_marks_lost_work_interrupted(tmp_path):
     assert snapshot["status"] == "interrupted"
     assert snapshot["progress"] is None
     assert snapshot["events"][0]["message"] == "queued"
+    assert snapshot["events"][0]["created_at"]
+
+
+def test_run_store_migrates_existing_events_to_timestamped_rows(tmp_path):
+    """Opening an older run database must add event timestamps without data loss."""
+    path = tmp_path / "runs.sqlite"
+    store = RunStore(path)
+    store.create("old-run", {"mode": "quick", "task": {"place_name": "Phoenix"}})
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE run_events")
+        connection.execute(
+            "CREATE TABLE run_events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, "
+            "payload_json TEXT NOT NULL, PRIMARY KEY(run_id,seq))"
+        )
+        connection.execute(
+            "INSERT INTO run_events (run_id,seq,payload_json) VALUES (?,?,?)",
+            ("old-run", 1, '{"seq":1,"stage":"legacy","message":"retained"}'),
+        )
+
+    migrated = RunStore(path)
+    event = migrated.snapshot("old-run")["events"][0]
+    assert event["message"] == "retained"
+    assert event["created_at"]
+
+def test_run_store_heartbeat_preserves_last_activity_and_updates_elapsed_time(tmp_path):
+    """A heartbeat must make a blocked stage observable without inventing activity."""
+    path = tmp_path / "runs.sqlite"
+    store = RunStore(path)
+    store.create("run-heartbeat", {"mode": "quick", "task": {"place_name": "Phoenix"}})
+    store.transition(
+        "run-heartbeat", ("queued",), "running",
+        progress={
+            "label": "Minimum-threshold search", "done": 0, "total": 12,
+            "unit": "probes", "fraction": 0.0,
+            "stage_started_at": "2026-01-01T00:00:00+00:00",
+            "activity_at": "2026-01-01T00:00:00+00:00",
+        },
+    )
+
+    assert store.heartbeat("run-heartbeat")
+    progress = store.snapshot("run-heartbeat")["progress"]
+    assert progress["label"] == "Minimum-threshold search"
+    assert progress["last_activity_at"] == "2026-01-01T00:00:00+00:00"
+    assert progress["stage_elapsed_seconds"] > 0
+    assert progress["last_activity_seconds"] > 0
 
 def test_waiting_revision_is_visible_and_cancellable(tmp_path, monkeypatch):
     """A serialized run reports why it is waiting and can exit before acquiring the lock."""

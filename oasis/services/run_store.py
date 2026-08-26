@@ -71,6 +71,15 @@ class RunStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs(parent_run_id);
             """)
+            event_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(run_events)")
+            }
+            if "created_at" not in event_columns:
+                connection.execute("ALTER TABLE run_events ADD COLUMN created_at TEXT")
+            connection.execute(
+                "UPDATE run_events SET created_at=(SELECT created_at FROM runs "
+                "WHERE runs.run_id=run_events.run_id) WHERE created_at IS NULL"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         """Open one thread-local connection with bounded writer waiting."""
@@ -117,9 +126,14 @@ class RunStore:
             row = connection.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
             if row is None:
                 raise KeyError("Unknown run")
-            events = [json.loads(item[0]) for item in connection.execute(
-                "SELECT payload_json FROM run_events WHERE run_id=? ORDER BY seq", (run_id,)
-            )]
+            events = []
+            for item in connection.execute(
+                "SELECT payload_json,created_at FROM run_events WHERE run_id=? ORDER BY seq",
+                (run_id,),
+            ):
+                payload = json.loads(item[0])
+                payload.setdefault("created_at", item[1])
+                events.append(payload)
         record = dict(row)
         for public, column in _JSON_COLUMNS.items():
             raw = record.pop(column)
@@ -209,13 +223,48 @@ class RunStore:
             seq = connection.execute(
                 "SELECT COALESCE(MAX(seq),0)+1 FROM run_events WHERE run_id=?", (run_id,)
             ).fetchone()[0]
-            payload = {"seq": seq, **event}
+            created_at = _now()
+            payload = {"seq": seq, "created_at": created_at, **event}
             connection.execute(
-                "INSERT INTO run_events (run_id,seq,payload_json) VALUES (?,?,?)",
-                (run_id, seq, _dump(payload)),
+                "INSERT INTO run_events (run_id,seq,payload_json,created_at) VALUES (?,?,?,?)",
+                (run_id, seq, _dump(payload), created_at),
             )
             connection.commit()
         return payload
+
+    def heartbeat(self, run_id: str) -> bool:
+        """Refresh one active progress snapshot without hiding its last real activity."""
+        now = _now()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT status,progress_json FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError("Unknown run")
+            if row["status"] not in {"queued", "running", "cancelling"}:
+                return False
+            progress = json.loads(row["progress_json"]) if row["progress_json"] else None
+            if progress is not None:
+                activity_at = progress.get("activity_at") or now
+                stage_started_at = progress.get("stage_started_at") or activity_at
+                wall_now = datetime.fromisoformat(now)
+                progress.update(
+                    heartbeat_at=now,
+                    last_activity_at=activity_at,
+                    stage_elapsed_seconds=round(
+                        max((wall_now - datetime.fromisoformat(stage_started_at)).total_seconds(), 0.0),
+                        1,
+                    ),
+                    last_activity_seconds=round(
+                        max((wall_now - datetime.fromisoformat(activity_at)).total_seconds(), 0.0),
+                        1,
+                    ),
+                )
+            connection.execute(
+                "UPDATE runs SET progress_json=?,updated_at=? WHERE run_id=?",
+                (None if progress is None else _dump(progress), now, run_id),
+            )
+        return True
 
     def put_artifacts(self, run_id: str, phase: str, artifacts: dict[str, Path]) -> None:
         """Persist allow-listed private paths under stable public names."""

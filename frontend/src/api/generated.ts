@@ -575,6 +575,11 @@ export interface components {
             expires_in_seconds: number;
             /** Structured Output */
             structured_output: boolean;
+            /**
+             * Compatibility Attempts
+             * @default 1
+             */
+            compatibility_attempts: number;
         };
         /**
          * LlmModelsRequest
@@ -841,6 +846,8 @@ export interface components {
         PublicAgentEvent: {
             /** Seq */
             seq?: number | null;
+            /** Created At */
+            created_at?: string | null;
             /**
              * Kind
              * @default agent
@@ -1055,6 +1062,16 @@ export interface components {
              * @default 0
              */
             inflight_pairs: number;
+            /** Stage Started At */
+            stage_started_at?: string | null;
+            /** Activity At */
+            activity_at?: string | null;
+            /** Heartbeat At */
+            heartbeat_at?: string | null;
+            /** Stage Elapsed Seconds */
+            stage_elapsed_seconds?: number;
+            /** Last Activity Seconds */
+            last_activity_seconds?: number;
         } & {
             [key: string]: unknown;
         };

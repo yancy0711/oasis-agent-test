@@ -11,6 +11,10 @@ export function RunProgress({ status, phase, progress }: RunProgressProps) {
   const active = status === "queued" || status === "running";
   const complete = status === "succeeded";
   const visibleProgress = active ? progress : null;
+  const timing = visibleProgress as (Progress & {
+    stage_elapsed_seconds?: number;
+    last_activity_seconds?: number;
+  }) | null;
   const percent = complete ? 100 : Math.round((visibleProgress?.fraction ?? 0) * 100);
   const [eta, setEta] = useState(visibleProgress?.eta_seconds ?? null);
   useEffect(() => {
@@ -39,6 +43,9 @@ export function RunProgress({ status, phase, progress }: RunProgressProps) {
           <span>{visibleProgress.done}/{visibleProgress.total} {visibleProgress.unit}</span>
           <span>{visibleProgress.cache_hits} cache hits</span>
           <span>{visibleProgress.remote_pairs} remote pairs</span>
+          {timing?.stage_elapsed_seconds != null && <span>Stage elapsed {Math.floor(timing.stage_elapsed_seconds)}s</span>}
+          {timing?.last_activity_seconds != null && timing.last_activity_seconds >= 1
+            && <span>Last activity {Math.floor(timing.last_activity_seconds)}s ago</span>}
           {eta != null && (eta <= 0 && visibleProgress.done < visibleProgress.total
             ? <span>Finishing the current solver setting</span>
             : <span>ETA ≈ {Math.ceil(eta)}s</span>)}

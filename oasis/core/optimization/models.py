@@ -5,6 +5,8 @@ the solver (PuLP/CBC) does exact, reproducible math. The LLM never touches
 numbers here.
 """
 from __future__ import annotations
+import math
+from time import monotonic
 import numpy as np
 import pulp
 from oasis.contracts.domain import SiteSolution, ValueWeights
@@ -441,20 +443,65 @@ def minimum_coverage_threshold(travel_matrix: np.ndarray, population: np.ndarray
                                vulnerable_mask: np.ndarray, candidate_ids: list[str],
                                n_facilities: int, coverage_target: float = 1.0,
                                coverage_mask: np.ndarray | None = None,
-                               time_limit_s: int = 120, progress_callback=None) -> tuple[float | None, SiteSolution | None]:
-    """Find the smallest observed travel time at which LSCP needs no more than the budget."""
+                               time_limit_s: int = 120, progress_callback=None, *,
+                               total_time_limit_s: float | None = None,
+                               search_diagnostics: dict | None = None,
+                               cancel_check=None) -> tuple[float | None, SiteSolution | None]:
+    """Find the smallest feasible observed threshold within one bounded search budget."""
     matrix = np.asarray(travel_matrix, dtype=float)
     if matrix.ndim != 2 or not 1 <= n_facilities <= matrix.shape[1]:
         raise ValueError("n_facilities must be between 1 and candidate count")
     values = np.unique(matrix[np.isfinite(matrix)])
-    if not len(values): return None, None
+    if not len(values):
+        if search_diagnostics is not None:
+            search_diagnostics.update(status="no_finite_travel_times", probes=0)
+        return None, None
+    expected_probes = max(1, int(np.ceil(np.log2(len(values) + 1))))
+    total_budget = float(total_time_limit_s if total_time_limit_s is not None else time_limit_s)
+    if total_budget <= 0:
+        raise ValueError("total_time_limit_s must be positive")
+    started = monotonic()
     low, high, best, solution, probes = 0, len(values) - 1, None, None, 0
+    status = "complete"
     while low <= high:
-        middle = (low + high) // 2; threshold = float(values[middle]); probes += 1
-        current = solve_lscp(matrix, population, vulnerable_mask, threshold, candidate_ids,
-                             coverage_target, coverage_mask, time_limit_s)
-        feasible = current.solver_status in {"Optimal", "Feasible"} and len(current.selected_ids) <= n_facilities
-        if progress_callback: progress_callback("Minimum-threshold search", probes, max(1, int(np.ceil(np.log2(len(values) + 1)))))
-        if feasible: best, solution, high = threshold, current, middle - 1
-        else: low = middle + 1
+        if cancel_check:
+            cancel_check()
+        remaining = total_budget - (monotonic() - started)
+        if remaining <= 0:
+            status = "time_limit"
+            break
+        middle = (low + high) // 2
+        threshold = float(values[middle])
+        remaining_probes = max(1, expected_probes - probes)
+        probe_budget = max(1, min(int(time_limit_s), int(math.ceil(remaining / remaining_probes))))
+        if progress_callback:
+            progress_callback("Minimum-threshold search", probes, expected_probes)
+        current = solve_lscp(
+            matrix, population, vulnerable_mask, threshold, candidate_ids,
+            coverage_target, coverage_mask, probe_budget,
+        )
+        probes += 1
+        if progress_callback:
+            progress_callback("Minimum-threshold search", probes, expected_probes)
+        if current.solver_status not in {"Optimal", "Feasible", "Infeasible"}:
+            status = "solver_time_limit"
+            break
+        feasible = (
+            current.solver_status in {"Optimal", "Feasible"}
+            and len(current.selected_ids) <= n_facilities
+        )
+        if feasible:
+            best, solution, high = threshold, current, middle - 1
+        else:
+            low = middle + 1
+    elapsed = monotonic() - started
+    if search_diagnostics is not None:
+        search_diagnostics.update(
+            status=status,
+            probes=probes,
+            expected_probes=expected_probes,
+            elapsed_seconds=round(elapsed, 3),
+            total_time_limit_seconds=total_budget,
+            best_threshold_minutes=best,
+        )
     return best, solution

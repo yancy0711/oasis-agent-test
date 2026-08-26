@@ -8,7 +8,7 @@ describe("prompt examples", () => {
   it("copies an example into the editable prompt without submitting it", () => {
     const submit = vi.fn();
     render(<PromptInput pending={false} onSubmit={submit} onCancel={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: "Candidate selection" }));
+    fireEvent.click(screen.getByRole("button", { name: "Candidate facility siting" }));
     expect(screen.getByLabelText("Describe the cooling-access question")).toHaveValue(
       "Select 10 candidate cooling facilities in Phoenix, Arizona within a 15-minute walking threshold.",
     );
@@ -17,14 +17,17 @@ describe("prompt examples", () => {
 
   it("groups research and personal route examples without clearing typed text", () => {
     render(<PromptInput pending={false} onSubmit={vi.fn()} onCancel={vi.fn()} />);
-    expect(screen.getByRole("button", { name: "Candidate selection" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Candidate facility siting" })).toBeInTheDocument();
+    expect(screen.getAllByRole("button").filter((button) => button.closest(".prompt-examples"))).toHaveLength(4);
+    expect(screen.queryByRole("button", { name: "Needs clarification" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Outside scope" })).not.toBeInTheDocument();
     const input = screen.getByLabelText("Describe the cooling-access question");
     fireEvent.change(input, { target: { value: "My unfinished question" } });
 
     fireEvent.click(screen.getByRole("tab", { name: "Find a nearby facility" }));
 
     expect(input).toHaveValue("My unfinished question");
-    expect(screen.queryByRole("button", { name: "Candidate selection" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Candidate facility siting" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Landmark route" })).toBeInTheDocument();
     expect(screen.getByText(/does not confirm real-time opening/i)).toBeInTheDocument();
   });

@@ -571,9 +571,9 @@ class LLMClient:
         """Call the LLM and parse JSON across OpenAI-compatible provider variants."""
         return self._structured_response(system, user, schema=schema)[0]
 
-    def probe(self, system: str, user: str) -> tuple[dict, str]:
+    def probe(self, system: str, user: str, schema: dict | None = None) -> tuple[dict, str]:
         """Return a parsed probe plus the model identifier reported by the provider."""
-        payload, response = self._structured_response(system, user)
+        payload, response = self._structured_response(system, user, schema=schema)
         return payload, str(getattr(response, "model", self.cfg["model"]))
 
     def list_models(self) -> list[str]:
@@ -1318,14 +1318,25 @@ class Orchestrator:
                 ) + query_suffix
             threshold = self.ctx.get("minimum_threshold", {})
             if threshold.get("feasible"):
+                bound = (
+                    "the smallest computed threshold is"
+                    if threshold.get("search_complete", True)
+                    else "the best feasible threshold found before the search time limit is"
+                )
                 return (
                     f"No number of the retained candidate facilities can cover "
                     f"{float(summary.get('coverage_target', 1.0)):.0%} of the "
                     f"{str(summary.get('coverage_group', 'all')).replace('_', ' ')} group within "
                     f"{float(summary['threshold_minutes']):g} minutes. With "
-                    f"{int(threshold['n_facilities'])} facilities, the smallest computed threshold is "
+                    f"{int(threshold['n_facilities'])} facilities, {bound} "
                     f"{float(threshold['minimum_threshold_minutes']):.1f} minutes by "
                     f"{task.mobility_scenario.replace('_', ' ')}."
+                ) + query_suffix
+            if not threshold.get("search_complete", True):
+                return (
+                    "The retained candidate set cannot meet the requested coverage at the confirmed "
+                    "threshold. The bounded minimum-threshold search reached its time limit before "
+                    "it could establish a defensible alternative bound."
                 ) + query_suffix
             return (
                 "The retained candidate set cannot meet the requested coverage at the confirmed "
@@ -1334,11 +1345,21 @@ class Orchestrator:
         if task.analysis_goal == "minimum_threshold" and self.ctx.has("minimum_threshold"):
             summary = self.ctx.get("minimum_threshold")
             if summary.get("feasible"):
+                qualifier = (
+                    "A threshold of at least"
+                    if summary.get("search_complete", True)
+                    else "The best feasible threshold found before the search time limit was"
+                )
                 return (
-                    f"A threshold of at least {float(summary['minimum_threshold_minutes']):.1f} minutes "
-                    f"is required with {int(summary['n_facilities'])} facilities to cover "
+                    f"{qualifier} {float(summary['minimum_threshold_minutes']):.1f} minutes "
+                    f"with {int(summary['n_facilities'])} facilities to cover "
                     f"{float(summary.get('coverage_target', 1.0)):.0%} of the "
                     f"{str(summary.get('coverage_group', 'all')).replace('_', ' ')} group."
+                )
+            if not summary.get("search_complete", True):
+                return (
+                    "The bounded minimum-threshold search reached its time limit before it could "
+                    "establish a defensible bound for the confirmed facility budget."
                 )
             return "No feasible threshold was found in the computed travel matrix for the confirmed facility budget."
         if task.result_queries and self.ctx.has("result_query_answers"):

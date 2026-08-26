@@ -312,6 +312,8 @@ def render_diagnostic_report(recovery: dict | None, diagnostics: dict) -> str:
         value = threshold.get("minimum_threshold_minutes")
         display = f"{value:.1f} minutes" if value is not None else "not achievable with the current travel matrix"
         lines += ["", "## Fixed-budget lower bound", f"- Feasible: {threshold.get('feasible', False)}",
+                  f"- Search status: {threshold.get('search', {}).get('status', 'complete')}",
+                  f"- Search elapsed: {threshold.get('search', {}).get('elapsed_seconds', 'unknown')} seconds",
                   f"- Minimum threshold: {display}", f"- Facilities: {threshold.get('n_facilities', 'unknown')}"]
     approximate_threshold = diagnostics.get("approximate_minimum_threshold", {})
     if approximate_threshold:

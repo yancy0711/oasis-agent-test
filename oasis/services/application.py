@@ -11,6 +11,7 @@ import subprocess
 import requests
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -98,7 +99,7 @@ class OasisService:
         if not worker_mode:
             self.store.interrupt_active()
         self.controls: dict[str, _RunControl] = {}
-        self.progress_clocks: dict[str, tuple[str, float, int]] = {}
+        self.progress_clocks: dict[str, tuple[str, float, int, str]] = {}
 
     def data_source_status(self, force: bool = False) -> dict[str, Any]:
         """Return a cached, read-only check of approved external sources."""
@@ -172,7 +173,10 @@ class OasisService:
         }
         probe_config = {
             **runtime_config,
-            "max_tokens": min(int(runtime_config.get("max_tokens", 4096)), 1024),
+            "max_tokens": min(
+                int(runtime_config.get("max_tokens", 4096)),
+                int(runtime_config.get("connection_test_max_tokens", 2048)),
+            ),
         }
         started = monotonic()
         try:
@@ -186,15 +190,60 @@ class OasisService:
                         f"Local service is reachable, but model '{model.strip()}' is not installed. "
                         f"Run: ollama pull {model.strip()}. Installed models: {available}."
                     )
-            response, resolved_model = client.probe(
-                "Parse a cooling-access request into a structured task draft. Return only JSON.",
-                'Request: Select 2 cooling facilities in Phoenix within 15 minutes. '
-                'Return {"place_name":"Phoenix, Arizona, USA","analysis_goal":"facility_siting",'
-                '"n_facilities":2,"threshold_minutes":15,"mobility_scenario":"walking"}.',
+            system = "Parse a cooling-access request into a structured TaskSpec."
+            user = (
+                "Request: Select 2 cooling facilities in Phoenix within 15 minutes by walking. "
+                "Return a TaskSpec with place_name Phoenix, Arizona, USA; analysis_goal "
+                "facility_siting; n_facilities 2; threshold_minutes 15; and mobility_scenario walking."
             )
-            required = {"place_name", "analysis_goal", "n_facilities", "threshold_minutes"}
-            if not required.issubset(response) or response.get("n_facilities") != 2:
-                raise RuntimeError("The model responded, but it failed the OASIS task-structure check.")
+            probe_schema = TaskSpec.model_json_schema()
+            compatibility_attempts = 0
+            mismatches = []
+            while compatibility_attempts < 2:
+                compatibility_attempts += 1
+                try:
+                    response, resolved_model = client.probe(system, user, schema=probe_schema)
+                except Exception as exc:
+                    detail = str(exc).casefold()
+                    terminal_markers = (
+                        "401", "403", "invalid api key", "authentication", "unauthorized",
+                        "permission denied", "insufficient quota", "user location is not supported",
+                    )
+                    if compatibility_attempts >= 2 or any(marker in detail for marker in terminal_markers):
+                        raise
+                    user += (
+                        " The previous compatibility attempt did not return usable TaskSpec JSON. "
+                        "Return only one TaskSpec JSON object with the exact requested values."
+                    )
+                    continue
+                try:
+                    parsed = TaskSpec.model_validate(response)
+                except Exception as exc:
+                    mismatches = [f"TaskSpec validation: {exc}"]
+                else:
+                    mismatches = []
+                    if "phoenix" not in parsed.place_name.casefold():
+                        mismatches.append(f"place_name={parsed.place_name or 'missing'}")
+                    if parsed.analysis_goal != "facility_siting":
+                        mismatches.append(f"analysis_goal={parsed.analysis_goal}")
+                    if parsed.n_facilities != 2:
+                        mismatches.append(f"n_facilities={parsed.n_facilities}")
+                    if abs(parsed.threshold_minutes - 15.0) > 1e-6:
+                        mismatches.append(f"threshold_minutes={parsed.threshold_minutes:g}")
+                    if parsed.mobility_scenario != "walking":
+                        mismatches.append(f"mobility_scenario={parsed.mobility_scenario}")
+                if not mismatches:
+                    break
+                user += (
+                    " Your previous JSON did not preserve the requested probe values. "
+                    "Return the exact requested values in the TaskSpec."
+                )
+            if mismatches:
+                detail = ", ".join(mismatches)[:240]
+                raise RuntimeError(
+                    "The endpoint accepted the credential and returned structured JSON, but the "
+                    f"model did not follow the OASIS probe after two attempts ({detail})."
+                )
         except Exception as exc:
             message = str(exc)
             if api_key: message = message.replace(api_key, "<redacted>")
@@ -223,6 +272,7 @@ class OasisService:
             "latency_ms": round((monotonic() - started) * 1000),
             "expires_in_seconds": ttl_seconds,
             "structured_output": isinstance(response, dict),
+            "compatibility_attempts": compatibility_attempts,
         }
 
     def list_llm_models(
@@ -728,10 +778,11 @@ class OasisService:
     def _progress(self, run_id: str, label: str, done: int, total: int, **details: Any) -> None:
         """Persist structured progress with a lightweight stage ETA."""
         now, done, total = monotonic(), int(done), int(total)
+        activity_at = datetime.now(timezone.utc).isoformat()
         with self.lock:
             prior = self.progress_clocks.get(run_id)
             if prior is None or prior[0] != label or done < prior[2]:
-                prior = (label, now, done)
+                prior = (label, now, done, activity_at)
             self.progress_clocks[run_id] = prior
         elapsed = max(now - prior[1], 0.0)
         completed = max(done - prior[2], 0)
@@ -746,6 +797,11 @@ class OasisService:
             "remote_pairs": int(details.pop("remote_pairs", details.pop("live_pairs", 0)) or 0),
             "inflight_pairs": int(details.pop("inflight_pairs", 0) or 0),
             "retry_after_seconds": details.pop("retry_after_seconds", None),
+            "stage_started_at": prior[3],
+            "activity_at": activity_at,
+            "heartbeat_at": activity_at,
+            "stage_elapsed_seconds": round(elapsed, 1),
+            "last_activity_seconds": 0.0,
             **details,
         }
         self.store.update(run_id, progress=progress)
@@ -837,6 +893,10 @@ class OasisService:
             # The precise phase retains the configured full sweep limits.
             cfg["optimization"]["solver_time_limit_s"] = min(
                 cfg["optimization"].get("solver_time_limit_s", 120), 30
+            )
+            cfg["optimization"]["minimum_threshold_total_time_limit_s"] = min(
+                cfg["optimization"].get("minimum_threshold_total_time_limit_s", 90),
+                cfg["optimization"].get("minimum_threshold_preview_time_limit_s", 25),
             )
             cfg["optimization"]["pareto_point_time_limit_s"] = min(
                 cfg["optimization"].get("pareto_point_time_limit_s", 30), 10
@@ -1154,10 +1214,17 @@ class OasisService:
         )
         control = self.controls[run_id]
         acquired = False
+        heartbeat_interval = max(
+            1.0, float(self.cfg.get("execution", {}).get("run_heartbeat_interval_s", 5))
+        )
+        next_heartbeat = monotonic() + heartbeat_interval
         try:
             while not acquired:
                 control.token.check()
                 acquired = self.execution_lock.acquire(timeout=0.05)
+                if not acquired and monotonic() >= next_heartbeat:
+                    self.store.heartbeat(run_id)
+                    next_heartbeat = monotonic() + heartbeat_interval
             control.token.check()
             if self.process_isolation:
                 self._run_isolated(run_id, task, spec, control)
@@ -1193,12 +1260,19 @@ class OasisService:
         process.start()
         with self.lock:
             control.process = process
+        heartbeat_interval = max(
+            1.0, float(self.cfg.get("execution", {}).get("run_heartbeat_interval_s", 5))
+        )
+        next_heartbeat = monotonic() + heartbeat_interval
         try:
             while process.is_alive():
                 if control.token.cancelled():
                     with control.termination_lock:
                         self._terminate_process(process)
                     raise RunCancelled()
+                if monotonic() >= next_heartbeat:
+                    self.store.heartbeat(run_id)
+                    next_heartbeat = monotonic() + heartbeat_interval
                 process.join(timeout=0.1)
             if process.exitcode:
                 if control.token.cancelled():

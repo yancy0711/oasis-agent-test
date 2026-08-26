@@ -116,7 +116,8 @@ export function LlmSettings({ defaults }: { defaults?: Record<string, unknown> }
       setLlmSession(result.session_id, `${result.provider} | ${result.model}`); setApiKey("");
       setConnectionState("success");
       const resolved = result.resolved_model === result.model ? result.model : `${result.model} → ${result.resolved_model}`;
-      setMessage(`Success! ${resolved} passed the OASIS task-structure check in ${result.latency_ms} ms. The key is cleared when this browser tab or the backend process closes.`);
+      const retryNote = result.compatibility_attempts > 1 ? ` after ${result.compatibility_attempts} compatibility attempts` : "";
+      setMessage(`Success! ${resolved} passed the OASIS task-structure check${retryNote} in ${result.latency_ms} ms. The key is cleared when this browser tab or the backend process closes.`);
     } catch (error) {
       setLlmSession(null, null); setConnectionState("failure");
       setMessage(error instanceof Error ? `Failure: ${error.message}` : "Failure: connection test failed.");
