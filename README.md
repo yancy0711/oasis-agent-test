@@ -117,28 +117,44 @@ Put the server-default OpenRouter key in `OPENROUTER_API_KEY` inside the project
 conda create -n oasis-agent python=3.11
 conda activate oasis-agent
 pip install -r requirements.txt
-
-cd frontend
-npm install
-cd ..
+npm --prefix frontend install
 ```
 
 ## Run the web application
 
-Terminal 1:
+Run both terminals from the repository root.
+
+Terminal 1 (backend):
 
 ```powershell
+conda activate oasis-agent
 python -m uvicorn api.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-Terminal 2:
+Terminal 2 (frontend):
 
 ```powershell
-cd frontend
-npm run dev
+npm --prefix frontend run dev
 ```
 
 Open http://127.0.0.1:5173.
+
+For access from a phone or another device on the same local network, listen on
+all interfaces in both terminals:
+
+```powershell
+# Terminal 1
+conda activate oasis-agent
+python -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 1
+
+# Terminal 2
+npm --prefix frontend run dev -- --host 0.0.0.0
+```
+
+Open `http://<computer-lan-ip>:5173` on the other device. Both devices must be
+on the same network, and the operating-system firewall must allow the private
+network connection to port 5173. Do not expose this development server directly
+to the public internet.
 
 Basic workflow:
 
@@ -189,13 +205,15 @@ Web runs are stored under `outputs_run/api_runs/<run_id>/`. Outputs include MapL
 docker compose up --build
 ```
 
+Open http://127.0.0.1:5173. The frontend proxies `/api` requests to the backend
+container on port 8000. Runtime cache and output directories are mounted from
+`data/cache/` and `outputs_run/`.
+
 ## Verify
 
 ```powershell
 python -m pytest tests -q
-
-cd frontend
-npm test
-npm run build
-npm run lint
+npm --prefix frontend test
+npm --prefix frontend run build
+npm --prefix frontend run lint
 ```
