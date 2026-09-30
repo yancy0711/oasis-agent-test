@@ -253,13 +253,14 @@ class UiExecutionConfig(BaseModel):
 
 
 class UiConfigResponse(BaseModel):
-    """Return non-secret presentation defaults and registered profiles."""
+    """Return presentation defaults, profiles, and the public basemap credential."""
 
     optimization: dict[str, Any]
     accessibility: dict[str, Any]
     agent: dict[str, Any]
     execution: UiExecutionConfig
     value_profiles: dict[str, Any]
+    carto_basemap_api_key: str = ""
 
 
 class DataSourceStatusResponse(BaseModel):

@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import type { FeatureCollection } from "geojson";
 import maplibregl, { type CircleLayerSpecification, type FillLayerSpecification, type LineLayerSpecification, type Map as MapLibreMap } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import { BASE_MAP_STYLE, HEAT_COLORS } from "../result/mapConfig";
+import { useBasemapStyle } from "../result/useBasemapStyle";
+import { HEAT_COLORS } from "../result/mapConfig";
 import { popupContent } from "../result/mapPopup";
 
 interface ComparisonDataset extends FeatureCollection {
@@ -48,6 +49,7 @@ async function loadDataset(url: string, signal: AbortSignal): Promise<Comparison
 }
 
 export function ComparisonMap({ url, baselineUrl, alternativeUrl, baselineLabel, alternativeLabel }: ComparisonMapProps) {
+  const baseMapStyle = useBasemapStyle();
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const [datasets, setDatasets] = useState<ComparisonDataset[] | null>(null);
@@ -85,7 +87,7 @@ export function ComparisonMap({ url, baselineUrl, alternativeUrl, baselineLabel,
     baselineSites.forEach((feature) => { if (feature.properties) Object.assign(feature.properties, { comparison_label: baselineLabel }); });
     alternativeSites.forEach((feature) => { if (feature.properties) Object.assign(feature.properties, { comparison_label: alternativeLabel }); });
 
-    const map = new maplibregl.Map({ container: containerRef.current, style: BASE_MAP_STYLE, attributionControl: false });
+    const map = new maplibregl.Map({ container: containerRef.current, style: baseMapStyle, attributionControl: false });
     mapRef.current = map;
     const resizeObserver = new ResizeObserver(() => map.resize());
     resizeObserver.observe(containerRef.current);
@@ -133,7 +135,7 @@ export function ComparisonMap({ url, baselineUrl, alternativeUrl, baselineLabel,
       });
     });
     return () => { resizeObserver.disconnect(); popup?.remove(); map.remove(); mapRef.current = null; };
-  }, [datasets, baselineLabel, alternativeLabel]);
+  }, [datasets, baselineLabel, alternativeLabel, baseMapStyle]);
 
   if (error) return <p className="error error--block">{error}</p>;
   if (!datasets) return <p className="muted">No comparison map is available for these results.</p>;

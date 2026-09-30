@@ -90,6 +90,8 @@ If a system Python installation cannot resolve GDAL, use
 | [Mapillary](https://www.mapillary.com/dashboard/developers) | Optional nearby street-level imagery | Register an app and copy its client token |
 | [OpenRouter](https://openrouter.ai/settings/keys), [Google Gemini](https://aistudio.google.com/apikey), or [OpenAI](https://platform.openai.com/api-keys) | Language-model parsing and orchestration | OpenRouter with openai/gpt-4o is the default; create a provider key or configure local Ollama |
 
+For the CARTO basemap, [request a Basemaps API key](https://www.carto.com/basemaps/apikey/).
+
 For a local language model, install [Ollama](https://ollama.com/download); OASIS does not download models automatically.
 
 Copy the environment template:
@@ -107,9 +109,26 @@ OPENROUTER_API_KEY=
 ORS_API_KEY=
 CENSUS_API_KEY=
 MAPILLARY_ACCESS_TOKEN=
+CARTO_BASEMAP_API_KEY=
 ```
 
 Put the server-default OpenRouter key in `OPENROUTER_API_KEY` inside the project-root `.env`. A visitor may instead enter a provider key in **Preliminary setup**; that key stays only in the browser-scoped backend session. Direct Gemini remains available through `GEMINI_API_KEY`, but access is evaluated from the backend network location and is limited to Google's [supported regions](https://ai.google.dev/gemini-api/docs/available-regions). If unavailable, select OpenRouter, OpenAI, or a local model instead; OASIS never switches providers silently. Gemini free-tier availability and quotas also depend on the selected model, account, and region. Only configure the services you use, and never commit the populated `.env`.
+
+Keep all server-default keys in the project-root `.env`; `.env.example` is the
+empty template, not a second configuration file. Do not put service keys in
+frontend files. The backend loads `.env` locally, and Docker Compose passes the
+same file to the backend container.
+
+`CARTO_BASEMAP_API_KEY` is the one browser-visible key: `/api/v1/config` supplies
+it to both the result and comparison maps, which append it to CARTO tile URLs.
+LLM, Census, ORS, and Mapillary credentials stay on the backend. Without a CARTO
+key, maps retain the study-area layers on a neutral background.
+
+After changing `.env`, restart the local backend and reload the browser. With
+Docker Compose, run `docker compose up -d --force-recreate backend` and reload;
+a container restart alone does not reload `env_file`. Changing keys does not
+require rebuilding the frontend. Visitor-provided LLM keys remain temporary
+session overrides rather than being written to `.env`.
 
 ## Install
 
@@ -216,4 +235,10 @@ python -m pytest tests -q
 npm --prefix frontend test
 npm --prefix frontend run build
 npm --prefix frontend run lint
+npm --prefix frontend run test:e2e
 ```
+
+The Playwright smoke test uses Microsoft Edge and mocks the API. It verifies
+task confirmation, submitted parameters, polling, cancellation, and persistence
+after reload without calling LLM or geographic services. It does not validate
+live data or solver results. The frontend build also type-checks its fixtures.

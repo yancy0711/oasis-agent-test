@@ -13,18 +13,24 @@ export const MAP_LAYER_IDS = {
   paretoSites: "oasis-pareto-sites",
 } as const;
 
-export const BASE_MAP_STYLE: MapOptions["style"] = {
-  version: 8,
-  sources: {
-    carto: {
-      type: "raster",
-      tiles: ["https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"],
-      tileSize: 256,
-      attribution: "© OpenStreetMap contributors · © CARTO",
-    },
-  },
-  layers: [{ id: "carto", type: "raster", source: "carto" }],
-};
+export function createBaseMapStyle(apiKey: string): MapOptions["style"] {
+  const key = apiKey.trim();
+  return {
+    version: 8,
+    sources: key ? {
+      carto: {
+        type: "raster",
+        tiles: [`https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png?key=${encodeURIComponent(key)}`],
+        tileSize: 256,
+        attribution: "© OpenStreetMap contributors · © CARTO",
+      },
+    } : {},
+    layers: [
+      { id: "background", type: "background", paint: { "background-color": "#f3f2ef" } },
+      ...(key ? [{ id: "carto", type: "raster" as const, source: "carto" }] : []),
+    ],
+  };
+}
 
 export const HEAT_COLORS = ["#fff7bc", "#fec44f", "#f03b20", "#8c2d04"] as const;
 

@@ -53,7 +53,7 @@ export interface paths {
         };
         /**
          * Ui Config
-         * @description Return non-secret defaults and registered value profiles.
+         * @description Return presentation defaults and the browser-visible basemap key.
          */
         get: operations["ui_config_v1_config_get"];
         put?: never;
@@ -1368,7 +1368,7 @@ export interface components {
         };
         /**
          * UiConfigResponse
-         * @description Return non-secret presentation defaults and registered profiles.
+         * @description Return presentation defaults, profiles, and the public basemap credential.
          */
         UiConfigResponse: {
             /** Optimization */
@@ -1388,6 +1388,11 @@ export interface components {
             value_profiles: {
                 [key: string]: unknown;
             };
+            /**
+             * Carto Basemap Api Key
+             * @default
+             */
+            carto_basemap_api_key: string;
         };
         /**
          * UiExecutionConfig

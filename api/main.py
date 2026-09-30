@@ -1,5 +1,6 @@
 """FastAPI routes for the OASIS parsing, HITL, run, and artifact services."""
 from __future__ import annotations
+import os
 from fastapi import APIRouter, FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse
 
@@ -31,7 +32,7 @@ def create_app(service: OasisService | None = None) -> FastAPI:
 
     @router.get("/config", response_model=UiConfigResponse)
     def ui_config() -> dict:
-        """Return non-secret defaults and registered value profiles."""
+        """Return presentation defaults and the browser-visible basemap key."""
         cfg = app.state.service.cfg
         return {"optimization": cfg.get("optimization", {}),
                 "accessibility": {key: value for key, value in cfg.get("accessibility", {}).items()
@@ -44,7 +45,8 @@ def create_app(service: OasisService | None = None) -> FastAPI:
                     "modes": ["auto", "quick", "precise"],
                     "default_mode": cfg.get("execution", {}).get("default_mode", "auto"),
                 },
-                "value_profiles": app.state.service.profiles}
+                "value_profiles": app.state.service.profiles,
+                "carto_basemap_api_key": os.getenv("CARTO_BASEMAP_API_KEY", "").strip()}
 
     @router.get("/data-sources/status", response_model=DataSourceStatusResponse)
     def data_source_status(refresh: bool = False) -> dict:

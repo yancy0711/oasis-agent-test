@@ -2,8 +2,9 @@ import { useCallback, useEffect, useRef, useState, type FormEvent, type PointerE
 import type { Feature, FeatureCollection, Point } from "geojson";
 import maplibregl, { type GeoJSONSource, type Map as MapLibreMap } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
+import { useBasemapStyle } from "./useBasemapStyle";
 import { planPlaceRoute, planPointRoute, type PlannedRoute } from "../../api/client";
-import { BASE_MAP_STYLE, HEAT_COLORS, MAP_LAYER_IDS, MAP_SOURCE_ID, PARETO_SOURCE_ID, ROUTE_SOURCE_ID, paretoPreviewLayer, plannedRouteLayers, resultLayers } from "./mapConfig";
+import { HEAT_COLORS, MAP_LAYER_IDS, MAP_SOURCE_ID, PARETO_SOURCE_ID, ROUTE_SOURCE_ID, paretoPreviewLayer, plannedRouteLayers, resultLayers } from "./mapConfig";
 import { popupContent } from "./mapPopup";
 import type { ParetoPoint } from "./ParetoView";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
@@ -39,6 +40,7 @@ function RouteAudit({ summary }: { summary: Record<string, unknown> }) {
 }
 
 export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showRoutePlanner = true, focusTractId = null, routeOriginQuery = null, routeOriginCoordinate = null }: MapViewProps) {
+  const baseMapStyle = useBasemapStyle();
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const routeControlRef = useRef<HTMLDivElement>(null);
@@ -191,7 +193,7 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
   useEffect(() => {
     if (!data || !containerRef.current) return;
     setMapReady(false);
-    const map = new maplibregl.Map({ container: containerRef.current, style: BASE_MAP_STYLE, attributionControl: false });
+    const map = new maplibregl.Map({ container: containerRef.current, style: baseMapStyle, attributionControl: false });
     mapRef.current = map;
     const mapSizeObserver = new ResizeObserver(() => map.resize());
     mapSizeObserver.observe(containerRef.current);
@@ -300,7 +302,7 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
       map.off("rotate", updateBearing); map.remove(); mapRef.current = null;
       setMapReady(false); setBearing(0);
     };
-  }, [data, focusTractId, runId, showRouteResult]);
+  }, [data, focusTractId, runId, showRouteResult, baseMapStyle]);
 
   useEffect(() => {
     const source = mapRef.current?.getSource(PARETO_SOURCE_ID) as GeoJSONSource | undefined;

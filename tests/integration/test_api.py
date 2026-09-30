@@ -166,6 +166,25 @@ def test_health_config_and_parse_contract(tmp_path):
     assert service.calls[-1] == ("parse", "Site centers in Phoenix")
 
 
+def test_config_exposes_only_the_browser_basemap_credential(tmp_path, monkeypatch):
+    private_keys = (
+        "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY",
+        "CENSUS_API_KEY", "ORS_API_KEY", "MAPILLARY_ACCESS_TOKEN",
+    )
+    for name in private_keys:
+        monkeypatch.setenv(name, f"private-{name}")
+    monkeypatch.setenv("CARTO_BASEMAP_API_KEY", "  public-basemap-test  ")
+    client, service = _client(tmp_path)
+    service.cfg["llm"] = {"_session_api_key": "private-session-key"}
+    response = client.get("/v1/config")
+    assert response.status_code == 200
+    assert response.json()["carto_basemap_api_key"] == "public-basemap-test"
+    assert "private-" not in response.text
+
+    monkeypatch.delenv("CARTO_BASEMAP_API_KEY")
+    assert client.get("/v1/config").json()["carto_basemap_api_key"] == ""
+
+
 def test_data_source_status_is_notify_only(tmp_path):
     client, service = _client(tmp_path)
     response = client.get("/v1/data-sources/status")
