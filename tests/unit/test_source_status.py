@@ -19,6 +19,9 @@ def test_source_monitor_reports_updates_without_mutating_configuration():
     assert result["updates_available"] is True
     assert {item["status"] for item in result["sources"][:2]} == {"update_available"}
     assert result["compatibility_warnings"]
+    routing = next(item for item in result["sources"] if item["source"] == "openrouteservice")
+    assert routing["status"] == "unverified"
+    assert routing["official_url"] == "https://status.heigit.org/"
 
 
 def test_source_monitor_distinguishes_unverified_from_current():

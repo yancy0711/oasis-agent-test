@@ -38,6 +38,16 @@ def _parse_service(payload) -> OasisService:
     return service
 
 
+def test_solver_phase_budgets_use_configured_preview_limit():
+    service = _parse_service({})
+    service.cfg["optimization"].update(solver_time_limit_s=180, solver_preview_time_limit_s=60)
+    assert service._phase_config("quick", Path("outputs_run"))["optimization"]["solver_time_limit_s"] == 60
+    assert service._phase_config("precise", Path("outputs_run"))["optimization"]["solver_time_limit_s"] == 180
+    service.cfg["optimization"]["solver_time_limit_s"] = 20
+    assert service._phase_config("quick", Path("outputs_run"))["optimization"]["solver_time_limit_s"] == 20
+    assert service.cfg["optimization"]["solver_preview_time_limit_s"] == 60
+
+
 def test_parse_requires_one_choice_when_the_model_extracts_multiple_places():
     service = _parse_service({
         "place_name": "Phoenix, Arizona, USA",
@@ -630,12 +640,12 @@ def test_place_route_returns_preview_for_geocoded_origin_outside_study_area(tmp_
     service.store.put_artifacts(run_id, "quick", {"map": map_path})
     monkeypatch.setattr(
         "oasis.services.application.search_origin_candidates",
-        lambda query: [{"display_name": "Hong Kong", "lon": "114.17", "lat": "22.32"}],
+        lambda query, **kwargs: [{"display_name": "Los Angeles, USA", "lon": "-118.24", "lat": "34.05"}],
     )
     try:
-        result = service.plan_place_route(run_id, "Hong Kong", "walking")
+        result = service.plan_place_route(run_id, "Los Angeles", "walking")
         assert result["summary"]["status"] == "outside_study_area"
-        assert result["features"][0]["geometry"]["coordinates"] == [114.17, 22.32]
+        assert result["features"][0]["geometry"]["coordinates"] == [-118.24, 34.05]
     finally:
         service.executor.shutdown(wait=True)
 
@@ -681,6 +691,27 @@ def test_queued_cancel_is_idempotent_and_revision_is_immutable(tmp_path, monkeyp
     finally:
         release.set()
         blocker.result(timeout=2)
+        service.executor.shutdown(wait=True)
+
+
+def test_provider_retry_inherits_confirmed_task_and_mode(tmp_path, monkeypatch):
+    service = _service(tmp_path, monkeypatch)
+    task = TaskSpec(place_name="Los Angeles, California, USA", n_facilities=7, threshold_minutes=12)
+    parent = "osm-timeout-parent"
+    service.store.create(parent, {"task": task.model_dump(mode="json"), "mode": "precise"})
+    service.store.update(parent, status="awaiting_hitl")
+    captured = {}
+    def queue(spec, upload_id, **kwargs):
+        captured.update(spec=spec, upload_id=upload_id, **kwargs)
+        return {"run_id": "retry-child", "status": "queued", "mode": spec.mode}
+    monkeypatch.setattr(service, "_queue_run", queue)
+    try:
+        accepted = service.revise_run(parent)
+        assert accepted["run_id"] == "retry-child"
+        assert captured["spec"].task == task and captured["spec"].mode == "precise"
+        assert captured["parent_run_id"] == parent and captured["revision"] == 1
+        assert service.store.get(parent)["status"] == "awaiting_hitl"
+    finally:
         service.executor.shutdown(wait=True)
 
 
@@ -782,3 +813,33 @@ def test_hard_cancel_terminates_an_isolated_run_process():
 
     assert not process.is_alive()
     assert time.monotonic() - started < 6
+
+
+def test_place_route_preserves_scope_and_original_query(tmp_path, monkeypatch):
+    service = _service(tmp_path, monkeypatch)
+    task = TaskSpec(place_name="Riverside, California, USA")
+    run_id = "centre-spelling"
+    service.store.create(run_id, {"task": task.model_dump(mode="json"), "mode": "quick"})
+    service.store.update(run_id, status="succeeded", result={"artifacts": {}})
+    map_path = tmp_path / "map.geojson"
+    map_path.write_text(json.dumps({"type": "FeatureCollection", "features": [{"type": "Feature", "geometry": {"type": "Polygon", "coordinates": [[[-117.4,33.9],[-117.3,33.9],[-117.3,34],[-117.4,34],[-117.4,33.9]]]}, "properties": {"layer_kind": "tract", "GEOID": "1"}}]}), encoding="utf-8")
+    service.store.put_artifacts(run_id, "quick", {"map": map_path})
+    calls = []
+    def geocode(query, **kwargs):
+        calls.append((query, kwargs))
+        return [{"display_name": "Riverside Convention Center", "lon": "-117.3714766", "lat": "33.9852422"}]
+    monkeypatch.setattr("oasis.services.application.search_origin_candidates", geocode)
+    monkeypatch.setattr(service, "plan_point_route", lambda *args, **kwargs: {"type": "FeatureCollection", "features": [], "summary": {}})
+    try:
+        result = service.plan_place_route(run_id, "riverside Convention Centre", "cycling")
+        assert len(calls) == 1
+        assert all(call[1]["countrycodes"] == "us" and call[1]["viewbox"] == (-117.4,33.9,-117.3,34.0) for call in calls)
+        assert result["summary"]["origin_label"] == "Riverside Convention Center"
+        assert result["summary"]["origin_query"] == "riverside Convention Centre"
+        def unavailable(*args, **kwargs):
+            raise RuntimeError("ORS cycling-regular timed out")
+        monkeypatch.setattr(service, "plan_point_route", unavailable)
+        with pytest.raises(RuntimeError, match="Starting point found: Riverside Convention Center.*Route planning failed: ORS"):
+            service.plan_place_route(run_id, "riverside Convention Centre", "cycling")
+    finally:
+        service.executor.shutdown(wait=True)

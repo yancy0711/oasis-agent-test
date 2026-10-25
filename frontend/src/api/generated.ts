@@ -424,6 +424,125 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/requests/interpret": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Interpret Request */
+        post: operations["interpret_request_v1_requests_interpret_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/resident/parse": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Parse */
+        post: operations["parse_v1_resident_parse_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/resident/origin": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Locate */
+        post: operations["locate_v1_resident_origin_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/resident/origins": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Origins */
+        post: operations["origins_v1_resident_origins_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/resident/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Search */
+        post: operations["search_v1_resident_search_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/resident/cancel/{request_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel */
+        post: operations["cancel_v1_resident_cancel__request_id__post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/resident/routes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Route */
+        post: operations["route_v1_resident_routes_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -534,6 +653,20 @@ export interface components {
         HTTPValidationError: {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
+        };
+        /** InterpretRequest */
+        InterpretRequest: {
+            /** Prompt */
+            prompt: string;
+            previous?: components["schemas"]["ResidentPreferences"] | null;
+            /** Llm Session Id */
+            llm_session_id?: string | null;
+            /**
+             * Audience
+             * @default research
+             * @enum {string}
+             */
+            audience: "research" | "personal";
         };
         /**
          * LlmConnectionRequest
@@ -888,6 +1021,215 @@ export interface components {
             /** Minimum Facilities */
             minimum_facilities: number;
         };
+        /** RequestInterpretation */
+        RequestInterpretation: {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "select_facilities" | "find_destination" | "assess_area" | "compare_scenarios" | "clarify";
+            /**
+             * Workflow
+             * @enum {string}
+             */
+            workflow: "research" | "personal" | "clarify";
+            /** Reason */
+            reason: string;
+            preferences?: components["schemas"]["ResidentPreferences"] | null;
+        };
+        /** ResidentCoordinateRequest */
+        ResidentCoordinateRequest: {
+            /** Longitude */
+            longitude: number;
+            /** Latitude */
+            latitude: number;
+            /** Request Id */
+            request_id?: string | null;
+        };
+        /** ResidentOrigin */
+        ResidentOrigin: {
+            /** Longitude */
+            longitude: number;
+            /** Latitude */
+            latitude: number;
+            /** Label */
+            label: string;
+            /**
+             * Country Code
+             * @default
+             */
+            country_code: string;
+        };
+        /** ResidentOriginQuery */
+        ResidentOriginQuery: {
+            /** Request Id */
+            request_id?: string | null;
+            /** Query */
+            query: string;
+        };
+        /** ResidentOriginResponse */
+        ResidentOriginResponse: {
+            /** Candidates */
+            candidates: components["schemas"]["ResidentOrigin"][];
+            /** Message */
+            message: string;
+        };
+        /** ResidentParseRequest */
+        ResidentParseRequest: {
+            /** Prompt */
+            prompt: string;
+            previous?: components["schemas"]["ResidentPreferences"] | null;
+            /** Llm Session Id */
+            llm_session_id?: string | null;
+        };
+        /** ResidentPlace */
+        ResidentPlace: {
+            /** Longitude */
+            longitude: number;
+            /** Latitude */
+            latitude: number;
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+            /**
+             * Category
+             * @enum {string}
+             */
+            category: "library" | "community_centre" | "swimming_pool" | "mall" | "sports_centre" | "arts_centre" | "place_of_worship" | "park";
+            /** Duration Minutes */
+            duration_minutes: number;
+            /**
+             * Opening Hours
+             * @default Unknown
+             */
+            opening_hours: string;
+            /**
+             * Access
+             * @default Unknown
+             */
+            access: string;
+            /**
+             * Fee
+             * @default Unknown
+             */
+            fee: string;
+            /**
+             * Indoor
+             * @default Unknown
+             */
+            indoor: string;
+            /** Coordinate Source */
+            coordinate_source: string;
+            /** Osm Url */
+            osm_url: string;
+        };
+        /** ResidentPreferences */
+        ResidentPreferences: {
+            /** Origin Query */
+            origin_query?: string | null;
+            /**
+             * Use Current Location
+             * @default false
+             */
+            use_current_location: boolean;
+            /**
+             * Mode
+             * @default walking
+             * @enum {string}
+             */
+            mode: "walking" | "cycling" | "driving";
+            /**
+             * Threshold Minutes
+             * @default 15
+             */
+            threshold_minutes: number;
+            /** Categories */
+            categories?: ("library" | "community_centre" | "swimming_pool" | "mall" | "sports_centre" | "arts_centre" | "place_of_worship" | "park")[];
+            /** Excluded Categories */
+            excluded_categories?: ("library" | "community_centre" | "swimming_pool" | "mall" | "sports_centre" | "arts_centre" | "place_of_worship" | "park")[];
+            /** Preferred Categories */
+            preferred_categories?: ("library" | "community_centre" | "swimming_pool" | "mall" | "sports_centre" | "arts_centre" | "place_of_worship" | "park")[];
+            /**
+             * Indoor Only
+             * @default false
+             */
+            indoor_only: boolean;
+            /**
+             * Clarification
+             * @default
+             */
+            clarification: string;
+            /**
+             * Needs Clarification
+             * @default false
+             */
+            needs_clarification: boolean;
+            /**
+             * Notice
+             * @default
+             */
+            notice: string;
+        };
+        /** ResidentRouteRequest */
+        ResidentRouteRequest: {
+            /** Request Id */
+            request_id?: string | null;
+            /** Search Id */
+            search_id: string;
+            /** Candidate Id */
+            candidate_id: string;
+        };
+        /** ResidentSearchRequest */
+        ResidentSearchRequest: {
+            /** Longitude */
+            longitude: number;
+            /** Latitude */
+            latitude: number;
+            /** Request Id */
+            request_id: string;
+            preferences: components["schemas"]["ResidentPreferences"];
+            /**
+             * Radius Km
+             * @default 5
+             */
+            radius_km: number;
+        };
+        /** ResidentSearchResponse */
+        ResidentSearchResponse: {
+            /** Search Id */
+            search_id: string;
+            origin: components["schemas"]["ResidentOrigin"];
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "walking" | "cycling" | "driving";
+            /** Threshold Minutes */
+            threshold_minutes: number;
+            /** Radius Km */
+            radius_km: number;
+            /** Candidates */
+            candidates: components["schemas"]["ResidentPlace"][];
+            /** Complete */
+            complete: boolean;
+            /**
+             * Candidate Limit
+             * @default 50
+             */
+            candidate_limit: number;
+            /** Discovered Count */
+            discovered_count: number;
+            /** Checked Count */
+            checked_count: number;
+            /** Message */
+            message: string;
+            /**
+             * Source
+             * @default OpenStreetMap candidates; ORS network travel times
+             */
+            source: string;
+        };
         /**
          * ResultNarrative
          * @description Store evidence-grounded decision interpretation and self-reflection.
@@ -1068,10 +1410,16 @@ export interface components {
             activity_at?: string | null;
             /** Heartbeat At */
             heartbeat_at?: string | null;
-            /** Stage Elapsed Seconds */
-            stage_elapsed_seconds?: number;
-            /** Last Activity Seconds */
-            last_activity_seconds?: number;
+            /**
+             * Stage Elapsed Seconds
+             * @default 0
+             */
+            stage_elapsed_seconds: number;
+            /**
+             * Last Activity Seconds
+             * @default 0
+             */
+            last_activity_seconds: number;
         } & {
             [key: string]: unknown;
         };
@@ -2123,6 +2471,235 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    interpret_request_v1_requests_interpret_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InterpretRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RequestInterpretation"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    parse_v1_resident_parse_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResidentParseRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResidentPreferences"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    locate_v1_resident_origin_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResidentCoordinateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResidentOrigin"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    origins_v1_resident_origins_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResidentOriginQuery"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResidentOriginResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    search_v1_resident_search_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResidentSearchRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResidentSearchResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cancel_v1_resident_cancel__request_id__post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    route_v1_resident_routes_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResidentRouteRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PointRouteResponse"];
                 };
             };
             /** @description Validation Error */

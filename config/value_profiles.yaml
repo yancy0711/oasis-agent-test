@@ -20,6 +20,16 @@ profiles:
     description: "Emphasizes heat exposure; may reduce total coverage."
     weights: {population_density: 0.1, elderly_ratio: 0.15, poverty_rate: 0.15, heat_exposure: 0.4, environment_burden: 0.2}
 
+  older_adults:
+    label: "Older adults"
+    description: "Prioritize older residents and age-related vulnerability, including seniors and elderly people. A value emphasis, not a guarantee of complete elderly coverage."
+    weights: {population_density: 0.1, elderly_ratio: 0.6, poverty_rate: 0.1, heat_exposure: 0.1, environment_burden: 0.1}
+
+  heat_poverty:
+    label: "Heat + poverty"
+    description: "Jointly prioritize low-income residents and high heat exposure. Both matter; this is not an age-first preference."
+    weights: {population_density: 0.1, elderly_ratio: 0.1, poverty_rate: 0.35, heat_exposure: 0.35, environment_burden: 0.1}
+
   balanced:
     label: "Balanced"
     description: "Default starting point for decision-makers to adjust from."

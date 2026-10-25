@@ -3,10 +3,12 @@ import type { Feature, FeatureCollection, Point } from "geojson";
 import maplibregl, { type GeoJSONSource, type Map as MapLibreMap } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { useBasemapStyle } from "./useBasemapStyle";
+import { LoadingText } from "../../components/LoadingText";
 import { planPlaceRoute, planPointRoute, type PlannedRoute } from "../../api/client";
 import { HEAT_COLORS, MAP_LAYER_IDS, MAP_SOURCE_ID, PARETO_SOURCE_ID, ROUTE_SOURCE_ID, paretoPreviewLayer, plannedRouteLayers, resultLayers } from "./mapConfig";
 import { popupContent } from "./mapPopup";
 import type { ParetoPoint } from "./ParetoView";
+import { useAppStore } from "../../store/appStore";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 
 interface MapMetadata {
@@ -17,7 +19,7 @@ interface MapMetadata {
   bounds: [[number, number], [number, number]];
 }
 interface MapDataset extends FeatureCollection { metadata: MapMetadata; }
-interface MapViewProps { url?: string; runId: string; paretoPreview?: ParetoPoint | null; onClearParetoPreview?: () => void; showRoutePlanner?: boolean; focusTractId?: string | null; routeOriginQuery?: string | null; routeOriginCoordinate?: { longitude: number; latitude: number } | null; }
+interface MapViewProps { initialRouteMode?: RouteMode; url?: string; runId: string; paretoPreview?: ParetoPoint | null; onClearParetoPreview?: () => void; showRoutePlanner?: boolean; focusTractId?: string | null; routeOriginQuery?: string | null; routeOriginCoordinate?: { longitude: number; latitude: number } | null; }
 type LayerState = { tracts: boolean; boundary: boolean; route: boolean; sites: boolean };
 type RouteMode = "walking" | "cycling" | "driving";
 type PanelPosition = { x: number; y: number };
@@ -39,7 +41,7 @@ function RouteAudit({ summary }: { summary: Record<string, unknown> }) {
   return <section className="route-audit"><h4>Active route heat audit</h4><div><span>Network travel</span><strong>{duration.toFixed(1)} min</strong></div><div><span>Route mean LST</span><strong>{heat == null ? "Unavailable" : `${heat.toFixed(1)} °C`}</strong></div><div><span>LST × travel-time index</span><strong>{dose == null ? "Unavailable" : `${dose.toFixed(0)} °C·min`}</strong></div><p>{calculation ? `${calculation}. ` : ""}This is a comparative route index, not a temperature reading or physiological heat dose. It does not alter ORS routing or facility optimization.</p></section>;
 }
 
-export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showRoutePlanner = true, focusTractId = null, routeOriginQuery = null, routeOriginCoordinate = null }: MapViewProps) {
+export function MapView({ initialRouteMode = "walking", url, runId, paretoPreview, onClearParetoPreview, showRoutePlanner = true, focusTractId = null, routeOriginQuery = null, routeOriginCoordinate = null }: MapViewProps) {
   const baseMapStyle = useBasemapStyle();
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
@@ -48,17 +50,18 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
   const dragRef = useRef<{ pointerId: number; offsetX: number; offsetY: number } | null>(null);
   const routeManuallyMovedRef = useRef(false);
   const planAtRef = useRef<((longitude: number, latitude: number) => void) | null>(null);
+  const routeRequestRef = useRef<AbortController | null>(null);
   const autoRouteRef = useRef<string | null>(null);
   const outsideReturnTimerRef = useRef<number | null>(null);
   const planningEnabledRef = useRef(false);
-  const routeModeRef = useRef<RouteMode>("walking");
+  const routeModeRef = useRef<RouteMode>(initialRouteMode);
   const mobile = useMediaQuery("(max-width: 620px)");
   const [data, setData] = useState<MapDataset | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [mapReady, setMapReady] = useState(false);
   const [bearing, setBearing] = useState(0);
   const [planningEnabled, setPlanningEnabled] = useState(false);
-  const [routeMode, setRouteMode] = useState<RouteMode>("walking");
+  const [routeMode, setRouteMode] = useState<RouteMode>(initialRouteMode);
   const [routeStatus, setRouteStatus] = useState('Select “Plan from map point”, then click an exact origin.');
   const [routeBusy, setRouteBusy] = useState(false);
   const [routeAudit, setRouteAudit] = useState<Record<string, unknown> | null>(null);
@@ -139,6 +142,46 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
     }, 3000);
   }, [data, showRoute]);
 
+  const cancelRoute = useCallback(() => {
+    routeRequestRef.current?.abort();
+    routeRequestRef.current = null;
+    setRouteBusy(false);
+    setPlanningEnabled(false);
+    planningEnabledRef.current = false;
+    setRouteStatus("Route request cancelled. Choose another point or retry.");
+  }, []);
+
+  useEffect(() => useAppStore.subscribe((state, previous) => {
+    if (state.taskVersion !== previous.taskVersion && (routeRequestRef.current || planningEnabledRef.current)) cancelRoute();
+  }), [cancelRoute]);
+
+  const requestRoute = useCallback((request: (signal: AbortSignal) => Promise<PlannedRoute>, coordinate?: { longitude: number; latitude: number }) => {
+    routeRequestRef.current?.abort();
+    const controller = new AbortController();
+    routeRequestRef.current = controller;
+    setRouteBusy(true);
+    setPlanningEnabled(false);
+    planningEnabledRef.current = false;
+    void request(controller.signal).then((result) => {
+      if (routeRequestRef.current !== controller) return;
+      const longitude = coordinate?.longitude ?? Number(result.summary.origin_longitude);
+      const latitude = coordinate?.latitude ?? Number(result.summary.origin_latitude);
+      if (!Number.isFinite(longitude) || !Number.isFinite(latitude)) throw new Error("The geocoder returned an invalid origin coordinate.");
+      showRouteResult(result, longitude, latitude);
+    }).catch((reason: unknown) => {
+      if (routeRequestRef.current !== controller) return;
+      setRouteStatus(reason instanceof Error && reason.name === "TimeoutError"
+        ? "Route request timed out. Your inputs are kept; retry or choose another point."
+        : reason instanceof Error ? reason.message : "Could not plan this route.");
+    }).finally(() => {
+      if (routeRequestRef.current === controller) { routeRequestRef.current = null; setRouteBusy(false); }
+    });
+  }, [showRouteResult]);
+
+  useEffect(() => {
+    return () => { routeRequestRef.current?.abort(); routeRequestRef.current = null; };
+  }, [runId, url]);
+
   useEffect(() => () => {
     if (outsideReturnTimerRef.current !== null) window.clearTimeout(outsideReturnTimerRef.current);
   }, []);
@@ -158,23 +201,10 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
     setRouteStatus(coordinate
       ? "Planning from the confirmed browser location..."
       : `Finding "${query}" and planning its nearest selected facility...`);
-    const request = coordinate
-      ? planPointRoute(runId, coordinate.longitude, coordinate.latitude, routeModeRef.current)
-      : planPlaceRoute(runId, query as string, routeModeRef.current);
-    request.then((result) => {
-      if (autoRouteRef.current !== autoRouteKey) return;
-      const longitude = coordinate?.longitude ?? Number(result.summary.origin_longitude);
-      const latitude = coordinate?.latitude ?? Number(result.summary.origin_latitude);
-      if (!Number.isFinite(longitude) || !Number.isFinite(latitude)) throw new Error("The geocoder returned an invalid origin coordinate.");
-      showRouteResult(result, longitude, latitude);
-    }).catch((reason: unknown) => {
-      if (autoRouteRef.current === autoRouteKey) {
-        setRouteStatus(reason instanceof Error ? reason.message : "Could not plan from this location.");
-      }
-    }).finally(() => {
-      if (autoRouteRef.current === autoRouteKey) setRouteBusy(false);
-    });
-  }, [mapReady, routeOriginCoordinate, routeOriginQuery, runId, showRoutePlanner, showRouteResult, url]);
+    requestRoute((signal) => coordinate
+      ? planPointRoute(runId, coordinate.longitude, coordinate.latitude, routeModeRef.current, signal)
+      : planPlaceRoute(runId, query as string, routeModeRef.current, signal), coordinate ?? undefined);
+  }, [mapReady, routeOriginCoordinate, routeOriginQuery, runId, showRoutePlanner, requestRoute, url]);
 
   useEffect(() => {
     if (!url) { setData(null); return; }
@@ -219,11 +249,7 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
         (map.getSource(ROUTE_SOURCE_ID) as GeoJSONSource).setData({ type: "FeatureCollection", features: [origin] });
         setRouteBusy(true);
         setRouteStatus("Origin selected. Comparing network travel times to selected candidate facilities…");
-        planPointRoute(runId, longitude, latitude, routeModeRef.current).then((result) => {
-          showRouteResult(result, longitude, latitude);
-        }).catch((reason: unknown) => {
-          setRouteStatus(reason instanceof Error ? reason.message : "Could not plan this route.");
-        }).finally(() => setRouteBusy(false));
+        requestRoute((signal) => planPointRoute(runId, longitude, latitude, routeModeRef.current, signal), { longitude, latitude });
       };
 
       let pinnedFeature: string | null = null;
@@ -302,7 +328,7 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
       map.off("rotate", updateBearing); map.remove(); mapRef.current = null;
       setMapReady(false); setBearing(0);
     };
-  }, [data, focusTractId, runId, showRouteResult, baseMapStyle]);
+  }, [data, focusTractId, runId, requestRoute, baseMapStyle]);
 
   useEffect(() => {
     const source = mapRef.current?.getSource(PARETO_SOURCE_ID) as GeoJSONSource | undefined;
@@ -337,14 +363,20 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
       setRouteStatus("This browser does not provide geolocation. Enter an address instead.");
       return;
     }
+    routeRequestRef.current?.abort();
+    const locationRequest = new AbortController();
+    routeRequestRef.current = locationRequest;
     setRouteStatus("Waiting for browser location permission…"); setRouteBusy(true);
     navigator.geolocation.getCurrentPosition(
       ({ coords }) => {
+        if (routeRequestRef.current !== locationRequest) return;
         setRouteBusy(false);
         setRouteStatus(`Location received (${coords.latitude.toFixed(5)}, ${coords.longitude.toFixed(5)}). Checking whether it is inside the study area…`);
         planAtRef.current?.(coords.longitude, coords.latitude);
       },
       (reason) => {
+        if (routeRequestRef.current !== locationRequest) return;
+        routeRequestRef.current = null;
         const message = reason.code === 1
           ? "Location permission was denied. Allow location access or enter an address."
           : reason.code === 2
@@ -364,16 +396,7 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
     if (!query) { setRouteStatus("Enter an address or named place inside the study area."); return; }
     setRouteBusy(true);
     setRouteStatus(`Finding “${query}” with OpenStreetMap Nominatim…`);
-    planPlaceRoute(runId, query, routeModeRef.current).then((result) => {
-      const longitude = Number(result.summary.origin_longitude);
-      const latitude = Number(result.summary.origin_latitude);
-      if (!Number.isFinite(longitude) || !Number.isFinite(latitude)) {
-        throw new Error("The geocoder returned an invalid origin coordinate.");
-      }
-      showRouteResult(result, longitude, latitude);
-    }).catch((reason: unknown) => {
-      setRouteStatus(reason instanceof Error ? reason.message : "Could not plan from this location.");
-    }).finally(() => setRouteBusy(false));
+    requestRoute((signal) => planPlaceRoute(runId, query, routeModeRef.current, signal));
   };
 
   const startPanelDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -448,7 +471,7 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
   const routeWarning = !routeBusy && /outside the (?:current study area|analyzed boundary)|not found|denied|could not|failed|timed out|not available|invalid/i.test(routeStatus);
   return <div className="map-view">
     <div ref={containerRef} className="map-canvas" aria-label="Interactive analysis map" />
-    {!data && <p className="map-loading">Loading interactive map…</p>}
+    {!data && <p className="map-loading"><LoadingText>Loading interactive map</LoadingText></p>}
     {data && <>
       {showRoutePlanner && <div ref={routeControlRef} className={`map-route-control${routeCollapsed ? " is-collapsed" : ""}`} style={{ transform: `translate(${routePosition.x}px, ${routePosition.y}px)` }}>
         <div className="map-route-control__handle" onPointerDown={startPanelDrag} onPointerMove={movePanel} onPointerUp={stopPanelDrag} onPointerCancel={stopPanelDrag}>
@@ -467,7 +490,8 @@ export function MapView({ url, runId, paretoPreview, onClearParetoPreview, showR
           <input value={originQuery} onChange={(event) => setOriginQuery(event.target.value)} placeholder="Address inside study area" aria-label="Route origin address" />
           <button type="submit" className="button--secondary" disabled={!mapReady || routeBusy || !originQuery.trim()}>Plan</button>
         </form>
-        <small className={`map-route-status${routeWarning ? " is-warning" : ""}`} role={routeWarning ? "alert" : "status"} aria-live="polite">{routeBusy ? "Planning route…" : routeStatus}</small>
+        {routeBusy && <button type="button" onClick={cancelRoute}>Cancel route request</button>}
+        <small className={`map-route-status${routeWarning ? " is-warning" : ""}`} role={routeWarning ? "alert" : "status"} aria-live="polite"><LoadingText active={routeBusy}>{routeBusy ? "Planning route" : routeStatus}</LoadingText></small>
         {routeAudit && <RouteAudit summary={routeAudit} />}
         <details className="map-route-method"><summary>How this route is calculated</summary>
           <p>The origin is your map click, browser coordinate, or a Nominatim-geocoded US address inside the displayed study area. The nearest selected facilities are shortlisted by straight-line distance, then OpenRouteService network travel time chooses the fastest one and supplies its route geometry. This small route request remains available when the full study-area ORS matrix is too large. Route LST, NDVI, NDBI, and albedo are current tract-level, length-weighted overlays, not street-level optimization inputs.</p>

@@ -1,4 +1,5 @@
 import { useAppStore } from "../../store/appStore";
+import { LoadingText } from "../../components/LoadingText";
 import { ResultPanel } from "../result/ResultPanel";
 import { AgentTrace } from "./AgentTrace";
 import { RunControls } from "./RunControls";
@@ -16,7 +17,7 @@ export function RunWorkspace() {
     return <section className="panel empty-state"><p>Confirm a task to start an auditable run.</p></section>;
   }
   if (query.isLoading) {
-    return <section className="panel empty-state"><p>Loading run {runId.slice(0, 8)}…</p></section>;
+    return <section className="panel empty-state"><p><LoadingText>{`Loading run ${runId.slice(0, 8)}`}</LoadingText></p></section>;
   }
   if (query.isError || !query.data) {
     return <section className="panel"><p className="error error--block">{query.error?.message ?? "Run unavailable."}</p></section>;

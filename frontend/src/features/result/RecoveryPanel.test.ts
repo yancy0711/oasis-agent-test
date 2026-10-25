@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { createElement } from "react";
-import { afterEach, describe, expect, it } from "vitest";
-import { TaskEditorProvider } from "../task/TaskEditorContext";
+import { createElement, useEffect } from "react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { TaskEditorProvider, useTaskEditor } from "../task/TaskEditorContext";
 import { RecoveryPanel } from "./RecoveryPanel";
 import { safeRecoveryPatch } from "./recovery.utils";
 
@@ -34,5 +34,49 @@ describe("recovery patch allowlist", () => {
     expect(screen.getByRole("button", { name: "Choose a city or county" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Choose a city or county" }));
     expect(screen.queryByText("Human decision required")).not.toBeInTheDocument();
+  });
+
+  it("offers actionable OSM recovery without silently switching the source", () => {
+    const apply = vi.fn();
+    const retry = vi.fn();
+    function EditorListener() {
+      const editor = useTaskEditor();
+      useEffect(() => { editor.register(apply); return () => editor.register(null); }, [editor]);
+      return null;
+    }
+    const result = { execution: { status: "failed" }, recovery: {
+      diagnosis: "OpenStreetMap place lookup failed (ReadTimeout).",
+      question: "Retry later.", suggested_changes: {},
+    } } as never;
+    render(createElement(TaskEditorProvider, null, createElement(EditorListener),
+      createElement(RecoveryPanel, { result, onRetry: retry })));
+    expect(apply).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Keep editing manually" })).not.toBeInTheDocument();
+    expect(screen.getByText("Service options")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry same task" }));
+    expect(retry).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", { name: "Use candidate CSV" }));
+    expect(apply).toHaveBeenCalledWith({ candidate_source: "csv" });
+  });
+
+  it("prevents duplicate submissions while a retry is starting", () => {
+    const result = { recovery: { diagnosis: "OpenStreetMap lookup failed", question: "Retry", suggested_changes: {} } } as never;
+    render(createElement(TaskEditorProvider, null,
+      createElement(RecoveryPanel, { result, onRetry: vi.fn(), retryPending: true })));
+    expect(screen.getByRole("button", { name: /Starting retry/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Use candidate CSV" })).toBeDisabled();
+  });
+
+  it("allows retrying a solver timeout without changing the task", () => {
+    const retry = vi.fn();
+    const result = { recovery: {
+      diagnosis: "The requested coverage solve reached its time limit without a verified solution.",
+      question: "Retry the same task.", suggested_changes: {},
+    } } as never;
+    render(createElement(TaskEditorProvider, null,
+      createElement(RecoveryPanel, { result, onRetry: retry })));
+    fireEvent.click(screen.getByRole("button", { name: "Retry same task" }));
+    expect(retry).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("button", { name: "Apply to task editor" })).not.toBeInTheDocument();
   });
 });

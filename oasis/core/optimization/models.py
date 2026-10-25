@@ -10,6 +10,7 @@ from time import monotonic
 import numpy as np
 import pulp
 from oasis.contracts.domain import SiteSolution, ValueWeights
+from oasis.core.optimization.cbc import solve_bounded_cbc
 
 
 def population_weighted_gini(values: np.ndarray, population: np.ndarray) -> float | None:
@@ -75,8 +76,12 @@ def _solve_gradual_assignment(
     coverage_target: float | None = None,
     coverage_mask: np.ndarray | None = None,
     facility_capacities: np.ndarray | None = None,
+    *, cancel_check=None, heartbeat=None,
 ) -> tuple[list[int], str, np.ndarray]:
     """Select sites and assign splittable demand using distance-decayed benefit."""
+    deadline = monotonic() + time_limit_s
+    if cancel_check:
+        cancel_check()
     benefit = np.asarray(benefit, float)
     demand_weights = np.asarray(demand_weights, float)
     population = np.asarray(population, float)
@@ -105,6 +110,10 @@ def _solve_gradual_assignment(
     )
     problem += pulp.lpSum(x) <= n_facilities
     for i in range(n_demand):
+        if cancel_check:
+            cancel_check()
+        if monotonic() >= deadline:
+            return [], "Not Solved", np.zeros_like(benefit)
         row = [allocation[(i, j)] for j in range(n_supply) if (i, j) in allocation]
         if row:
             problem += pulp.lpSum(row) <= 1
@@ -130,8 +139,7 @@ def _solve_gradual_assignment(
         ]
         problem += pulp.lpSum(served) >= required
 
-    problem.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit_s, threads=1))
-    status = pulp.LpStatus[problem.status]
+    status = solve_bounded_cbc(problem, deadline, cancel_check=cancel_check, heartbeat=heartbeat)
     chosen = [
         j for j in range(n_supply) if (x[j].value() or 0) > .5
     ] if status in {"Optimal", "Feasible"} else []
@@ -151,6 +159,7 @@ def _solve_mclp_selection(
     coverage_mask: np.ndarray | None = None,
 ) -> tuple[list[int], str]:
     """Solve the binary coverage model and return selected column indices."""
+    deadline = monotonic() + time_limit_s
     cover = np.asarray(cover, dtype=bool)
     demand_weights = np.asarray(demand_weights, dtype=float)
     if cover.ndim != 2:
@@ -193,10 +202,7 @@ def _solve_mclp_selection(
         required = int(np.ceil(coverage_target * int(target_mask.sum()) - 1e-9))
         problem += pulp.lpSum(y[i] for i in np.flatnonzero(target_mask)) >= required
 
-    problem.solve(
-        pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit_s, threads=1)
-    )
-    status = pulp.LpStatus[problem.status]
+    status = solve_bounded_cbc(problem, deadline)
     chosen = (
         [j for j in range(n_supply) if (x[j].value() or 0) > 0.5]
         if status in {"Optimal", "Feasible"}
@@ -328,7 +334,8 @@ def solve_mclp(travel_matrix: np.ndarray, demand_weights: np.ndarray,
                weights: ValueWeights | None, time_limit_s: int = 120,
                coverage_target: float | None = None,
                coverage_mask: np.ndarray | None = None,
-               facility_capacities: np.ndarray | None = None) -> SiteSolution:
+               facility_capacities: np.ndarray | None = None, *,
+               cancel_check=None, heartbeat=None) -> SiteSolution:
     """Solve gradual capacitated coverage with explicit demand assignment."""
     travel_matrix = np.asarray(travel_matrix, dtype=float)
     demand_weights = np.asarray(demand_weights, dtype=float)
@@ -375,6 +382,8 @@ def solve_mclp(travel_matrix: np.ndarray, demand_weights: np.ndarray,
         coverage_target,
         target_mask,
         facility_capacities,
+        cancel_check=cancel_check,
+        heartbeat=heartbeat,
     )
     # Solver y values can be arbitrary for zero-weight rows. Always derive
     # reported coverage from the selected geography instead.
@@ -395,8 +404,12 @@ def solve_mclp(travel_matrix: np.ndarray, demand_weights: np.ndarray,
 
 def solve_lscp(travel_matrix: np.ndarray, population: np.ndarray, vulnerable_mask: np.ndarray,
                threshold_minutes: float, candidate_ids: list[str], coverage_target: float = 1.0,
-               coverage_mask: np.ndarray | None = None, time_limit_s: int = 120) -> SiteSolution:
-    """Minimize facility count while meeting a confirmed tract-coverage target."""
+               coverage_mask: np.ndarray | None = None, time_limit_s: float = 120, *,
+               cancel_check=None, heartbeat=None) -> SiteSolution:
+    """Minimize facility count within a wall-clock budget, including model export."""
+    deadline = monotonic() + time_limit_s
+    if cancel_check:
+        cancel_check()
     travel_matrix = np.asarray(travel_matrix, dtype=float); population = np.asarray(population, dtype=float)
     equity_population = np.asarray(vulnerable_mask)
     if travel_matrix.ndim != 2: raise ValueError("travel_matrix must be two-dimensional")
@@ -411,15 +424,24 @@ def solve_lscp(travel_matrix: np.ndarray, population: np.ndarray, vulnerable_mas
     cover = travel_matrix <= threshold_minutes
     problem = pulp.LpProblem("LSCP", pulp.LpMinimize)
     x = [pulp.LpVariable(f"x_{j}", cat="Binary") for j in range(n_supply)]
-    y = [pulp.LpVariable(f"y_{i}", cat="Binary") for i in range(n_demand)]
+    # Non-target y variables can always be zero: dropping them is exact.
+    target_rows = np.flatnonzero(target_mask)
+    y = {i: pulp.LpVariable(f"y_{i}", cat="Binary") for i in target_rows}
     problem += pulp.lpSum(x)
-    for i in range(n_demand):
+    status = "Not Solved"
+    for i in target_rows:
+        if cancel_check:
+            cancel_check()
+        if monotonic() >= deadline:
+            break
         reachable = np.flatnonzero(cover[i])
-        problem += (y[i] == 0) if len(reachable) == 0 else (y[i] <= pulp.lpSum(x[j] for j in reachable))
-    required = int(np.ceil(coverage_target * int(target_mask.sum()) - 1e-9))
-    problem += pulp.lpSum(y[i] for i in np.flatnonzero(target_mask)) >= required
-    problem.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit_s, threads=1))
-    status = pulp.LpStatus[problem.status]
+        problem += (y[i] == 0) if len(reachable) == 0 else (
+            y[i] <= pulp.LpAffineExpression((x[j], 1) for j in reachable)
+        )
+    else:
+        required = int(np.ceil(coverage_target * int(target_mask.sum()) - 1e-9))
+        problem += pulp.lpSum(y.values()) >= required
+        status = solve_bounded_cbc(problem, deadline, cancel_check=cancel_check, heartbeat=heartbeat)
     chosen = ([j for j in range(n_supply) if (x[j].value() or 0) > .5]
               if status in {"Optimal", "Feasible"} else [])
     covered = cover[:, chosen].any(axis=1) if chosen else np.zeros(n_demand, dtype=bool)
@@ -473,12 +495,15 @@ def minimum_coverage_threshold(travel_matrix: np.ndarray, population: np.ndarray
         middle = (low + high) // 2
         threshold = float(values[middle])
         remaining_probes = max(1, expected_probes - probes)
-        probe_budget = max(1, min(int(time_limit_s), int(math.ceil(remaining / remaining_probes))))
+        probe_budget = min(remaining, max(1, min(float(time_limit_s), math.ceil(remaining / remaining_probes))))
         if progress_callback:
             progress_callback("Minimum-threshold search", probes, expected_probes)
         current = solve_lscp(
             matrix, population, vulnerable_mask, threshold, candidate_ids,
             coverage_target, coverage_mask, probe_budget,
+            cancel_check=cancel_check,
+            heartbeat=(lambda: progress_callback("Minimum-threshold search", probes, expected_probes))
+            if progress_callback else None,
         )
         probes += 1
         if progress_callback:
@@ -492,6 +517,10 @@ def minimum_coverage_threshold(travel_matrix: np.ndarray, population: np.ndarray
         )
         if feasible:
             best, solution, high = threshold, current, middle - 1
+        elif current.solver_status == "Feasible":
+            # An incumbent above budget does not prove that <= budget is impossible.
+            status = "solver_time_limit"
+            break
         else:
             low = middle + 1
     elapsed = monotonic() - started

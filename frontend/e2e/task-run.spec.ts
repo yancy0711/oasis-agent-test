@@ -67,6 +67,7 @@ test("parse, confirm, start, poll, cancel, and reload preserve one run", async (
       progress: status === "running" ? {
         kind: "progress", label: "Preparing demand", done: 1, total: 4,
         unit: "stages", fraction: 0.25, cache_hits: 0, remote_pairs: 0, inflight_pairs: 0,
+        stage_elapsed_seconds: 1, last_activity_seconds: 0,
       } : null,
       preview_result: null, result: null, error: null, cancel_reason: null,
       created_at: "2026-09-30T00:00:00Z", updated_at: "2026-09-30T00:00:01Z",
@@ -85,6 +86,8 @@ test("parse, confirm, start, poll, cancel, and reload preserve one run", async (
         return json(config);
       case "POST /api/v1/llm/models":
         return json({ provider: "openrouter", models: ["openai/gpt-4o"] });
+      case "POST /api/v1/requests/interpret":
+        return json({ action: "select_facilities", workflow: "research", reason: "Facility portfolio analysis", preferences: null });
       case "POST /api/v1/parse":
         return json({
           disposition: "full_analysis", task, missing_place: false, message: "",
@@ -113,9 +116,12 @@ test("parse, confirm, start, poll, cancel, and reload preserve one run", async (
   });
 
   await page.goto("/");
+  await page.getByRole("tab", { name: "Find a nearby facility" }).click();
+  await page.getByRole("checkbox", { name: "Auto-detect task type" }).check();
   await page.getByRole("textbox", { name: "Describe the cooling-access question", exact: true })
     .fill("Select 8 candidate cooling facilities in Phoenix, Arizona within a 15-minute walk.");
   await page.getByRole("button", { name: "Analyze request" }).click();
+  await expect(page.getByRole("tab", { name: "Research and planning" })).toHaveAttribute("aria-selected", "true");
   await expect(page.getByRole("heading", { name: "Confirm the boundary" })).toBeVisible();
   const runButton = page.getByRole("button", { name: "Run confirmed agent" });
   await expect(runButton).toBeDisabled();

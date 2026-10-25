@@ -31,6 +31,62 @@ class RecordingLLM:
         return self.responses.pop(0)
 
 
+def test_requested_coverage_timeout_does_not_claim_a_constraint_conflict(monkeypatch):
+    from oasis.services import workflow
+    ctx = Context()
+    ctx.put("config", {"optimization": {"solver_time_limit_s": 3}})
+    ctx.put("demand", {"population": np.ones(2), "indicators": {}})
+    ctx.put("candidates", gpd.GeoDataFrame({"cand_id": ["a", "b"]},
+        geometry=[Point(0, 0), Point(1, 1)], crs="EPSG:4326"))
+    ctx.put("travel", {"matrix": np.ones((2, 2))})
+    monkeypatch.setattr(workflow, "coverage_pareto_sweep", lambda *args, **kwargs: [])
+    def timed_out(*args, **kwargs):
+        assert kwargs["cancel_check"] == ctx.check_cancelled
+        kwargs["heartbeat"]()
+        return SimpleNamespace(solver_status="Not Solved")
+    monkeypatch.setattr(workflow, "solve_mclp", timed_out)
+    result = workflow.optimize_sites(ctx, n_facilities=1, coverage_target=.8, weights=ValueWeights())
+    assert not result.ok and result.error.kind == "timeout"
+    assert "Feasibility has not been established" in result.error.hint
+    orch = Orchestrator(RecordingLLM([]), {})
+    orch.ctx = ctx
+    steps = []
+    orch._complete_constraint_diagnostics(TaskSpec(place_name="Riverside", coverage_target=.8), [result], steps)
+    assert steps == [] and not ctx.has("minimum_facilities")
+    recovery = orch._failure_recovery(
+        TaskSpec(place_name="Riverside", n_facilities=10, threshold_minutes=10), [result],
+        question="Adjust the number of facilities or the threshold minutes?",
+    )
+    assert recovery.suggested_changes == {}
+    assert "Retry the same task" in recovery.question
+    assert "does not prove infeasibility" in recovery.question
+
+
+@pytest.mark.parametrize("expression", ["10 minutes' dirve", "a ten-minute car ride", "10 min by taxi"])
+def test_semantic_driving_is_retained_with_equity_preference(expression):
+    from oasis.settings import load_profiles
+    llm = RecordingLLM([{
+        "place_name": "Los Angeles, California, USA", "mobility_scenario": "driving",
+        "threshold_minutes": 10, "recommended_value_profile": "equity_first", "weights": None,
+    }])
+    task = Orchestrator(llm, {"value_profiles": load_profiles()}).parse_task(
+        f"I'm in LA. Plan cooling centers within {expression}, equity-first.")
+    assert task.mobility_scenario == "driving" and task.threshold_minutes == 10
+    assert task.recommended_value_profile == "equity_first" and task.weights is None
+    assert "obvious typos" in llm.calls[0]["system"]
+
+
+def test_portfolio_selection_near_landmark_does_not_become_point_navigation():
+    task = Orchestrator(RecordingLLM([{
+        "place_name": "Riverside, California, USA", "n_facilities": 10,
+        "analysis_goal": "facility_siting", "coverage_target": .8,
+        "route_origin": {"entity": "Raincross Hotel Riverside", "context": "Riverside", "source": "llm"},
+    }]), {}).parse_task("Select 10 candidate cooling facilities near Raincross Hotel Riverside within a 15-minute walking threshold, covering 80% of the population.")
+    assert task.route_origin is None and task.analysis_goal == "facility_siting"
+    assert task.n_facilities == 10 and task.threshold_minutes == 15
+    assert task.coverage_target == .8
+
+
 def test_request_scope_routes_clear_boundaries_with_a_useful_alternative():
     unsupported = classify_request("Find vacant land for a new cooling-center building in Phoenix")
     assert unsupported.disposition == "out_of_scope"
@@ -1004,6 +1060,23 @@ def test_hard_constraint_hitl_reports_exact_relaxation_bounds(monkeypatch):
     assert [item.tool for item in result["results"]] == ["infeasible_analysis_behavior_test",
                                                           "find_minimum_facilities", "find_minimum_threshold"]
 
+
+def test_timeout_hitl_does_not_restore_model_suggested_parameter_changes():
+    @registry.register("timeout_analysis_behavior_test", "Return an unverified timeout.")
+    def fail(ctx):
+        return ToolResult(ok=False, tool="timeout_analysis_behavior_test",
+                          error=ToolError(kind="timeout", message="The requested coverage solve reached its time limit.",
+                                          retryable=False))
+    llm = RecordingLLM([
+        {"kind": "tool", "tool": "timeout_analysis_behavior_test", "rationale": "Test the solver."},
+        {"kind": "hitl", "message": "Increase facilities or minutes?",
+         "suggested_changes": {"n_facilities": 15, "threshold_minutes": 15}},
+    ])
+    task = TaskSpec(place_name="Los Angeles", n_facilities=10, threshold_minutes=10)
+    result = Orchestrator(llm, {"max_agent_steps": 3, "max_self_correction_rounds": 0}).run(task, explain=False)
+    assert result["paused"] and result["recovery"].suggested_changes == {}
+    assert "Retry the same task" in result["recovery"].question
+
 def test_hard_coverage_with_travel_requires_feasibility_optimization():
     """A hard target with travel evidence must be tested before the model may stop."""
     orch = Orchestrator(RecordingLLM([]), {})
@@ -1541,3 +1614,55 @@ def test_sensitivity_interpretation_receives_mobility_hours_and_provenance():
     assert '"mobility_scenario": "walk_drive_equity"' in evidence
     assert '"unknown_candidates": 3' in evidence
     assert '"tier": "cache"' in evidence
+
+
+def test_semantic_age_recommendation_uses_shared_registry_without_executing_weights():
+    from oasis.settings import load_profiles
+    profiles = load_profiles()
+    llm = RecordingLLM([{"place_name": "Phoenix", "n_facilities": 10, "threshold_minutes": 15,
+                         "recommended_value_profile": "older_adults", "weights": None,
+                         "recommendation_rationale": "Prioritize the elderly: age-related vulnerability."}])
+    task = Orchestrator(llm, {"value_profiles": profiles}).parse_task(
+        "Select 10 facilities in Phoenix within 15 minutes. Prioritize the elderly.")
+    assert task.recommended_value_profile == "older_adults"
+    assert task.weights is None
+    assert task.coverage_group == "all"
+    assert task.n_facilities == 10 and task.threshold_minutes == 15
+    assert 'older_adults' in llm.calls[0]["user"]
+    assert profiles['older_adults']['weights']['elderly_ratio'] == .6
+
+
+def test_valid_semantic_recommendation_is_not_overwritten_by_one_mentioned_group():
+    from oasis.settings import load_profiles
+    llm = RecordingLLM([{"place_name": "Phoenix", "recommended_value_profile": "equity_first", "weights": None}])
+    task = Orchestrator(llm, {"value_profiles": load_profiles()}).parse_task(
+        "Select 10 facilities in Phoenix. Prioritize older adults, poverty and heat together, not age alone.")
+    assert task.recommended_value_profile == "equity_first"
+
+
+def test_partial_threshold_recovery_does_not_claim_a_proven_minimum():
+    orch = Orchestrator(RecordingLLM([]), {})
+    orch.ctx.put("minimum_threshold", {
+        "feasible": True, "minimum_threshold_minutes": 104.0,
+        "search_complete": False,
+    })
+    recovery = orch._failure_recovery(TaskSpec(place_name="Phoenix", n_facilities=10), [])
+    assert "feasible threshold of 104.0" in recovery.diagnosis
+    assert "minimum not proven" in recovery.diagnosis
+    assert "at least 104.0" not in recovery.diagnosis
+
+
+def test_facility_diagnostic_preserves_feasible_without_claiming_minimum(monkeypatch):
+    import oasis.services.workflow as workflow
+    ctx = Context()
+    ctx.put("demand", {"population": np.ones(2), "vulnerable_mask": np.zeros(2, bool)})
+    ctx.put("candidates", pd.DataFrame({"cand_id": ["a", "b"]}))
+    ctx.put("travel", {"matrix": np.array([[1., 10.], [10., 1.]])})
+    ctx.put("task", TaskSpec(place_name="Phoenix", n_facilities=1))
+    monkeypatch.setattr(workflow, "solve_lscp", lambda *args, **kwargs:
+                        SimpleNamespace(solver_status="Feasible", selected_ids=["a", "b"]))
+    result = workflow.find_minimum_facilities(ctx)
+    assert result.ok and result.summary["feasible"]
+    assert result.summary["minimum_facilities"] is None
+    assert result.summary["feasible_facility_count"] == 2
+    assert result.summary["minimum_proven"] is False

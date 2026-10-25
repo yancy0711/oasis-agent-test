@@ -6,12 +6,17 @@ services:
     image: oasis-agent:local
     init: true
     env_file: .env
+    environment:
+      OASIS_CONFIG_PATH: /app/config/settings.yaml
+      OASIS_CACHE_DIR: /app/data/cache
+      OASIS_OUTPUT_DIR: /app/outputs_run
     command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
     ports:
       - "8000:8000"
     volumes:
       - ./data/cache:/app/data/cache
       - ./outputs_run:/app/outputs_run
+      - ./tmp/uploads:/app/tmp/uploads
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
       interval: 10s

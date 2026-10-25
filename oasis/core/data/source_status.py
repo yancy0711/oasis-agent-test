@@ -83,8 +83,9 @@ def inspect_data_sources(cfg: dict[str, Any], *, force: bool = False,
                           "https://planetarycomputer.microsoft.com/api/stac/v1/collections/landsat-c2-l2", get_json)],
         lambda: [_service("OpenStreetMap Nominatim", "live service",
                           "https://nominatim.openstreetmap.org/status.php?format=json", get_json)],
-        lambda: [_service("openrouteservice", "live API",
-                          "https://api.openrouteservice.org/health", get_json)],
+        lambda: [_source("openrouteservice", "live API", "unverified",
+                         "Check the official status page and test a route with the configured key; no unauthenticated routing health check was performed.",
+                         official_url="https://status.heigit.org/")],
     ]
     sources: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=4, thread_name_prefix="source-status") as pool:

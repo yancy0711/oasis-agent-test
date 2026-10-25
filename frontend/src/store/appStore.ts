@@ -3,7 +3,9 @@ import { createJSONStorage, persist } from "zustand/middleware";
 import type { AppSessionState, AppStore } from "./appStore.types";
 
 const initialState: AppSessionState = {
+  audience: "research",
   activeRunId: null,
+  taskVersion: 0,
   confirmedPlace: null,
   candidateUploadId: null,
   llmSessionId: null,
@@ -18,6 +20,8 @@ export const useAppStore = create<AppStore>()(
   persist(
     (set) => ({
       ...initialState,
+      interruptTask: () => set((state) => ({ taskVersion: state.taskVersion + 1 })),
+      setAudience: (audience) => set({ audience }),
       setActiveRunId: (activeRunId) => set({ activeRunId }),
       setConfirmedPlace: (confirmedPlace) => set({ confirmedPlace }),
       setCandidateUploadId: (candidateUploadId) => set({ candidateUploadId }),

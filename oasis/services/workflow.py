@@ -26,6 +26,7 @@ from oasis.core.data.heat import fetch_heat_exposure
 from oasis.core.data.environment import derive_environment_burden, fetch_environment_indices
 from oasis.core.data.population import population_raster_source
 from oasis.core.data.osm import fetch_candidates
+from oasis.core.data.overpass import OverpassUnavailable
 from oasis.core.data.opening_hours import filter_candidates_by_hours
 from oasis.core.optimization.mobility import compose_demand, scenario_modes
 from oasis.core.optimization.models import (build_demand_weights, minimum_coverage_threshold,
@@ -53,6 +54,10 @@ def _guard(name: str):
             """Execute a tool and preserve the ToolResult contract on failure."""
             try: return fn(*args, **kwargs)
             except RunCancelled: raise
+            except OverpassUnavailable as exc:
+                return ToolResult(ok=False, tool=name, summary={"provider_unavailable": True},
+                                  error=ToolError(kind="unknown", message=str(exc), retryable=False,
+                                                  hint="The OSM candidate source is unchanged. Retry later; no CSV upload is required."))
             except Exception as exc:
                 return ToolResult(ok=False, tool=name, error=ToolError(
                     kind="ambiguous" if isinstance(exc, AmbiguousPlaceError) else (
@@ -647,8 +652,10 @@ def fetch_candidate_sites(ctx: Context, amenities: list[str], study_handle: str 
     """Fetch candidate facility points for the requested OSM amenities."""
     study = ctx.get(study_handle)
     ctx.progress("Candidate facilities: querying OpenStreetMap", 0, 3, unit="stages")
-    with scoped_cache(study["cache_scope"]): candidates, error = fetch_candidates(study["boundary"], amenities)
+    with scoped_cache(study["cache_scope"]):
+        candidates, error = fetch_candidates(study["boundary"], amenities, check=ctx.check_cancelled, progress=ctx.progress)
     if error: return ToolResult(ok=False, tool="fetch_candidate_sites", error=error)
+    acquisition = candidates.attrs.get("osm_acquisition", {})
     ctx.progress("Candidate facilities: received candidate records", 1, 3, unit="stages")
     ctx.progress("Candidate facilities: checking access and opening hours", 2, 3, unit="stages")
     potential = len(candidates)
@@ -671,20 +678,22 @@ def fetch_candidate_sites(ctx: Context, amenities: list[str], study_handle: str 
     ctx.put("quality", quality)
     prov = Provenance(
         source="OpenStreetMap candidate facilities, access, opening hours, and fee tags",
+        tier="cache" if acquisition.get("cache_parts") and not acquisition.get("live_parts") else "live",
         record_count=len(candidates),
         notes=(f"potential facilities: {potential}; retained: {len(candidates)}; "
                f"restricted access: {access['restricted_candidates']}; "
                f"fee required: {access['fee_required_candidates']}; "
                f"hours unknown: {hours.get('unknown_candidates', 0)}; "
                f"observed capacity: {capacity_summary['observed_capacity_sites']}; "
-               f"floor area proxy: {capacity_summary['relative_floor_area_proxy_sites']}"),
+               f"floor area proxy: {capacity_summary['relative_floor_area_proxy_sites']}; "
+               f"OSM acquisition: {acquisition}"),
     )
     ctx.put("candidates", candidates, prov)
     ctx.progress("Candidate facilities: ready", 3, 3, unit="stages")
     return ToolResult(ok=True, tool="fetch_candidate_sites", handle="candidates", provenance=prov,
                       summary={"candidates": len(candidates), "amenities": amenities,
                                "public_access": access, "operating_hours": hours,
-                               "capacity_evidence": capacity_summary})
+                               "capacity_evidence": capacity_summary, "osm_acquisition": acquisition})
 
 
 @registry.register("load_candidate_sites", "Load user-supplied candidate points from a CSV with latitude and longitude columns.",
@@ -1008,7 +1017,9 @@ def optimize_sites(ctx: Context, n_facilities: int = 10, threshold_minutes: floa
                               n_facilities, threshold_minutes, candidate_ids, "requested", value_weights,
                               optimization_cfg.get("solver_time_limit_s", 120),
                               coverage_target=coverage_target, coverage_mask=target_mask,
-                              facility_capacities=capacities)
+                              facility_capacities=capacities, cancel_check=ctx.check_cancelled,
+                              heartbeat=lambda: ctx.progress("Requested gradual coverage", 0, 1,
+                                  solve_time_limit_seconds=solver_time_limit))
         ctx.progress("Requested gradual coverage", 1, 1)
     reachable = matrix <= threshold_minutes
     max_tract_coverage = float(reachable[target_mask].any(axis=1).mean()) if target_mask.any() else 0.0
@@ -1032,7 +1043,10 @@ def optimize_sites(ctx: Context, n_facilities: int = 10, threshold_minutes: floa
                    "minimum_threshold_with_all_candidates": minimum_full_threshold}
     if solution.solver_status not in {"Optimal", "Feasible"}:
         ctx.put("constraint_diagnostics", diagnostics)
-        if coverage_target is not None and max_tract_coverage + 1e-9 < coverage_target:
+        timed_out = solution.solver_status != "Infeasible"
+        if timed_out:
+            hint = "Retry the same inputs or allow more solver time. Feasibility has not been established."
+        elif coverage_target is not None and max_tract_coverage + 1e-9 < coverage_target:
             hint = "Even all current candidates cannot meet the target at this threshold; increase the threshold or expand candidates."
         else: hint = "Increase the facility budget or threshold, or relax the coverage target."
         analysis = {"solution": solution, "points": points, "frontier": non_dominated(points),
@@ -1040,8 +1054,9 @@ def optimize_sites(ctx: Context, n_facilities: int = 10, threshold_minutes: floa
                     "coverage_target": coverage_target, "diagnostics": diagnostics}
         ctx.put("analysis", analysis)
         return ToolResult(ok=False, tool="optimize_sites", summary=diagnostics,
-                          error=ToolError(kind="constraint_conflict",
-                                          message=f"The confirmed constraints are {solution.solver_status.lower()} under the current candidates and travel matrix.",
+                          error=ToolError(kind="timeout" if timed_out else "constraint_conflict",
+                                          message=("The requested coverage solve reached its time limit without a verified solution."
+                                                   if timed_out else "The confirmed constraints are infeasible under the current candidates and travel matrix."),
                                           hint=hint, retryable=False))
     selected = {candidate_id: index for index, candidate_id in enumerate(candidate_ids)}
     columns = [selected[candidate_id] for candidate_id in solution.selected_ids if candidate_id in selected]
@@ -1098,13 +1113,18 @@ def find_minimum_facilities(ctx: Context, threshold_minutes: float = 15,
     ctx.progress("LSCP", 0, 1)
     solution = solve_lscp(matrix, population, vulnerable,
                           threshold_minutes, candidate_ids, coverage_target, mask,
-                          _cfg(ctx, "optimization").get("solver_time_limit_s", 120))
+                          _cfg(ctx, "optimization").get("solver_time_limit_s", 120),
+                          cancel_check=ctx.check_cancelled,
+                          heartbeat=lambda: ctx.progress("LSCP", 0, 1))
     ctx.progress("LSCP", 1, 1)
     feasible = solution.solver_status in {"Optimal", "Feasible"}
-    current = ctx.get("task", None); minimum = len(solution.selected_ids) if feasible else None
+    current = ctx.get("task", None)
+    minimum = len(solution.selected_ids) if solution.solver_status == "Optimal" else None
     summary = {"feasible": feasible, "minimum_facilities": minimum,
+               "minimum_proven": solution.solver_status == "Optimal",
+               "feasible_facility_count": len(solution.selected_ids) if feasible else None,
                "current_facilities": getattr(current, "n_facilities", None),
-               "facility_gap": (minimum - current.n_facilities if feasible and current else None),
+               "facility_gap": (minimum - current.n_facilities if minimum is not None and current else None),
                "threshold_minutes": threshold_minutes, "coverage_target": coverage_target,
                "coverage_group": coverage_group, "solver_status": solution.solver_status,
                "selected_ids": solution.selected_ids}

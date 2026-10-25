@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { Controller, useForm, type Control } from "react-hook-form";
 import type { RoutingMode, TaskSpec } from "../../api/models";
 import { InfoLabel } from "../../components/InfoLabel";
+import { LoadingText } from "../../components/LoadingText";
 import { CheckboxDropdown } from "../../components/CheckboxDropdown";
 import { CandidateUpload } from "./CandidateUpload";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
@@ -48,12 +49,6 @@ function WeightField({ name, label, weights, control }: {
   }} /></label>} />;
 }
 
-const QUICK_PROFILES: ValueProfile[] = [
-  { name: "heat_poverty", label: "Heat + poverty", weights: { population_density: .1, elderly_ratio: .1, poverty_rate: .35, heat_exposure: .35, environment_burden: .1 } },
-  { name: "older_adults", label: "Older adults", weights: { population_density: .1, elderly_ratio: .6, poverty_rate: .1, heat_exposure: .1, environment_burden: .1 } },
-  { name: "balanced", label: "Balanced", weights: { population_density: .2, elderly_ratio: .2, poverty_rate: .2, heat_exposure: .2, environment_burden: .2 } },
-];
-
 const AMENITY_OPTIONS = [
   { value: "library", label: "Public library" },
   { value: "community_centre", label: "Community center" },
@@ -96,7 +91,9 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
   const facilityCount = watch("n_facilities");
   const threshold = watch("threshold_minutes");
   const mobility = watch("mobility_scenario");
-  const allProfiles = [...profiles, ...QUICK_PROFILES.filter((quick) => !profiles.some((profile) => profile.name === quick.name))];
+  const allProfiles = profiles;
+  const appliedProfile = allProfiles.find((profile) => Object.entries(profile.weights).every(([key, value]) =>
+    Math.abs(Number(weights[key as keyof typeof weights]) - value) < 0.000001));
   const recommended = profiles.find((profile) => profile.name === task.recommended_value_profile);
 
   function applyProfile(profile: ValueProfile | undefined) { if (profile) setValue("weights", profile.weights, { shouldDirty: true, shouldValidate: true }); }
@@ -114,10 +111,11 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
 
     {(task.recommended_value_profile || task.recommended_mobility_scenario || task.recommended_sensitivity_thresholds?.length) ? <div className="recommendation-panel">
       <div><strong>Model recommendation</strong><p>{task.recommendation_rationale || "Review and explicitly apply the suggested settings."}</p></div>
+      {recommended && <p>Suggested value profile: <strong>{recommended.label}</strong>. {appliedProfile?.name === recommended.name ? "Applied to the displayed weights." : "Not applied yet; review and apply before running."}</p>}
       <button type="button" onClick={applyRecommendations}>Apply all recommendations</button>
     </div> : null}
     {task.route_origin && <div className="route-request-notice"><strong>Route origin</strong><span>{task.route_origin.entity}{task.route_origin.context ? `, ${task.route_origin.context}` : ""}</span>{task.route_origin.positional_hint && <small>Position described by user: {task.route_origin.positional_hint}. The confirmed candidate supplies the route coordinate.</small>}<small>Confirm the inferred city or county and run the candidate selection. The Map tab will then plan to the network-nearest selected facility.</small></div>}
-    {task.preference_question && <div className="preference-panel"><strong>{task.preference_question}</strong><div className="button-row">{QUICK_PROFILES.map((profile) => <button type="button" key={profile.name} onClick={() => applyProfile(profile)}>{profile.label}</button>)}</div></div>}
+    {task.preference_question && <div className="preference-panel"><strong>{task.preference_question}</strong><div className="button-row">{allProfiles.map((profile) => <button type="button" key={profile.name} onClick={() => applyProfile(profile)}>{profile.label}</button>)}</div></div>}
     {(task.result_queries?.length ?? 0) > 0 && <div className="route-request-notice"><strong>Requested result questions</strong>{task.result_queries?.map((query, index) => <span key={`${query.metric}-${index}`}>{query.limit} {query.scope === "vulnerable" ? "vulnerable " : ""}tract(s) by {query.metric.replaceAll("_", " ")} ({query.direction})</span>)}<small>These answers are read-only outputs and do not change the facility budget.</small></div>}
     {(task.ambiguities?.length ?? 0) > 0 && <div className="preference-panel"><strong>Confirm the model interpretation</strong>{task.ambiguities?.map((item, index) => { const candidates = item.candidates ?? []; return <div className="ambiguity-choice" key={`${item.field}-${index}`}><p>{item.question}</p>{candidates.length > 0 ? <div className="button-row">{candidates.map((candidate) => <button type="button" key={candidate} onClick={() => onResolveAmbiguity?.(index, candidate)}>{candidate.replaceAll("_", " ")}</button>)}</div> : <small>Edit the corresponding field below, then run the confirmed task.</small>}</div>; })}</div>}
 
@@ -149,7 +147,7 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
         const labels = profiles.filter((profile) => field.value.includes(profile.name)).map((profile) => profile.label);
         return <div className="comparison-profile-picker field field--wide"><InfoLabel label="Value profiles to compare">Each selected profile supplies a different audited weighting scheme. Every profile is solved against the same candidate facilities and travel matrix.</InfoLabel><CheckboxDropdown ariaLabel="Value profiles to compare" options={options} selected={field.value} onChange={field.onChange} summary={`${field.value.length} profiles selected`} detail={labels.length ? labels.join(", ") : "Select at least two profiles"} actions={<><button type="button" className="button--secondary" onClick={() => field.onChange(options.map((option) => option.value))}>Select all</button><button type="button" className="button--secondary" onClick={() => field.onChange(["efficiency_first", "equity_first"].filter((name) => options.some((option) => option.value === name)))}>Efficiency vs equity</button></>} emptyMessage="No registered profiles are available." defaultOpen />{errors.comparison_profiles && <small className="error">{errors.comparison_profiles.message}</small>}</div>;
       }} />}
-      <fieldset className={`weights ${routeFocused ? "weights--secondary" : ""}`}><legend><InfoLabel label="Value profile">Sets how strongly population, older adults, poverty, heat exposure, and passive built-environment burden influence site selection.</InfoLabel></legend><label className="field compact-field"><InfoLabel label="Apply a registered profile">Loads a saved combination of value weights; choose Custom weights to edit them manually.</InfoLabel><select aria-label="Apply a registered profile" defaultValue="" onChange={(event) => applyProfile(allProfiles.find((profile) => profile.name === event.target.value))}><option value="">Custom weights</option>{allProfiles.map((profile) => <option key={profile.name} value={profile.name}>{profile.label}</option>)}</select></label><div className="form-grid form-grid--weights">
+      <fieldset className={`weights ${routeFocused ? "weights--secondary" : ""}`}><legend><InfoLabel label="Value profile">Sets how strongly population, older adults, poverty, heat exposure, and passive built-environment burden influence site selection.</InfoLabel></legend><label className="field compact-field"><InfoLabel label="Apply a registered profile">Loads a saved combination of value weights; choose Custom weights to edit them manually.</InfoLabel><select aria-label="Apply a registered profile" value={appliedProfile?.name ?? ""} onChange={(event) => applyProfile(allProfiles.find((profile) => profile.name === event.target.value))}><option value="">Custom weights</option>{allProfiles.map((profile) => <option key={profile.name} value={profile.name}>{profile.label}</option>)}</select></label><div className="form-grid form-grid--weights">
         <WeightField name="population_density" label="Population" weights={weights} control={control} /><WeightField name="elderly_ratio" label="Older adults" weights={weights} control={control} /><WeightField name="poverty_rate" label="Poverty" weights={weights} control={control} /><WeightField name="heat_exposure" label="Heat exposure" weights={weights} control={control} /><WeightField name="environment_burden" label="Passive environment burden" weights={weights} control={control} />
       </div><div className={`weight-total ${Math.abs(weightTotal - 1) < .0001 ? "weight-total--ready" : "weight-total--warning"}`}><strong>Total: {weightTotal.toFixed(2)}</strong><span>{weightTotal < .9999 ? `Add ${(1 - weightTotal).toFixed(2)} before running.` : "Weights are ready."}</span></div>{errors.weights?.root && <small className="error">{errors.weights.root.message}</small>}</fieldset>
     </>}
@@ -163,6 +161,6 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
     </div>
     </details>
 
-    <div className="form-actions"><span>{ready ? "The confirmed task is ready to run." : "Confirm a study area before running."}</span><button type="submit" disabled={!ready || pending || (source === "csv" && !uploadedName)}>{pending ? "Starting…" : "Run confirmed agent"}</button></div>
+    <div className="form-actions"><span>{ready ? "The confirmed task is ready to run." : "Confirm a study area before running."}</span><button type="submit" disabled={!ready || pending || (source === "csv" && !uploadedName)}>{pending ? <LoadingText>Starting</LoadingText> : "Run confirmed agent"}</button></div>
   </form>;
 }

@@ -1,0 +1,43 @@
+# Semantic hints for the LLM, not keyword triggers or verified site attributes.
+# IDs must match ResidentCategory and the existing OSM discovery adapters.
+categories:
+  library:
+    purpose: Public access to books, information, and study space.
+    activities: [reading, studying, borrowing books, quiet individual work]
+    setting: Usually indoors.
+    limits: Seating, silence, Wi-Fi, air conditioning, and opening hours are not verified.
+  community_centre:
+    purpose: Shared local space for community activities and gathering.
+    activities: [socializing, community meetings, classes, group activities]
+    setting: Often indoors, sometimes with outdoor facilities.
+    limits: Admission, available programs, and usable rooms are not verified.
+  swimming_pool:
+    purpose: A facility for swimming and water recreation.
+    activities: [swimming, water exercise, recreational bathing]
+    setting: May be indoors or outdoors.
+    limits: Indoor status, public access, lifeguards, and admission fees are not guaranteed.
+  mall:
+    purpose: A shopping complex with multiple stores and shared visitor areas.
+    activities: [shopping, browsing stores, indoor leisure]
+    setting: Often indoors; open-air malls also exist.
+    limits: Cooling, seating, particular stores, and current access are not verified.
+  sports_centre:
+    purpose: A facility primarily supporting sport and physical exercise.
+    activities: [sports, fitness, working out, training, court games]
+    setting: May combine indoor and outdoor facilities.
+    limits: Particular sports, equipment, membership requirements, and availability are not verified.
+  arts_centre:
+    purpose: A venue for cultural and creative activities.
+    activities: [art, exhibitions, creative workshops, cultural activities]
+    setting: Often indoors, sometimes with outdoor spaces.
+    limits: Current exhibitions, programs, tickets, and access are not verified.
+  place_of_worship:
+    purpose: A venue primarily used for religious and spiritual gatherings.
+    activities: [worship, prayer, religious gatherings]
+    setting: Often indoors; visitor spaces vary.
+    limits: Non-member access and use as a cooling or general recreation space are not guaranteed.
+  park:
+    purpose: A public outdoor recreation and open-space destination.
+    activities: [outdoor leisure, walking, enjoying greenery, picnicking]
+    setting: Outdoors; vegetation varies.
+    limits: Shade, dense vegetation, low temperature, drinking water, and amenities are not guaranteed.

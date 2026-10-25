@@ -135,3 +135,20 @@ describe("advanced task editor", () => {
     expect(submit.mock.calls[0][0].comparison_profiles).toEqual(["efficiency_first", "equity_first"]);
   });
 });
+
+
+it("shows an age-priority recommendation and reflects applied or edited weights in the selector", () => {
+  const task = taskFromDraft({ place_name: "Phoenix", n_facilities: 10, threshold_minutes: 15,
+    recommended_value_profile: "older_adults", recommendation_rationale: "Prioritize the elderly: emphasize age-related vulnerability." });
+  const { container } = render(<TaskEditorProvider><TaskForm task={task} mode="auto" ready pending={false} uploadPending={false} uploadedName={null}
+    profiles={[{ name: "older_adults", label: "Older adults", weights: { population_density: .1, elderly_ratio: .6, poverty_rate: .1, heat_exposure: .1, environment_burden: .1 } }]}
+    onModeChange={() => undefined} onUpload={() => undefined} onSubmit={() => undefined} /></TaskEditorProvider>);
+  const selector = screen.getByRole("combobox", { name: "Apply a registered profile" });
+  expect(selector).toHaveValue("");
+  expect(screen.getByText(/Not applied yet/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Apply all recommendations" }));
+  expect(selector).toHaveValue("older_adults");
+  expect(container.querySelector('[name="weights.elderly_ratio"]')).toHaveValue(.6);
+  fireEvent.change(container.querySelector('[name="weights.elderly_ratio"]')!, { target: { value: "0.5" } });
+  expect(selector).toHaveValue("");
+});

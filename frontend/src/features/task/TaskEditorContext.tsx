@@ -4,7 +4,7 @@ import type { TaskFormValues } from "./taskForm.schema";
 
 export type TaskEditorPatch = Partial<Pick<TaskFormValues,
   "n_facilities" | "threshold_minutes" | "coverage_target" | "coverage_target_enabled" |
-  "candidate_amenities" | "mobility_scenario" | "sensitivity_thresholds" | "sensitivity_facility_counts" | "weights"
+  "candidate_source" | "candidate_amenities" | "mobility_scenario" | "sensitivity_thresholds" | "sensitivity_facility_counts" | "weights"
 >>;
 
 type Handler = (patch: TaskEditorPatch) => void;

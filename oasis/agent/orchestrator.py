@@ -25,7 +25,10 @@ class MissingPlaceError(ValueError):
 
 def load_prompt(name: str) -> str:
     """Read an agent prompt template by name."""
-    return (PROMPT_DIR / f"{name}.md").read_text(encoding="utf-8")
+    prompt = (PROMPT_DIR / f"{name}.md").read_text(encoding="utf-8")
+    if name in {"task_parsing", "resident_parsing", "request_intent"}:
+        prompt += "\n" + (PROMPT_DIR / "parameter_parsing.md").read_text(encoding="utf-8")
+    return prompt
 
 
 def _slug(value: Any) -> str:
@@ -729,6 +732,11 @@ class Orchestrator:
                 raw["threshold_minutes"] = bounded_threshold
         route_origin = raw.get("route_origin")
         fallback_origin = route_origin_from_prompt(user_prompt)
+        if explicit_count is not None and fallback_origin is None:
+            # A protected portfolio count must not become a trip merely because
+            # the model put the nearby landmark in route_origin.
+            route_origin = None
+            raw["route_origin"] = None
         model_entity = str(route_origin.get("entity") or "").strip() if isinstance(route_origin, dict) else ""
         destination_as_origin = bool(re.fullmatch(
             r"(?:the\s+)?(?:nearest|closest)?\s*(?:cooling\s+)?"
@@ -816,7 +824,7 @@ class Orchestrator:
             raw["comparison_profiles"] = selected_profiles
         explicit_profile_names = list(dict.fromkeys(mentioned_profiles))
         matched_profile = _matching_profile(weights, profiles)
-        if len(explicit_profile_names) == 1:
+        if len(explicit_profile_names) == 1 and raw.get("recommended_value_profile") not in profiles:
             selected_profile = explicit_profile_names[0]
             raw["recommended_value_profile"] = selected_profile
             raw["weights"] = None
@@ -857,6 +865,9 @@ class Orchestrator:
 
     def _bind_task_args(self, step: PlanStep, task: TaskSpec) -> PlanStep:
         """Bind confirmed TaskSpec values to their corresponding tool calls."""
+        if step.tool in {"fetch_candidate_sites", "load_candidate_sites"}:
+            tool = "load_candidate_sites" if task.candidate_source == "csv" else "fetch_candidate_sites"
+            step = PlanStep(tool=tool, args={}, rationale=step.rationale)
         args = dict(step.args)
         if step.tool == "resolve_study_area": args["place_name"] = task.place_name
         elif step.tool == "fetch_candidate_sites": args["amenities"] = task.candidate_amenities
@@ -1028,7 +1039,13 @@ class Orchestrator:
             self.ctx.failures.append({"tool": step.tool, "args": step.args,
                                       "error": result.error.message if result.error else ""})
             if attempt == rounds or (result.error and not result.error.retryable): return result
-            try: repaired = self._sanitize_step(self._repair(step, result.error))
+            try:
+                repaired = self._sanitize_step(self._repair(step, result.error))
+                task = self.ctx.get("task", None)
+                if task and repaired.tool in {"fetch_candidate_sites", "load_candidate_sites"}:
+                    expected = "load_candidate_sites" if task.candidate_source == "csv" else "fetch_candidate_sites"
+                    if repaired.tool != expected:
+                        repaired = self._bind_task_args(repaired, task)
             except RunCancelled:
                 raise
             except Exception as exc:
@@ -1132,6 +1149,10 @@ class Orchestrator:
                                          steps: list[PlanStep]) -> None:
         """Compute exact relaxation bounds before a hard-coverage failure reaches HITL."""
         if task.coverage_target is None or not all(self.ctx.has(name) for name in ("demand", "candidates", "travel")): return
+        # A time-limited solve supplies no proof of a constraint conflict.
+        solution = self.ctx.get("analysis", {}).get("solution")
+        if solution is not None and solution.solver_status not in {"Optimal", "Feasible", "Infeasible"}:
+            return
         for tool, handle in (("find_minimum_facilities", "minimum_facilities"),
                              ("find_minimum_threshold", "minimum_threshold")):
             if self.ctx.has(handle): continue
@@ -1160,6 +1181,12 @@ class Orchestrator:
         diagnosis = error.message if error else (f"The agent reached its {limit}-action safety limit."
                                                  if safety_limited else "The requested analysis did not produce its required result.")
         if error and error.hint: diagnosis += f" {error.hint}"
+        if error and error.kind == "timeout":
+            return RecoveryProposal(
+                diagnosis=diagnosis,
+                question="Retry the same task, or increase the solver time budget in configuration. A timeout does not prove infeasibility; changing facility count or travel threshold is optional.",
+                suggested_changes={},
+            )
         options, changes = [], {}
         facilities = self.ctx.get("minimum_facilities", {})
         minimum = facilities.get("minimum_facilities") if facilities.get("feasible") else None
@@ -1169,10 +1196,12 @@ class Orchestrator:
         threshold = self.ctx.get("minimum_threshold", {})
         minimum_minutes = threshold.get("minimum_threshold_minutes") if threshold.get("feasible") else None
         if minimum_minutes is not None:
-            options.append(f"a threshold of at least {minimum_minutes:.1f} minutes with {task.n_facilities} facilities")
+            bound = "a threshold of at least" if threshold.get("search_complete", True) else "a feasible threshold of"
+            option = f"{bound} {minimum_minutes:.1f} minutes with {task.n_facilities} facilities"
+            options.append(option if threshold.get("search_complete", True) else option + " (minimum not proven)")
             if not changes and minimum_minutes > task.threshold_minutes:
                 changes["threshold_minutes"] = float(minimum_minutes)
-        if options: diagnosis += " The current candidate set requires " + " or ".join(options) + "."
+        if options: diagnosis += " Candidate-set diagnostics suggest " + " or ".join(options) + "."
         prompt = f"Would you like to use {' or '.join(options)}?" if options else (question or "Review the diagnostic and revise the confirmed inputs before retrying.")
         return RecoveryProposal(diagnosis=diagnosis, question=prompt, suggested_changes=changes)
     def interpret_results(self, task: TaskSpec) -> ResultNarrative:
@@ -1310,11 +1339,22 @@ class Orchestrator:
         if task.analysis_goal == "minimum_facilities" and self.ctx.has("minimum_facilities"):
             summary = self.ctx.get("minimum_facilities")
             if summary.get("feasible"):
+                if summary.get("minimum_facilities") is None:
+                    return (
+                        f"A feasible solution uses {int(summary['feasible_facility_count'])} facilities "
+                        f"within {float(summary['threshold_minutes']):g} minutes. "
+                        "The time limit was reached before the minimum count could be proven."
+                    ) + query_suffix
                 return (
                     f"At least {int(summary['minimum_facilities'])} candidate facilities are required "
                     f"to cover {float(summary.get('coverage_target', 1.0)):.0%} of the "
                     f"{str(summary.get('coverage_group', 'all')).replace('_', ' ')} group within "
                     f"{float(summary['threshold_minutes']):g} minutes."
+                ) + query_suffix
+            if summary.get("solver_status") not in {None, "Optimal", "Infeasible"}:
+                return (
+                    "The facility-count search reached its time limit without a verified solution. "
+                    "This does not establish that the requested coverage is infeasible."
                 ) + query_suffix
             threshold = self.ctx.get("minimum_threshold", {})
             if threshold.get("feasible"):
@@ -1409,6 +1449,13 @@ class Orchestrator:
         closure_attempted: set[str] = set()
         for index in range(1, max_steps + 1):
             self.ctx.check_cancelled()
+            if results and results[-1].summary.get("provider_unavailable"):
+                paused = True
+                recovery = self._failure_recovery(task, results, question="The OpenStreetMap service could not complete this lookup. Retry the same task later. A candidate CSV is optional, not required.")
+                message = recovery.diagnosis
+                self.ctx.record("hitl", "The data provider is unavailable; the confirmed candidate source is preserved.",
+                                results[-1].tool, diagnosis=recovery.diagnosis, question=recovery.question, suggested_changes={})
+                break
             if self._is_complete(task):
                 ok = True; message = self._completion_message(task)
                 self.ctx.record("decision", f"Verified completed result handle: {goal_handle}.",
@@ -1440,7 +1487,8 @@ class Orchestrator:
             if action.kind == "hitl":
                 self._complete_constraint_diagnostics(task, results, steps)
                 recovery = self._failure_recovery(task, results, action.message)
-                if not recovery.suggested_changes:
+                last_error = next((item.error for item in reversed(results) if item.error), None)
+                if not recovery.suggested_changes and not (last_error and last_error.kind == "timeout"):
                     recovery.suggested_changes = self._validated_changes(task, action.suggested_changes)
                 self.ctx.record("hitl", "The agent paused for a human-confirmed decision.",
                                 diagnosis=recovery.diagnosis, question=recovery.question,

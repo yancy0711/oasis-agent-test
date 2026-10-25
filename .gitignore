@@ -22,6 +22,8 @@ venv/
 # Local tools
 .vscode/
 .agents/
+.codex/
+.aws/
 
 # Runtime data
 /data/cache/*
@@ -32,6 +34,8 @@ venv/
 # Local notes
 /DEVELOPMENT.md
 /PROJECT_STRUCTURE.md
+/REQUEST_FLOW.md
+/docs/presentation-prep/
 
 # Operating system files
 .DS_Store

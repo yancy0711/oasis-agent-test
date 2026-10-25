@@ -26,7 +26,11 @@ function appendStreetView(root: HTMLElement, longitude: number, latitude: number
   panel.className = "map-popup__streetview";
   const status = document.createElement("p");
   status.className = "map-popup__streetview-status map-popup__streetview-status--notice";
-  status.textContent = "Checking for nearby street-level imagery...";
+  status.textContent = "Checking for nearby street-level imagery";
+  const dots = document.createElement("span");
+  dots.className = "animated-ellipsis";
+  dots.setAttribute("aria-label", "in progress");
+  status.append(dots);
   panel.append(status);
   root.append(panel);
   void getStreetView(latitude, longitude).then((result) => {

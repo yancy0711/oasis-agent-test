@@ -1,5 +1,7 @@
 .git/
 .agents/
+.codex/
+.aws/
 .vscode/
 .env
 .env.*
@@ -16,6 +18,9 @@ outputs_run/
 tmp/
 frontend/node_modules/
 frontend/dist/
+frontend/playwright-report/
+frontend/test-results/
+docs/
 notebooks/
 tests/
 experiments/

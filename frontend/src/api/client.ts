@@ -20,6 +20,13 @@ import type {
 
 const client = createClient<paths>({ baseUrl: "/api" });
 
+async function readErrorBody(response: Response): Promise<unknown> {
+  const text = await response.text();
+  try { return JSON.parse(text); } catch {
+    return { detail: `Request failed (HTTP ${response.status}). ${text.trim().startsWith("<") ? "The server returned a non-JSON error. Please retry." : text.slice(0, 300)}` };
+  }
+}
+
 function valueOrThrow<T>(data: T | undefined, error: unknown, fallback: string): T {
   if (error || data === undefined) throw apiError(error, fallback);
   return data;
@@ -80,8 +87,7 @@ export async function testLlmConnection(input: LlmConnectionInput): Promise<LlmC
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input),
   });
   if (!response.ok) {
-    let detail: unknown;
-    try { detail = await response.json(); } catch { detail = await response.text(); }
+    const detail = await readErrorBody(response);
     throw apiError(detail, "Could not connect to this model.");
   }
   return response.json() as Promise<LlmConnectionResult>;
@@ -92,8 +98,7 @@ export async function listLlmModels(input: Omit<LlmConnectionInput, "model">): P
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input),
   });
   if (!response.ok) {
-    let detail: unknown;
-    try { detail = await response.json(); } catch { detail = await response.text(); }
+    const detail = await readErrorBody(response);
     throw apiError(detail, "Could not read available models.");
   }
   const result = await response.json() as { models: string[] };
@@ -112,8 +117,7 @@ export async function parseTask(prompt: string, llmSessionId?: string | null, si
     body: JSON.stringify({ prompt, llm_session_id: llmSessionId ?? null }),
   });
   if (!response.ok) {
-    let detail: unknown;
-    try { detail = await response.json(); } catch { detail = await response.text(); }
+    const detail = await readErrorBody(response);
     throw apiError(detail, "Could not parse the request.");
   }
   return response.json() as Promise<ParseResponse>;
@@ -152,8 +156,7 @@ export async function reverseRouteOrigin(
     body: JSON.stringify({ longitude, latitude }),
   });
   if (!response.ok) {
-    let detail: unknown;
-    try { detail = await response.json(); } catch { detail = await response.text(); }
+    const detail = await readErrorBody(response);
     throw apiError(detail, "Could not identify the current location.");
   }
   return response.json() as Promise<CoordinateOriginResult>;
@@ -166,8 +169,7 @@ export async function searchRouteOrigin(query: string): Promise<CoordinateOrigin
     body: JSON.stringify({ query }),
   });
   if (!response.ok) {
-    let detail: unknown;
-    try { detail = await response.json(); } catch { detail = await response.text(); }
+    const detail = await readErrorBody(response);
     throw apiError(detail, "Could not search for this route origin.");
   }
   return response.json() as Promise<CoordinateOriginResult>;
@@ -178,8 +180,7 @@ export async function uploadCandidates(file: File): Promise<UploadResponse> {
   form.set("file", file);
   const response = await fetch("/api/v1/uploads", { method: "POST", body: form });
   if (!response.ok) {
-    let detail: unknown;
-    try { detail = await response.json(); } catch { detail = await response.text(); }
+    const detail = await readErrorBody(response);
     throw apiError(detail, "Could not upload candidate facilities.");
   }
   return response.json() as Promise<UploadResponse>;
@@ -233,33 +234,33 @@ export interface PlannedRoute {
 }
 
 export async function planPointRoute(
-  runId: string, longitude: number, latitude: number, mode: "walking" | "cycling" | "driving",
+  runId: string, longitude: number, latitude: number, mode: "walking" | "cycling" | "driving", signal?: AbortSignal,
 ): Promise<PlannedRoute> {
   const response = await fetch(`/api/v1/runs/${encodeURIComponent(runId)}/routes`, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ longitude, latitude, mode }),
+    signal: AbortSignal.any([AbortSignal.timeout(90_000), ...(signal ? [signal] : [])]),
   });
   if (!response.ok) {
-    let detail: unknown;
-    try { detail = await response.json(); } catch { detail = await response.text(); }
+    const detail = await readErrorBody(response);
     throw apiError(detail, "Could not plan a route from this point.");
   }
   return response.json() as Promise<PlannedRoute>;
 }
 
 export async function planPlaceRoute(
-  runId: string, query: string, mode: "walking" | "cycling" | "driving",
+  runId: string, query: string, mode: "walking" | "cycling" | "driving", signal?: AbortSignal,
 ): Promise<PlannedRoute> {
   const response = await fetch(
     `/api/v1/runs/${encodeURIComponent(runId)}/routes/from-place`,
     {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ query, mode }),
+      signal: AbortSignal.any([AbortSignal.timeout(90_000), ...(signal ? [signal] : [])]),
     },
   );
   if (!response.ok) {
-    let detail: unknown;
-    try { detail = await response.json(); } catch { detail = await response.text(); }
+    const detail = await readErrorBody(response);
     throw apiError(detail, "Could not plan a route from this location.");
   }
   return response.json() as Promise<PlannedRoute>;

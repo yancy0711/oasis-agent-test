@@ -1,4 +1,5 @@
 import { lazy, Suspense, useState } from "react";
+import { LoadingText } from "../../components/LoadingText";
 import type { RunResult } from "../../api/models";
 import { publicApiUrl } from "../../api/client";
 import { DataTable } from "../result/ResultShared";
@@ -24,7 +25,7 @@ export function ComparisonView({ result }: { result: RunResult }) {
       {mode === "scenario" ? <>
         {profileScenarios.length > 0 && <section className="detail-stack">
           <div><h3>Profiles in this run</h3><p className="muted">Each profile uses the same study area, candidates, travel matrix, facility budget, and threshold; only the confirmed value weights differ.</p><DataTable data={profileScenarios} /></div>
-          {result.artifacts?.map && <Suspense fallback={<p className="muted">Loading comparison map…</p>}><ComparisonMap url={publicApiUrl(result.artifacts.map)} baselineLabel={String(profileScenarios[0]?.profile_label ?? "Baseline")} alternativeLabel={String(profileScenarios[1]?.profile_label ?? "Alternative")} /></Suspense>}
+          {result.artifacts?.map && <Suspense fallback={<p className="muted"><LoadingText>Loading comparison map</LoadingText></p>}><ComparisonMap url={publicApiUrl(result.artifacts.map)} baselineLabel={String(profileScenarios[0]?.profile_label ?? "Baseline")} alternativeLabel={String(profileScenarios[1]?.profile_label ?? "Alternative")} /></Suspense>}
           {profileComparisons.length > 0 && <div><h3>Changes from baseline</h3><DataTable data={profileComparisons} /></div>}
         </section>}
         <ScenarioComparison />

@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { InfoLabel } from "../../components/InfoLabel";
+import { LoadingText } from "../../components/LoadingText";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 
 type PromptAudience = "research" | "personal";
@@ -29,7 +30,7 @@ const AUDIENCES: Record<PromptAudience, {
     audience: "For Users starting from a specific address or landmark.",
     description: "Start from a specific US address or landmark and plan a route to a nearby candidate facility.",
     placeholder: "I'm at the Lincoln Memorial. How can I find the nearest cooling facility?",
-    note: "OASIS can plan to candidate facilities after analysis, but it does not confirm real-time opening or emergency availability.",
+    note: "Search nearby places without a facility budget. OASIS does not confirm real-time opening or emergency availability.",
     examples: [
       { label: "Use my location", prompt: "Use my current location to find the nearest cooling facility.", action: "current_location" },
       { label: "Landmark route", prompt: "I'm at the Lincoln Memorial. How can I find the nearest cooling facility?" },
@@ -43,12 +44,17 @@ interface PromptInputProps {
   pending: boolean;
   onSubmit: (prompt: string) => void;
   onCancel: () => void;
+  audience?: PromptAudience;
+  onAudienceChange?: (audience: "research" | "personal") => void;
   onUseLocation?: () => void;
+  autoDetect?: boolean;
+  onAutoDetectChange?: (enabled: boolean) => void;
 }
 
-export function PromptInput({ pending, onSubmit, onCancel, onUseLocation }: PromptInputProps) {
+export function PromptInput({ pending, onSubmit, onCancel, onUseLocation, audience: controlledAudience, onAudienceChange, autoDetect = true, onAutoDetectChange }: PromptInputProps) {
   const [prompt, setPrompt] = useState("");
-  const [audience, setAudience] = useState<PromptAudience>("research");
+  const [localAudience, setAudience] = useState<PromptAudience>("research");
+  const audience = controlledAudience ?? localAudience;
   const mobile = useMediaQuery("(max-width: 620px)");
   const [stepOpen, setStepOpen] = useState(true);
   const active = AUDIENCES[audience];
@@ -84,12 +90,15 @@ export function PromptInput({ pending, onSubmit, onCancel, onUseLocation }: Prom
             aria-selected={audience === key}
             className={audience === key ? "is-active" : ""}
             key={key}
-            onClick={() => setAudience(key)}
+            onClick={() => { setAudience(key); onAudienceChange?.(key); }}
           >
             {AUDIENCES[key].label}
           </button>
         ))}
       </div>
+      {onAutoDetectChange && <div className="workflow-detection"><label><input type="checkbox" checked={autoDetect} disabled={pending}
+        onChange={(event) => onAutoDetectChange(event.target.checked)} />Auto-detect task type</label>
+        {!autoDetect && <small>Manual choice: Analyze request uses this tab.</small>}</div>}
       <div className="prompt-audience-panel" role="tabpanel" id={`prompt-panel-${audience}`} aria-labelledby={`prompt-tab-${audience}`}>
         <strong className="prompt-audience-for">{active.audience}</strong>
         <p>{active.description}</p>
@@ -117,7 +126,7 @@ export function PromptInput({ pending, onSubmit, onCancel, onUseLocation }: Prom
           placeholder={active.placeholder}
         />
         <button type="submit" disabled={pending || !prompt.trim()}>
-          {pending ? "Analyzing..." : "Analyze request"}
+          {pending ? <LoadingText>Analyzing</LoadingText> : "Analyze request"}
         </button>
         {pending && <button type="button" className="button--danger" onClick={onCancel}>Cancel</button>}
       </div>

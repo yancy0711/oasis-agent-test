@@ -9,7 +9,8 @@ from threading import Lock
 from typing import Any, Callable, Protocol
 
 import numpy as np
-import requests
+import httpx
+from oasis.core.http import cancellable_request
 
 from oasis.core.retry import RETRYABLE_STATUS, TransientError, with_retry
 
@@ -118,34 +119,37 @@ def post_ors(
     timeout_s: float,
     gate: RequestGate | None = None,
     cancel_check: Callable[[], None] | None = None,
+    retry_transient: bool = True,
 ) -> dict[str, Any]:
     """POST one ORS request and retry provider-declared transient failures."""
+    failure = TransientError if retry_transient else RuntimeError
+    profile = url.rstrip("/").rsplit("/", 1)[-1]
     if gate:
         gate.wait(cancel_check)
     elif cancel_check:
         cancel_check()
     try:
-        response = requests.post(
-            url,
+        response = cancellable_request(
+            "POST", url,
+            check=cancel_check or (lambda: None),
             headers={
                 "Authorization": api_key,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
             },
             json=payload,
-            timeout=timeout_s,
+            timeout=(5, timeout_s),
         )
-    except requests.RequestException as exc:
-        raise TransientError(f"ORS request failed: {exc}") from exc
+    except httpx.HTTPError as exc:
+        raise failure(f"ORS {profile} travel-time lookup failed ({type(exc).__name__}). Retry later or explicitly select another travel mode.") from exc
     if response.status_code in RETRYABLE_STATUS:
         retry_after = retry_after_seconds(response.headers.get("Retry-After"))
         if gate and retry_after is not None:
             gate.defer(retry_after)
-        raise TransientError(
-            f"ORS returned HTTP {response.status_code}",
-            retry_after_s=retry_after,
-        )
-    if not response.ok:
+        if not retry_transient:
+            raise RuntimeError(f"ORS {profile} travel-time lookup returned HTTP {response.status_code}. Retry later or select another travel mode.")
+        raise TransientError(f"ORS returned HTTP {response.status_code}", retry_after_s=retry_after)
+    if not response.is_success:
         detail = response.text.strip().replace("\n", " ")[:300]
         raise RuntimeError(f"ORS returned HTTP {response.status_code}: {detail}")
     result = response.json()

@@ -1,4 +1,5 @@
 import { useCancelRun } from "./run.mutations";
+import { LoadingText } from "../../components/LoadingText";
 
 interface RunControlsProps {
   runId: string;
@@ -15,7 +16,7 @@ export function RunControls({ runId, terminal }: RunControlsProps) {
       disabled={cancelMutation.isPending}
       onClick={() => cancelMutation.mutate()}
     >
-      {cancelMutation.isPending ? "Cancelling…" : "Cancel run"}
+      {cancelMutation.isPending ? <LoadingText>Cancelling</LoadingText> : "Cancel run"}
     </button>
   );
 }

@@ -117,16 +117,16 @@ def test_pareto_cancel_keeps_the_last_completed_checkpoint():
     assert [index for index, _ in checkpoints] == [0]
 
 
-def test_mclp_explicitly_runs_cbc_with_one_thread(monkeypatch):
+def test_mclp_explicitly_runs_cbc_in_serial_mode(monkeypatch):
     """Process-level Pareto parallelism must not nest CBC thread pools."""
     seen = []
-    original = models.pulp.PULP_CBC_CMD
+    original = models.pulp.COIN_CMD.__init__
 
-    def command(*args, **kwargs):
+    def command(self, *args, **kwargs):
         seen.append(kwargs)
-        return original(*args, **kwargs)
+        original(self, *args, **kwargs)
 
-    monkeypatch.setattr(models.pulp, "PULP_CBC_CMD", command)
+    monkeypatch.setattr(models.pulp.COIN_CMD, "__init__", command)
     models.solve_mclp(
         np.array([[1.0, 99.0], [99.0, 1.0]]),
         np.array([1.0, 2.0]),
@@ -138,7 +138,7 @@ def test_mclp_explicitly_runs_cbc_with_one_thread(monkeypatch):
         "test",
         None,
     )
-    assert seen and seen[-1]["threads"] == 1
+    assert seen and seen[-1]["threads"] == 0
 
 
 def test_landsat_header_probes_are_bounded_and_preserve_order(monkeypatch):

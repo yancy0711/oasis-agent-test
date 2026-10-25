@@ -304,17 +304,26 @@ def render_diagnostic_report(recovery: dict | None, diagnostics: dict) -> str:
     facilities = diagnostics.get("minimum_facilities", {})
     if facilities:
         value = facilities.get("minimum_facilities")
-        lines += ["", "## Fixed-threshold lower bound", f"- Feasible: {facilities.get('feasible', False)}",
-                  f"- Minimum facilities: {value if value is not None else 'not achievable with current candidates'}",
+        display = value if value is not None else (
+            "not achievable with current candidates" if facilities.get("solver_status") == "Infeasible"
+            else "not established within the time budget"
+        )
+        lines += ["", "## Fixed-threshold search", f"- Feasible: {facilities.get('feasible', False)}",
+                  f"- Minimum facilities: {display}",
+                  f"- Feasible facility count: {facilities.get('feasible_facility_count', value)}",
                   f"- Threshold: {facilities.get('threshold_minutes', 'unknown')} minutes"]
     threshold = diagnostics.get("minimum_threshold", {})
     if threshold:
         value = threshold.get("minimum_threshold_minutes")
-        display = f"{value:.1f} minutes" if value is not None else "not achievable with the current travel matrix"
-        lines += ["", "## Fixed-budget lower bound", f"- Feasible: {threshold.get('feasible', False)}",
+        complete = threshold.get("search_complete", True)
+        display = f"{value:.1f} minutes" if value is not None else (
+            "not achievable with the current travel matrix" if complete else "not established within the time budget"
+        )
+        label = "Minimum threshold" if complete else "Best feasible threshold (minimum not proven)"
+        lines += ["", "## Fixed-budget threshold search", f"- Feasible: {threshold.get('feasible', False)}",
                   f"- Search status: {threshold.get('search', {}).get('status', 'complete')}",
                   f"- Search elapsed: {threshold.get('search', {}).get('elapsed_seconds', 'unknown')} seconds",
-                  f"- Minimum threshold: {display}", f"- Facilities: {threshold.get('n_facilities', 'unknown')}"]
+                  f"- {label}: {display}", f"- Facilities: {threshold.get('n_facilities', 'unknown')}"]
     approximate_threshold = diagnostics.get("approximate_minimum_threshold", {})
     if approximate_threshold:
         value = approximate_threshold.get("minimum_threshold_minutes")

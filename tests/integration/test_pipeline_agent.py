@@ -220,7 +220,7 @@ def test_cli_pipeline_matches_manual_seven_tool_chain(monkeypatch, tmp_path):
     monkeypatch.setattr(workflow, "fetch_acs", lambda *args: raw)
     monkeypatch.setattr(workflow, "fetch_tract_geometry", lambda *args: tracts)
     monkeypatch.setattr(workflow, "fetch_heat_exposure", lambda *args, **kwargs: (heat, Provenance(source="fake heat", record_count=3)))
-    monkeypatch.setattr(workflow, "fetch_candidates", lambda *args: (candidates, None))
+    monkeypatch.setattr(workflow, "fetch_candidates", lambda *args, **kwargs: (candidates, None))
 
     cfg = {"llm": {}, "data": {"landsat_environment_indices": {"enabled": False}},
            "accessibility": {"router": "haversine", "threshold_minutes": 15},

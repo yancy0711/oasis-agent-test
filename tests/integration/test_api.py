@@ -122,13 +122,13 @@ class FakeService:
                 "parent_run_id": run_id, "revision": 1,
                 "reuse": ["travel_matrix"], "recompute": ["optimization"]}
 
-    def plan_point_route(self, run_id: str, longitude: float, latitude: float, mode: str) -> dict:
+    def plan_point_route(self, run_id: str, longitude: float, latitude: float, mode: str, **kwargs) -> dict:
         self.calls.append(("route", run_id, longitude, latitude, mode))
         if run_id != "run-1": raise KeyError("Unknown run")
         return {"type": "FeatureCollection", "features": [],
                 "summary": {"destination_id": "site-1", "duration_minutes": 7.5}}
 
-    def plan_place_route(self, run_id: str, query: str, mode: str) -> dict:
+    def plan_place_route(self, run_id: str, query: str, mode: str, **kwargs) -> dict:
         self.calls.append(("place_route", run_id, query, mode))
         if run_id != "run-1": raise KeyError("Unknown run")
         return {"type": "FeatureCollection", "features": [],

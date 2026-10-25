@@ -35,6 +35,13 @@ def with_retry(max_retries: int = 4, base: float = 1.5) -> Callable:
                     )
                     log.warning("retry %s (%d/%d): %s -- sleeping %.1fs",
                                 fn.__name__, attempt + 1, max_retries, e, delay)
-                    time.sleep(delay)
+                    check = kwargs.get("cancel_check") or kwargs.get("check")
+                    if check:
+                        until = time.monotonic() + delay
+                        while time.monotonic() < until:
+                            check()
+                            time.sleep(min(0.1, max(0.0, until - time.monotonic())))
+                    else:
+                        time.sleep(delay)
         return wrapper
     return deco

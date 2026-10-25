@@ -5,7 +5,7 @@ export default defineConfig({
   timeout: 30_000,
   use: {
     baseURL: "http://127.0.0.1:5173",
-    channel: "msedge",
+    ...(process.platform === "win32" ? { channel: "msedge" } : {}),
     headless: true,
   },
   webServer: {

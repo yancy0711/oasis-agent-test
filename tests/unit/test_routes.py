@@ -7,6 +7,11 @@ from shapely.geometry import LineString, Point, box
 from oasis.core.spatial.routes import _directions_url, _length_weighted_environment, plan_point_to_nearest_site
 
 
+@pytest.fixture(autouse=True)
+def isolated_route_cache(monkeypatch, tmp_path):
+    monkeypatch.setattr("oasis.core.spatial.routes.cache_dir", lambda _name: tmp_path)
+
+
 def test_matrix_url_converts_to_directions_geojson():
     assert _directions_url(
         "https://api.heigit.org/openrouteservice/v2/matrix", "foot-walking"
@@ -113,3 +118,46 @@ def test_point_route_shortlists_before_calling_ors(monkeypatch):
     assert len(captured["locations"]) == 6
     assert result["summary"]["selected_facility_pool"] == 12
     assert result["summary"]["ors_shortlist_size"] == 5
+
+
+def test_interactive_matrix_timeout_is_not_retried(monkeypatch):
+    import httpx
+    from oasis.core.spatial.accessibility import backend
+    calls = []
+    def timeout(*args, **kwargs):
+        calls.append(kwargs)
+        raise httpx.ReadTimeout("read timed out")
+    monkeypatch.setattr(backend, "cancellable_request", timeout)
+    with pytest.raises(RuntimeError, match="foot-walking.*ReadTimeout"):
+        backend.post_ors("https://example.test/matrix/foot-walking", "test", {}, 15, retry_transient=False)
+    assert len(calls) == 1
+
+
+def test_interactive_directions_timeout_is_not_retried(monkeypatch):
+    import httpx
+    from oasis.core.spatial import routes
+    calls = []
+    def timeout(*args, **kwargs):
+        calls.append(kwargs)
+        raise httpx.ReadTimeout("read timed out")
+    monkeypatch.setattr(routes, "cancellable_request", timeout)
+    with pytest.raises(RuntimeError, match="directions failed.*ReadTimeout"):
+        routes._request_route("https://example.test/directions/foot-walking/geojson", "test", [0,0], [0,1], 15, routes.RequestGate(0), None)
+    assert len(calls) == 1
+
+
+def test_point_route_reuses_matrix_only_for_identical_origin_and_profile(monkeypatch):
+    from oasis.core.spatial import routes
+    areas = gpd.GeoDataFrame({"GEOID": ["1"], "mean_lst": [35.]}, geometry=[box(-118,33,-117,34)], crs=4326)
+    sites = gpd.GeoDataFrame({"cand_id": ["site"]}, geometry=[Point(-117.37,33.98)], crs=4326)
+    calls = []
+    def matrix(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"durations": [[60.]]}
+    monkeypatch.setenv("ORS_API_KEY", "test")
+    monkeypatch.setattr(routes, "post_ors", matrix)
+    monkeypatch.setattr(routes, "_cached_route", lambda *args, **kwargs: ({"type": "Feature", "geometry": {"type": "LineString", "coordinates": [[-117.38,33.98],[-117.37,33.98]]}, "properties": {"summary": {"duration": 60, "distance": 1000}}}, "cache"))
+    for mode in ["cycling", "cycling", "driving"]:
+        routes.plan_point_to_nearest_site(-117.38,33.98,areas,sites,["site"],mode=mode)
+    assert len(calls) == 2
+    assert all(call[1]["retry_transient"] is False for call in calls)

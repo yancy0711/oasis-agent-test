@@ -1,5 +1,6 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import { InfoLabel } from "../../components/InfoLabel";
+import { LoadingText } from "../../components/LoadingText";
 import { useAppStore } from "../../store/appStore";
 import { DataTable } from "../result/ResultShared";
 import { useComparisonRuns } from "./comparison.queries";
@@ -37,7 +38,7 @@ export function ScenarioComparison() {
   const queries = useComparisonRuns(selectedIds);
   if (completed.length < 2) return <p className="empty-tab">Complete two successful runs to compare scenarios.</p>;
   if (selectedIds.length < 2 || queries.some((query) => query.isLoading)) {
-    return <p className="empty-tab">Loading the two comparison runs…</p>;
+    return <p className="empty-tab"><LoadingText>Loading the two comparison runs</LoadingText></p>;
   }
   const failed = queries.find((query) => query.isError);
   if (failed) return <p className="error error--block">{failed.error?.message ?? "Could not load a comparison run."}</p>;
@@ -58,7 +59,7 @@ export function ScenarioComparison() {
       return <label className="field" key={label}><InfoLabel label={label}>{index === 0 ? "Selects the reference run against which changes are measured." : "Selects the run whose settings and outcomes are compared with the baseline."}</InfoLabel><select aria-label={label} value={entry.value} onChange={(event) => entry.set(event.target.value)}><option value="">Select a run</option>{completed.map((runId) => <option key={runId} value={runId}>{runId.slice(0, 8)}</option>)}</select></label>;
     })}</div>
     <div className="comparison-cards">{summaries.map((item) => <article key={item.runId}><span>{item.runId.slice(0, 8)} · {item.mode} · {item.accuracy ?? "unknown accuracy"}</span><strong>{item.place}</strong><small>{weightsLabel(item.weights)}</small><dl><div><dt>Facilities</dt><dd>{item.facilities}</dd></div><div><dt>Threshold</dt><dd>{item.threshold} min</dd></div><div><dt>Coverage</dt><dd>{formatPercent(item.coverage)}</dd></div><div><dt>Priority population</dt><dd>{formatPercent(item.vulnerable)}</dd></div></dl></article>)}</div>
-    {baseline?.mapUrl && alternative?.mapUrl && <Suspense fallback={<p className="muted">Loading comparison map…</p>}><ComparisonMap baselineUrl={baseline.mapUrl} alternativeUrl={alternative.mapUrl} baselineLabel={`Baseline ${baseline.runId.slice(0, 8)}`} alternativeLabel={`Alternative ${alternative.runId.slice(0, 8)}`} /></Suspense>}
+    {baseline?.mapUrl && alternative?.mapUrl && <Suspense fallback={<p className="muted"><LoadingText>Loading comparison map</LoadingText></p>}><ComparisonMap baselineUrl={baseline.mapUrl} alternativeUrl={alternative.mapUrl} baselineLabel={`Baseline ${baseline.runId.slice(0, 8)}`} alternativeLabel={`Alternative ${alternative.runId.slice(0, 8)}`} /></Suspense>}
     {deltas.length > 0 && <section><h3>Alternative − baseline</h3><DataTable data={deltas} /></section>}
     {alternative && Object.keys(alternative.diagnostics.scenario_comparison && typeof alternative.diagnostics.scenario_comparison === "object" ? alternative.diagnostics.scenario_comparison as object : {}).length > 0 && <details><summary>Within-run deterministic comparison</summary><pre className="json-view">{JSON.stringify(alternative.diagnostics.scenario_comparison, null, 2)}</pre></details>}
   </div>;

@@ -1,11 +1,11 @@
-import { useRef, useState, type FormEvent } from "react";
+import { useCallback, useRef, useState, type FormEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { PlaceResolveResponse, RouteOriginCandidate, RoutingMode, TaskSpec } from "../../api/models";
 import type { RequestDisposition } from "../../api/models";
 import { getConfig, reverseRouteOrigin, searchRouteOrigin } from "../../api/client";
 import { configKeys } from "../../api/queryKeys";
 import { useAppStore } from "../../store/appStore";
-import { useStartRun } from "../run/run.mutations";
+import { useStartRun, useStopActiveRun } from "../run/run.mutations";
 import { isTerminalRun } from "../run/run.selectors";
 import { useRunPolling } from "../run/useRunPolling";
 import { PlaceConfirmation } from "./PlaceConfirmation";
@@ -21,7 +21,24 @@ import {
   useUploadCandidates,
 } from "./task.mutations";
 
+import { ResidentWorkspace, type ResidentRequest } from "../resident/ResidentWorkspace";
+import { residentPost, type Interpretation, type Preferences } from "../resident/residentApi";
+
 export function TaskWorkspace() {
+  const audience = useAppStore((state) => state.audience);
+  const setAudience = useAppStore((state) => state.setAudience);
+  const [residentRequest, setResidentRequest] = useState<ResidentRequest | null>(null);
+  const [residentBusy, setResidentBusy] = useState(false);
+  const [residentCancel, setResidentCancel] = useState(0);
+  const [interpreting, setInterpreting] = useState(false);
+  const [intentMessage, setIntentMessage] = useState("");
+  const [intentError, setIntentError] = useState("");
+  const [autoDetect, setAutoDetect] = useState(true);
+  const entryController = useRef<AbortController | null>(null);
+  const residentPreferences = useRef<Preferences | null>(null);
+  const residentStop = useRef<(() => Promise<void>) | null>(null);
+  const rememberResidentStop = useCallback((stop: (() => Promise<void>) | null) => { residentStop.current = stop; }, []);
+  const rememberPreferences = useCallback((value: Preferences) => { residentPreferences.current = value; }, []);
   const [task, setTask] = useState<TaskSpec | null>(null);
   const [resolution, setResolution] = useState<PlaceResolveResponse | null>(null);
   const [mode, setMode] = useState<RoutingMode>("auto");
@@ -46,6 +63,7 @@ export function TaskWorkspace() {
   const confirmMutation = useConfirmPlace();
   const uploadMutation = useUploadCandidates();
   const startMutation = useStartRun();
+  const stopActiveRun = useStopActiveRun();
   const activeRunQuery = useRunPolling(activeRunId);
   const candidateSelectionLocked = draftLocked && Boolean(
     activeRunId && (!activeRunQuery.data || !isTerminalRun(activeRunQuery.data))
@@ -67,12 +85,14 @@ export function TaskWorkspace() {
   const error = parseError ?? resolveMutation.error ?? confirmMutation.error
     ?? uploadMutation.error ?? startMutation.error;
 
-  async function resolve(name: string) {
+  async function resolve(name: string, signal?: AbortSignal) {
     try {
       const value = await resolveMutation.mutateAsync(name);
+      if (signal?.aborted) return null;
       setResolution(value);
       return value;
     } catch (reason) {
+      if (signal?.aborted) return null;
       const message = reason instanceof Error ? reason.message : String(reason);
       if (message.includes("outside the United States") || message.includes("supports US city and county")) {
         resolveMutation.reset();
@@ -118,7 +138,8 @@ export function TaskWorkspace() {
           reason: "Checking that the study area is a supported US city or county.",
           alternative: "",
         });
-        const resolved = await resolve(nextTask.place_name);
+        const resolved = await resolve(nextTask.place_name, controller.signal);
+        if (controller.signal.aborted) return;
         if (resolved) setDecision(parsedDecision);
       } else setDecision(parsedDecision);
     } catch (reason) {
@@ -128,10 +149,94 @@ export function TaskWorkspace() {
     }
   }
 
+  async function submitPrompt(prompt: string) {
+    const stopping = interruptWork();
+    const controller = new AbortController();
+    entryController.current = controller;
+    setInterpreting(true); setIntentError(""); setIntentMessage("Identifying the requested workflow...");
+    try {
+      await stopping;
+      controller.signal.throwIfAborted();
+      if (!autoDetect) {
+        setIntentMessage(`${audience === "research" ? "Research and planning" : "Nearby-place search"}: manually selected.`);
+        if (audience === "research") { setResidentRequest(null); await analyze(prompt); }
+        else setResidentRequest({ id: crypto.randomUUID(), prompt });
+        return;
+      }
+      const interpretation = await residentPost<Interpretation>("/api/v1/requests/interpret", {
+        prompt, audience, previous: audience === "personal" ? residentPreferences.current : null,
+        llm_session_id: useAppStore.getState().llmSessionId,
+      }, controller.signal);
+      controller.signal.throwIfAborted();
+      if (interpretation.workflow === "clarify") { setIntentMessage(interpretation.reason); return; }
+      const next = interpretation.workflow;
+      setIntentMessage(`${next === "personal" ? "Nearby-place search" : "Research and planning"}${next !== audience ? " - switched workspace" : ""}: ${interpretation.reason}`);
+      setAudience(next);
+      if (next === "personal" && interpretation.preferences) {
+        setResidentRequest({ id: crypto.randomUUID(), prompt, preferences: interpretation.preferences });
+      } else {
+        setResidentRequest(null);
+        await analyze(prompt);
+      }
+    } catch (reason) {
+      if (!controller.signal.aborted) setIntentError(reason instanceof Error ? reason.message : "Could not identify the task. Please retry.");
+    } finally {
+      if (entryController.current === controller) { entryController.current = null; setInterpreting(false); }
+    }
+  }
+
   function cancelAnalysis() {
+    entryController.current?.abort(); entryController.current = null; setInterpreting(false);
     parseController.current?.abort();
     parseController.current = null;
     parseMutation.reset();
+  }
+
+  function interruptWork() {
+    cancelAnalysis();
+    useAppStore.getState().interruptTask();
+    const nearbyStopped = residentStop.current?.();
+    setResidentCancel((n) => n + 1);
+    return Promise.all([stopActiveRun(), nearbyStopped]);
+  }
+
+  async function changeAudience(next: "research" | "personal") {
+    if (next === audience) {
+      cancelAnalysis(); setAutoDetect(false); setIntentMessage(""); setIntentError("");
+      return;
+    }
+    const stopping = interruptWork();
+    const controller = new AbortController();
+    entryController.current = controller;
+    setInterpreting(true); setIntentMessage(""); setIntentError("");
+    try {
+      await stopping;
+      controller.signal.throwIfAborted();
+      setResidentRequest(null);
+      setAudience(next);
+      setAutoDetect(false);
+    } catch (reason) {
+      if (!controller.signal.aborted) setIntentError(reason instanceof Error ? reason.message : "Could not stop the previous task.");
+    } finally {
+      if (entryController.current === controller) { entryController.current = null; setInterpreting(false); }
+    }
+  }
+
+  async function handleUseLocation() {
+    const stopping = interruptWork();
+    const controller = new AbortController();
+    entryController.current = controller;
+    setInterpreting(true); setIntentError(""); setIntentMessage("");
+    try {
+      await stopping;
+      controller.signal.throwIfAborted();
+      if (audience === "personal") setResidentRequest({ id: crypto.randomUUID(), prompt: "", locate: true });
+      else handleCurrentLocation();
+    } catch (reason) {
+      if (!controller.signal.aborted) setIntentError(reason instanceof Error ? reason.message : "Could not stop the previous task.");
+    } finally {
+      if (entryController.current === controller) { entryController.current = null; setInterpreting(false); }
+    }
   }
 
   async function confirmResolution(target: PlaceResolveResponse, candidateId: string) {
@@ -198,7 +303,7 @@ export function TaskWorkspace() {
     }
   }
 
-  function useCurrentLocation() {
+  function handleCurrentLocation() {
     setConfirmedPlace(null);
     setResolution(null);
     setRouteOriginCandidates([]);
@@ -313,7 +418,8 @@ export function TaskWorkspace() {
   }
 
   function run(values: TaskFormValues) {
-    if (!task || !confirmedPlace) return;
+    if (!task || !confirmedPlace || interpreting) return;
+    useAppStore.getState().interruptTask();
     setDraftLocked(true);
     const executable = toTaskSpec(task, values, confirmedPlace.canonical_name);
     startMutation.mutate({
@@ -392,11 +498,19 @@ export function TaskWorkspace() {
         <p className="eyebrow">Policy and research decision support</p>
         <h1>OASIS: A bounded LLM agent for auditable, equity-aware cooling center siting</h1>
         <LlmSettings defaults={configQuery.data?.agent as Record<string, unknown> | undefined} />
-        <PromptInput pending={parseMutation.isPending} onSubmit={(prompt) => void analyze(prompt)} onCancel={cancelAnalysis} onUseLocation={useCurrentLocation} />
-        {decision && <div className={`request-decision request-decision--${decision.disposition}`} role="status"><strong>{decision.disposition.replaceAll("_", " ")}</strong><span>{decision.reason}</span>{decision.alternative && <span>{decision.alternative}</span>}</div>}
-        {error && <p className="error error--block">{error instanceof Error ? error.message : "The request failed."}</p>}
+          <PromptInput audience={audience} autoDetect={autoDetect} onAutoDetectChange={setAutoDetect} pending={interpreting || (audience === "personal" ? residentBusy : parseMutation.isPending)}
+          onSubmit={(prompt) => void submitPrompt(prompt)}
+          onAudienceChange={(next) => void changeAudience(next)}
+          onCancel={() => { void interruptWork().catch((reason: unknown) => setIntentError(reason instanceof Error ? reason.message : "Could not stop the previous task.")); }}
+          onUseLocation={() => void handleUseLocation()} />
+        {intentMessage && <p role="status" className="notice">{intentMessage}</p>}
+        {intentError && <p role="alert" className="error">{intentError}</p>}
+        {audience === "research" && decision && <div className={`request-decision request-decision--${decision.disposition}`} role="status"><strong>{decision.disposition.replaceAll("_", " ")}</strong><span>{decision.reason}</span>{decision.alternative && <span>{decision.alternative}</span>}</div>}
+        {audience === "research" && error && <p className="error error--block">{error instanceof Error ? error.message : "The request failed."}</p>}
       </section>
 
+      {audience === "personal" && <ResidentWorkspace request={residentRequest} cancelVersion={residentCancel} onBusy={setResidentBusy} onPreferencesChange={rememberPreferences} onCancelReady={rememberResidentStop} />}
+      {audience === "research" && <>
       {task && routeOriginCandidates.length > 0 && (
         <details className="panel mobile-step-panel" data-study-area-step open={routeStepOpen} onToggle={(event) => setRouteStepOpen(event.currentTarget.open)}>
           <summary>
@@ -474,7 +588,7 @@ export function TaskWorkspace() {
           task={task}
           mode={mode}
           ready={Boolean(confirmedPlace)}
-          pending={startMutation.isPending}
+          pending={startMutation.isPending || interpreting}
           uploadPending={uploadMutation.isPending}
           uploadedName={uploadedName}
           profiles={profiles}
@@ -484,6 +598,7 @@ export function TaskWorkspace() {
           onSubmit={run}
         />
       )}
+      </>}
     </div>
   );
 }

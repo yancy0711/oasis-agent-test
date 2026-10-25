@@ -1,6 +1,7 @@
 /* The exported Markdown normalizer is intentionally unit-tested alongside this view. */
 /* eslint-disable react-refresh/only-export-components */
 import { useQuery } from "@tanstack/react-query";
+import { LoadingText } from "../../components/LoadingText";
 import rehypeKatex from "rehype-katex";
 import ReactMarkdown from "react-markdown";
 import remarkMath from "remark-math";
@@ -67,7 +68,7 @@ export function ReportView({ runId, url, narrative, recoveryText }: ReportViewPr
     if (recoveryText) return <article className="report-view"><h3>Feasibility diagnostic</h3><p>{recoveryText}</p></article>;
     return <p className="empty-tab">No report artifact is available.</p>;
   }
-  if (report.isLoading) return <p className="empty-tab">Loading report…</p>;
+  if (report.isLoading) return <p className="empty-tab"><LoadingText>Loading report</LoadingText></p>;
   if (report.isError) return <p className="error error--block">{report.error.message}</p>;
   return <article className="report-view"><a className="download-link" href={url} download>Download Markdown</a><ReactMarkdown {...markdownPlugins}>{normalizeReportMarkdown(report.data ?? "")}</ReactMarkdown></article>;
 }

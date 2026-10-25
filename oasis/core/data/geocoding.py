@@ -7,6 +7,8 @@ import re
 
 import geopandas as gpd
 import requests
+import httpx
+from oasis.core.http import cancellable_request
 from shapely.geometry import shape
 
 from oasis.core.cache import (
@@ -113,9 +115,27 @@ def search_place_candidates(place_name: str, limit: int = 5) -> list[dict]:
     response.raise_for_status(); return response.json()
 
 
+def search_origin_candidates(query: str, limit: int = 5, *, countrycodes: str | None = None, viewbox: tuple | None = None, check=lambda: None) -> list[dict]:
+    """Try the supplied name, then US centre/center spelling in the same scope."""
+    if countrycodes == "us":
+        # Expand whole-place shorthand only; never rewrite street/landmark names.
+        alias = re.sub(r"[.\s]+", "", query).casefold()
+        query = {"la": "Los Angeles, California", "losangeles": "Los Angeles, California",
+                 "dc": "Washington, District of Columbia", "nyc": "New York City, New York"}.get(alias, query)
+    us_query = re.sub(r"\bcentres\b", "centers", query, flags=re.I)
+    us_query = re.sub(r"\bcentre\b", "center", us_query, flags=re.I)
+    for variant in dict.fromkeys((query, us_query)):
+        rows = _search_origin_candidates(variant, limit=limit, countrycodes=countrycodes,
+                                         viewbox=viewbox, check=check)
+        if rows:
+            return rows
+    return []
+
+
 @with_retry(max_retries=3)
-def search_origin_candidates(query: str, limit: int = 5) -> list[dict]:
+def _search_origin_candidates(query: str, limit: int = 5, *, countrycodes: str | None = None, viewbox: tuple | None = None, check=lambda: None) -> list[dict]:
     """Geocode an address or named point for an on-demand route origin."""
+    check()
     query = query.strip()
     if not query:
         raise ValueError("route origin must not be empty")
@@ -123,6 +143,11 @@ def search_origin_candidates(query: str, limit: int = 5) -> list[dict]:
         "q": query, "format": "jsonv2",
         "addressdetails": 1, "limit": limit,
     }
+    if countrycodes:
+        params["countrycodes"] = countrycodes
+    if viewbox is not None:
+        west, south, east, north = viewbox
+        params.update(viewbox=f"{west},{north},{east},{south}", bounded=1)
     key = hashlib.sha256(
         json.dumps({**params, "q": query.casefold()}, sort_keys=True).encode()
     ).hexdigest()[:16]
@@ -130,16 +155,19 @@ def search_origin_candidates(query: str, limit: int = 5) -> list[dict]:
     root.mkdir(parents=True, exist_ok=True)
     path = root / f"origin_{key}.json"
     if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    response = requests.get(
-        NOMINATIM_URL, params=params,
-        headers={"User-Agent": "oasis-agent/0.1"}, timeout=30,
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        if cached:
+            return cached
+    response = cancellable_request(
+        "GET", NOMINATIM_URL, params=params, check=check,
+        headers={"User-Agent": "oasis-agent/0.1"}, timeout=(5, 30),
     )
     if response.status_code in RETRYABLE_STATUS:
         raise TransientError(f"Nominatim {response.status_code}")
     response.raise_for_status()
     rows = response.json()
-    atomic_write_text(path, json.dumps(rows))
+    if rows:  # Do not persist empty landmark matches indefinitely.
+        atomic_write_text(path, json.dumps(rows))
     return rows
 
 
@@ -249,8 +277,9 @@ def resolve_origin_candidates(query: str, limit: int = 8) -> list[dict]:
 
 
 @with_retry(max_retries=3)
-def reverse_origin_address(latitude: float, longitude: float) -> dict:
+def reverse_origin_address(latitude: float, longitude: float, *, check=lambda: None) -> dict:
     """Return a cached county-level address for a resolved origin coordinate."""
+    check()
     params = {
         "lat": round(float(latitude), 6), "lon": round(float(longitude), 6),
         "format": "jsonv2", "addressdetails": 1, "zoom": 10,
@@ -261,9 +290,9 @@ def reverse_origin_address(latitude: float, longitude: float) -> dict:
     path = root / f"reverse_{key}.json"
     if path.exists():
         return json.loads(path.read_text(encoding="utf-8")).get("address", {})
-    response = requests.get(
-        NOMINATIM_REVERSE_URL, params=params,
-        headers={"User-Agent": "oasis-agent/0.1"}, timeout=30,
+    response = cancellable_request(
+        "GET", NOMINATIM_REVERSE_URL, params=params, check=check,
+        headers={"User-Agent": "oasis-agent/0.1"}, timeout=(5, 30),
     )
     if response.status_code in RETRYABLE_STATUS:
         raise TransientError(f"Nominatim {response.status_code}")
@@ -288,7 +317,7 @@ def _route_parent(row: dict) -> tuple[str | None, str | None]:
         return parent, state
     try:
         reverse = reverse_origin_address(float(latitude), float(longitude))
-    except (requests.RequestException, TransientError, ValueError, json.JSONDecodeError):
+    except (requests.RequestException, httpx.HTTPError, TransientError, ValueError, json.JSONDecodeError):
         return parent, state
     reverse_locality = next(
         (reverse.get(key) for key in ("city", "town", "municipality", "village") if reverse.get(key)),
@@ -334,7 +363,7 @@ def route_origin_options(
     if not context and not positional_hint and len(entity.split()) >= 2:
         try:
             boundary_rows = search_place_candidates(entity, limit=limit)
-        except (requests.RequestException, TransientError, ValueError, json.JSONDecodeError):
+        except (requests.RequestException, httpx.HTTPError, TransientError, ValueError, json.JSONDecodeError):
             # This optional exact-boundary probe must not block origin search.
             boundary_rows = []
         exact_administrative = [
@@ -457,7 +486,7 @@ def select_place_candidate(place_name: str, expect_level: int | None = None) -> 
     if not rows:
         try:
             unrestricted = search_origin_candidates(place_name, limit=5)
-        except (requests.RequestException, TransientError, ValueError, json.JSONDecodeError):
+        except (requests.RequestException, httpx.HTTPError, TransientError, ValueError, json.JSONDecodeError):
             unrestricted = []
         if unrestricted and not any(
             row.get("address", {}).get("country_code") == "us" for row in unrestricted

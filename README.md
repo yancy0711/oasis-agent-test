@@ -7,9 +7,9 @@ OASIS is an auditable autonomous GIS and LLM-GIS decision-support agent for eval
 - Policy analysts and planners: compare candidate-facility portfolios under budget, travel-time, capacity, and equity constraints.
 - Public-health teams: inspect population-weighted heat exposure, vulnerable-population coverage, and hard-to-reach areas.
 - Academic researchers: run reproducible efficiency-Gini, mobility, vulnerability, and threshold sensitivity analyses with provenance.
-- Residents and visitors: plan a route from a confirmed point to a selected candidate facility after a study-area run.
+- Residents and visitors: find nearby candidate cooling places and routes from a confirmed US starting point, without a study-area run or facility budget.
 
-OASIS is not a real-time navigation or emergency service. Its route planner uses the candidate facilities computed for a confirmed study area; it does not verify live opening status, provide emergency advice, search vacant land, or make zoning decisions.
+OASIS is not a real-time navigation or emergency service. Researcher map routes use selected facilities from a confirmed study-area run. Resident search checks nearby OSM candidates independently. Neither workflow verifies live opening status, provides emergency advice, searches vacant land, or makes zoning decisions.
 
 ## Main capabilities
 
@@ -25,20 +25,20 @@ OASIS is not a real-time navigation or emergency service. Its route planner uses
 
 Candidate facilities are possible existing service locations, not confirmed cooling centers. Unknown opening hours, fees, access, capacity, and official status remain explicit.
 
-## Supported question types and boundaries
+## Use cases
 
-Supported requests fall into four user-facing workflows:
+**Researcher / planner.** Analyze cooling-facility access in a US city or county, diagnose underserved areas, compare scenarios, and explore efficiency-equity Pareto trade-offs. Results include interactive maps, coverage and fairness metrics, reports, and data provenance.
 
-1. **Full analysis:** select existing candidate facilities and evaluate efficiency, coverage, vulnerability, Gini, capacity, environment, and Pareto trade-offs.
-2. **Quick diagnostic:** rank or inspect tracts using available heat exposure, configured vulnerability, candidate accessibility, or a transparent vulnerability-access gap score.
-3. **Route planning:** confirm a point or browser location, prepare candidates in its city or county, and request an ORS route to a nearby selected facility.
-4. **Comparison:** compare registered value profiles, mobility assumptions, saved runs, selected facilities, and efficiency-equity outcomes.
+```text
+Select 10 candidate cooling facilities in Riverside, California within a 15-minute walk.
+Which Riverside tracts are hardest to serve? Compare efficiency and access inequality.
+```
 
-`Needs clarification` and `out of scope` are routing outcomes rather than additional workflows. A request needs clarification when its place, origin, comparison profiles, or decision parameters cannot be confirmed safely.
+**Individual resident.** Find nearby candidate cooling places from an address, a map point, or your current location. Filter by place category and walking, cycling, or driving time, then select a destination for directions. No facility budget or analysis run is required; listed places are not guaranteed to be officially designated or currently open cooling centers.
 
-The built-in tract evidence is limited to Census population and configured vulnerability indicators, Landsat-derived heat and environmental diagnostics, and computed candidate accessibility. A requested property that is not supplied by these sources, for example crime, mortality, observed illness, real-time occupancy, or parcel suitability, is out of scope for the current run. OASIS should suggest an official city/county or research source and require a reviewed data adapter, version, missing-value policy, and indicator direction before that property can enter analysis. It does not silently substitute another dataset.
-
-Request interpretation is schema-first: one `analysis_goal` controls the executable workflow, `result_queries` holds independent read-only answers, `place_names` retains every detected study area for confirmation, and `ambiguities` records fields the model could not safely resolve. One run uses one confirmed city or county; analyze additional places separately and compare the saved runs.
+```text
+I'm at Riverside Convention Center, California. Find shopping malls within a 15-minute walk.
+```
 
 ## Code layout
 
@@ -56,7 +56,7 @@ oasis-agent/
 |   `-- src/
 |       |-- api/         # API client and generated OpenAPI types
 |       |-- components/  # Shared UI controls
-|       |-- features/    # Task, run, result, and comparison interfaces
+|       |-- features/    # Task, resident search, run, result, and comparison interfaces
 |       |-- store/       # Browser-session state
 |       `-- styles/      # Global responsive styling
 |-- tests/               # Unit and integration tests
@@ -64,7 +64,9 @@ oasis-agent/
 |-- notebooks/           # Minimal API-driven agent quickstart
 ```
 
-See [PIPELINE.md](PIPELINE.md) for the computational workflow.
+See [PIPELINE.md](PIPELINE.md) for the computational workflow and [DEPLOYMENT.md](DEPLOYMENT.md) for Docker setup and Mac migration.
+
+The LLM interprets intent into typed contracts; deterministic tools acquire data, build matrices, solve the confirmed model, and record provenance. Research analysis uses a confirmed city/county and produces a facility portfolio. Resident search uses a confirmed point and finds nearby existing places without invoking the portfolio solver. UI mode overrides remain available. Efficiency-Gini exploration is an approximate trade-off frontier, not a certified globally optimal Gini frontier.
 
 ## Requirements
 
@@ -85,8 +87,8 @@ If a system Python installation cannot resolve GDAL, use
 | [US Census TIGER/Line](https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html) | Tract, block-group, city, and county geometry | Public download; no key |
 | [Microsoft Planetary Computer Landsat](https://planetarycomputer.microsoft.com/dataset/group/landsat) | LST, NDVI, NDBI, and albedo diagnostics | Public catalog; no key |
 | [WorldPop data](https://data.worldpop.org/GIS/Population/Global_2015_2030/) and [STAC API](https://api.stac.worldpop.org/api.html) | Optional 100 m population grid | Public download; no key for normal access |
-| [OpenStreetMap](https://www.openstreetmap.org/copyright) and [Nominatim](https://operations.osmfoundation.org/policies/nominatim/) | Candidate facilities and geocoding | Public service; follow usage policies |
-| [openrouteservice](https://api.openrouteservice.org/) | Network matrices and point routes | [Create an account and API key](https://openrouteservice.org/sign-up/) |
+| [OpenStreetMap](https://www.openstreetmap.org/copyright) and [Nominatim](https://operations.osmfoundation.org/policies/nominatim/) | Candidate facilities and geocoding | Public services; optional [hosted Overpass](https://overpass.ch/docs) requires its own key |
+| [openrouteservice](https://api.heigit.org/openrouteservice/) | Network matrices and point routes | [Create an account and API key](https://account.heigit.org/) |
 | [Mapillary](https://www.mapillary.com/dashboard/developers) | Optional nearby street-level imagery | Register an app and copy its client token |
 | [OpenRouter](https://openrouter.ai/settings/keys), [Google Gemini](https://aistudio.google.com/apikey), or [OpenAI](https://platform.openai.com/api-keys) | Language-model parsing and orchestration | OpenRouter with openai/gpt-4o is the default; create a provider key or configure local Ollama |
 
@@ -110,6 +112,7 @@ ORS_API_KEY=
 CENSUS_API_KEY=
 MAPILLARY_ACCESS_TOKEN=
 CARTO_BASEMAP_API_KEY=
+OVERPASS_CH_API_KEY=
 ```
 
 Put the server-default OpenRouter key in `OPENROUTER_API_KEY` inside the project-root `.env`. A visitor may instead enter a provider key in **Preliminary setup**; that key stays only in the browser-scoped backend session. Direct Gemini remains available through `GEMINI_API_KEY`, but access is evaluated from the backend network location and is limited to Google's [supported regions](https://ai.google.dev/gemini-api/docs/available-regions). If unavailable, select OpenRouter, OpenAI, or a local model instead; OASIS never switches providers silently. Gemini free-tier availability and quotas also depend on the selected model, account, and region. Only configure the services you use, and never commit the populated `.env`.
@@ -120,12 +123,12 @@ frontend files. The backend loads `.env` locally, and Docker Compose passes the
 same file to the backend container.
 
 `CARTO_BASEMAP_API_KEY` is the one browser-visible key: `/api/v1/config` supplies
-it to both the result and comparison maps, which append it to CARTO tile URLs.
+it to the result, comparison, and resident maps, which append it to CARTO tile URLs.
 LLM, Census, ORS, and Mapillary credentials stay on the backend. Without a CARTO
 key, maps retain the study-area layers on a neutral background.
 
 After changing `.env`, restart the local backend and reload the browser. With
-Docker Compose, run `docker compose up -d --force-recreate backend` and reload;
+Docker Compose, run `docker compose up -d --force-recreate backend`, then `docker compose restart frontend` and reload;
 a container restart alone does not reload `env_file`. Changing keys does not
 require rebuilding the frontend. Visitor-provided LLM keys remain temporary
 session overrides rather than being written to `.env`.
@@ -175,32 +178,6 @@ on the same network, and the operating-system firewall must allow the private
 network connection to port 5173. Do not expose this development server directly
 to the public internet.
 
-Basic workflow:
-
-1. Optionally connect and test a visitor-provided language model.
-2. Describe a supported city/county analysis question.
-3. Confirm the interpreted task and place.
-4. Review candidate types, travel mode, threshold, weights, and optional constraints.
-5. Run and inspect Map, Analysis, Pareto, Compare, Report, and Provenance.
-
-Example requests:
-
-```text
-Select 10 candidate cooling facilities in Phoenix within a 15-minute walk.
-Compare efficiency and access inequality for 10 candidate facilities in Phoenix.
-Which Phoenix tracts have the highest population-weighted heat exposure?
-Which tracts are hardest to serve within 15 minutes?
-I'm at the Lincoln Memorial. How can I find the nearest cooling facility?
-```
-
-Requests such as “Which NYC cooling centers are open right now?” are rejected with an official-directory or 311 alternative.
-
-For Mapillary previews, add `MAPILLARY_ACCESS_TOKEN`, restart the backend, run an analysis, then click a selected facility. The backend endpoint is:
-
-```text
-/api/streetview?lat=<latitude>&lon=<longitude>&radius_m=100
-```
-
 ## Command line
 
 ```powershell
@@ -225,8 +202,10 @@ docker compose up --build
 ```
 
 Open http://127.0.0.1:5173. The frontend proxies `/api` requests to the backend
-container on port 8000. Runtime cache and output directories are mounted from
-`data/cache/` and `outputs_run/`.
+container on port 8000. Runtime cache, output, and uploaded-candidate directories are mounted from
+`data/cache/`, `outputs_run/`, and `tmp/uploads/`. Images exclude `.env`; Compose supplies it at runtime. System CBC is preferred so Intel and Apple Silicon builds use the installed native binary.
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for Mac setup, configuration updates, migration limits, and pre-demo checks. A standalone `docker build` does not start both services or configure their volumes.
 
 ## Verify
 
@@ -238,7 +217,4 @@ npm --prefix frontend run lint
 npm --prefix frontend run test:e2e
 ```
 
-The Playwright smoke test uses Microsoft Edge and mocks the API. It verifies
-task confirmation, submitted parameters, polling, cancellation, and persistence
-after reload without calling LLM or geographic services. It does not validate
-live data or solver results. The frontend build also type-checks its fixtures.
+Browser tests use mocked APIs; live data and solver results require separate validation.

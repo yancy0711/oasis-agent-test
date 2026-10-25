@@ -34,6 +34,8 @@ accessibility:
   router: ors
   ors_city_only: false
   ors_max_area_km2: 15000
+  # Local auto-refinement workload guard, not the provider's per-request limit.
+  # Raise only for a rehearsed case; large cold matrices may take minutes.
   ors_max_eligible_pairs: 250000
   point_route_candidate_limit: 15
   detour_factor: 1.3
@@ -56,12 +58,14 @@ accessibility:
   ors_max_block_route_expansion: 1.5
   ors_request_interval_s: 1.6
   ors_timeout_s: 60
+  point_route_timeout_s: 15  # One attempt per interactive matrix/directions request.
 
 optimization:
   value_profile: balanced
   n_facilities: 10
   facility_capacity: null
-  solver_time_limit_s: 120
+  solver_time_limit_s: 180
+  solver_preview_time_limit_s: 60
   # One total budget for every LSCP probe in a minimum-threshold search.
   minimum_threshold_total_time_limit_s: 90
   minimum_threshold_preview_time_limit_s: 25

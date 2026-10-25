@@ -4,8 +4,10 @@ import { MetricsView } from "./MetricsView";
 import { RecoveryPanel } from "./RecoveryPanel";
 import { ResultTabs } from "./ResultTabs";
 import { ExecutionSummary } from "./ResultShared";
+import { useReviseRun } from "../run/run.mutations";
 
 export function ResultPanel({ snapshot }: { snapshot: RunSnapshot }) {
+  const retry = useReviseRun(snapshot.run_id);
   const result = visibleResult(snapshot);
   const message = agentMessage(snapshot);
   const approximateFallback = Boolean(
@@ -34,9 +36,9 @@ export function ResultPanel({ snapshot }: { snapshot: RunSnapshot }) {
             <span><b>Mobility</b>{result.task.mobility_scenario}</span>
             <span><b>Equity setting</b>{result.task.equity_alpha == null ? "Not applied" : `α = ${result.task.equity_alpha}`}</span>
           </div>
-          {message && <p className={`agent-message${approximateFallback ? " agent-message--warning" : ""}`}>{message}</p>}
-          <ExecutionSummary result={result} />
-          <RecoveryPanel result={result} />
+          {message && !result.recovery && <p className={`agent-message${approximateFallback ? " agent-message--warning" : ""}`}>{message}</p>}
+          {(!result.recovery || result.execution.router_used) && <ExecutionSummary result={result} />}
+          <RecoveryPanel result={result} onRetry={() => retry.mutate({})} retryPending={retry.isPending} retryError={retry.error?.message} />
           <MetricsView result={result} />
           <ResultTabs runId={snapshot.run_id} result={result} />
         </>

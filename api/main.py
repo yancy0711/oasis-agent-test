@@ -1,6 +1,7 @@
 """FastAPI routes for the OASIS parsing, HITL, run, and artifact services."""
 from __future__ import annotations
 import os
+import httpx
 from fastapi import APIRouter, FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse
 
@@ -17,6 +18,8 @@ from api.schemas import (LlmConnectionRequest, LlmConnectionResponse,
 from api.schemas import StreetViewResponse
 from oasis.core.data.streetview import nearest_streetview
 from oasis.services.application import OasisService
+from oasis.core.cancellation import RunCancelled
+from api.cancellation import call_while_connected
 
 
 def create_app(service: OasisService | None = None) -> FastAPI:
@@ -179,29 +182,36 @@ def create_app(service: OasisService | None = None) -> FastAPI:
         except ValueError as exc: raise HTTPException(422, str(exc)) from exc
 
     @router.post("/runs/{run_id}/routes", response_model=PointRouteResponse)
-    def plan_point_route(run_id: str, request: PointRouteRequest) -> dict:
+    async def plan_point_route(run_id: str, request: PointRouteRequest, connection: Request) -> dict:
         """Plan a route from a user-selected point to the network-nearest selected candidate facility."""
         try:
-            return app.state.service.plan_point_route(
-                run_id, request.longitude, request.latitude, request.mode
+            return await call_while_connected(
+                connection, app.state.service.plan_point_route,
+                run_id, request.longitude, request.latitude, request.mode,
             )
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
-        except RuntimeError as exc:
+        except RunCancelled as exc:
+            raise HTTPException(409, "Route request cancelled.") from exc
+        except (RuntimeError, httpx.HTTPError) as exc:
             raise HTTPException(503, str(exc)) from exc
 
     @router.post("/runs/{run_id}/routes/from-place", response_model=PointRouteResponse)
-    def plan_place_route(run_id: str, request: PlaceRouteRequest) -> dict:
+    async def plan_place_route(run_id: str, request: PlaceRouteRequest, connection: Request) -> dict:
         """Geocode an origin within the study area, then plan to the network-nearest site."""
         try:
-            return app.state.service.plan_place_route(run_id, request.query, request.mode)
+            return await call_while_connected(
+                connection, app.state.service.plan_place_route, run_id, request.query, request.mode,
+            )
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
-        except RuntimeError as exc:
+        except RunCancelled as exc:
+            raise HTTPException(409, "Route request cancelled.") from exc
+        except (RuntimeError, httpx.HTTPError) as exc:
             raise HTTPException(503, str(exc)) from exc
 
     @router.get("/runs/{run_id}/artifacts/{name}")
@@ -216,6 +226,8 @@ def create_app(service: OasisService | None = None) -> FastAPI:
         )
 
     app.include_router(router)
+    from api.resident import create_resident_router
+    app.include_router(create_resident_router(app.state.service))
     return app
 
 

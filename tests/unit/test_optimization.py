@@ -296,3 +296,33 @@ def test_minimum_threshold_search_has_one_total_budget_and_pre_solve_progress(mo
     assert events[-1] == ("Minimum-threshold search", 1, 2)
     assert diagnostics["status"] == "time_limit"
     assert diagnostics["probes"] == 1
+
+
+def test_threshold_search_does_not_treat_large_feasible_incumbent_as_infeasible(monkeypatch):
+    calls = []
+    def timed_lscp(*args, **kwargs):
+        calls.append(args[3])
+        return SimpleNamespace(solver_status="Feasible", selected_ids=["a", "b"])
+    monkeypatch.setattr(optimization_models, "solve_lscp", timed_lscp)
+    diagnostics = {}
+    threshold, solution = minimum_coverage_threshold(
+        np.array([[5., 20.], [20., 5.]]), np.ones(2), np.zeros(2, bool),
+        ["a", "b"], 1, search_diagnostics=diagnostics,
+    )
+    assert threshold is None and solution is None
+    assert diagnostics["status"] == "solver_time_limit"
+    assert len(calls) == 1
+
+
+def test_lscp_checks_cancellation_during_model_construction():
+    from oasis.core.cancellation import RunCancelled
+    calls = 0
+    def cancel():
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise RunCancelled("cancelled")
+    with pytest.raises(RunCancelled):
+        solve_lscp(np.ones((5, 2)), np.ones(5), np.zeros(5, bool), 10, ["a", "b"],
+                   cancel_check=cancel)
+    assert calls == 3

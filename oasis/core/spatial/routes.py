@@ -4,17 +4,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
+import time
 from typing import Callable
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-import requests
+import httpx
+from oasis.core.http import cancellable_request
 from shapely.geometry import LineString, shape
 
 from oasis.core.cache import atomic_write_text, cache_dir
-from oasis.core.retry import RETRYABLE_STATUS, TransientError, with_retry
 from oasis.core.spatial.accessibility.backend import ORS_PROFILES, RequestGate
 from oasis.core.spatial.alignment import ensure_crs, pick_metric_crs
 from oasis.core.spatial.accessibility.backend import post_ors
@@ -27,7 +27,6 @@ def _directions_url(matrix_url: str, profile: str) -> str:
     return f"{root}/{profile}/geojson"
 
 
-@with_retry(max_retries=3)
 def _request_route(
     url: str,
     api_key: str,
@@ -39,18 +38,17 @@ def _request_route(
 ) -> dict:
     gate.wait(cancel_check)
     try:
-        response = requests.post(
-            url,
+        response = cancellable_request(
+            "POST", url,
+            check=cancel_check or (lambda: None),
             headers={"Authorization": api_key, "Accept": "application/geo+json",
                      "Content-Type": "application/json"},
             json={"coordinates": [origin, destination]},
-            timeout=timeout_s,
+            timeout=(5, timeout_s),
         )
-    except requests.RequestException as exc:
-        raise TransientError(f"ORS directions request failed: {exc}") from exc
-    if response.status_code in RETRYABLE_STATUS:
-        raise TransientError(f"ORS directions returned HTTP {response.status_code}")
-    if not response.ok:
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"ORS {url.split('/')[-2]} directions failed ({type(exc).__name__}). Retry later or select another travel mode.") from exc
+    if not response.is_success:
         raise RuntimeError(f"ORS directions returned HTTP {response.status_code}: {response.text[:200]}")
     payload = response.json()
     if not payload.get("features"):
@@ -77,6 +75,7 @@ def _cached_route(
         "origin": [round(value, 6) for value in origin],
         "destination": [round(value, 6) for value in destination],
         "profile": profile,
+        "base_url": base_url,
         "version": "v1",
     }, sort_keys=True)
     path = cache_dir("ors_routes") / f"route_{hashlib.sha256(identity.encode()).hexdigest()[:24]}.json"
@@ -124,13 +123,15 @@ def plan_point_to_nearest_site(
     *,
     mode: str,
     base_url: str = "https://api.heigit.org/openrouteservice/v2/matrix",
-    timeout_s: float = 60,
+    timeout_s: float = 15,
     request_interval_s: float = 1.6,
     candidate_limit: int = 15,
     study_boundary=None,
     cancel_check: Callable[[], None] | None = None,
 ) -> dict:
     """Shortlist nearby selected facilities, then find the network-nearest route."""
+    if cancel_check:
+        cancel_check()
     if not (-180 <= longitude <= 180 and -90 <= latitude <= 90):
         raise ValueError("route origin must be valid longitude/latitude")
     areas, candidates = ensure_crs(areas), ensure_crs(candidates)
@@ -163,13 +164,18 @@ def plan_point_to_nearest_site(
         )
         selected = selected.iloc[np.argsort(approximate_distance)[:candidate_limit]].copy()
     destinations = [[float(point.x), float(point.y)] for point in selected.geometry]
-    matrix = post_ors(
-        f"{base_url.rstrip('/')}/{profile}", api_key,
-        {"locations": [origin, *destinations], "sources": ["0"],
-         "destinations": [str(index) for index in range(1, len(destinations) + 1)],
-         "metrics": ["duration"]},
-        timeout_s, gate=gate, cancel_check=cancel_check,
-    )
+    matrix_payload = {"locations": [origin, *destinations], "sources": ["0"],
+                      "destinations": [str(index) for index in range(1, len(destinations) + 1)],
+                      "metrics": ["duration"]}
+    matrix_url = f"{base_url.rstrip('/')}/{profile}"
+    identity = json.dumps({"url": matrix_url, "payload": matrix_payload}, sort_keys=True)
+    matrix_path = cache_dir("ors_routes") / f"matrix_{hashlib.sha256(identity.encode()).hexdigest()[:24]}.json"
+    if matrix_path.exists() and time.time() - matrix_path.stat().st_mtime < 86400:
+        matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
+    else:
+        matrix = post_ors(matrix_url, api_key, matrix_payload, timeout_s,
+                          gate=gate, cancel_check=cancel_check, retry_transient=False)
+        atomic_write_text(matrix_path, json.dumps(matrix))
     durations = np.asarray(matrix["durations"][0], dtype=float)
     if not np.isfinite(durations).any():
         raise ValueError("none of the selected candidate facilities is reachable from this point")

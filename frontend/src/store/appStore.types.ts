@@ -3,7 +3,9 @@ import type { MobilityMode, PlaceConfirmResponse } from "../api/models";
 export type ConfirmedPlace = PlaceConfirmResponse;
 
 export interface AppSessionState {
+  audience: "research" | "personal";
   activeRunId: string | null;
+  taskVersion: number;
   confirmedPlace: ConfirmedPlace | null;
   candidateUploadId: string | null;
   llmSessionId: string | null;
@@ -15,6 +17,8 @@ export interface AppSessionState {
 }
 
 export interface AppSessionActions {
+  interruptTask: () => void;
+  setAudience: (audience: "research" | "personal") => void;
   setActiveRunId: (runId: string | null) => void;
   setConfirmedPlace: (place: ConfirmedPlace | null) => void;
   setCandidateUploadId: (uploadId: string | null) => void;

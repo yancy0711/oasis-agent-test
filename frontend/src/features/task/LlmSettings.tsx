@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { listLlmModels, revokeLlmSession, testLlmConnection, type LlmConnectionInput } from "../../api/client";
 import { CheckboxDropdown } from "../../components/CheckboxDropdown";
+import { LoadingText } from "../../components/LoadingText";
 import { useAppStore } from "../../store/appStore";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 
@@ -139,7 +140,7 @@ export function LlmSettings({ defaults }: { defaults?: Record<string, unknown> }
       {provider === "gemini" && <p className="llm-provider-note">Direct Gemini availability is determined by the OASIS backend location. If Google reports an unsupported region, switch Provider here or run the backend in a supported region.</p>}
       <div className="form-grid form-grid--four">
         <label className="field"><span>Provider</span><select aria-label="Provider" value={provider} onChange={(event) => chooseProvider(event.target.value as Provider)}><option value="gemini">Gemini</option><option value="openrouter">OpenRouter</option><option value="openai">OpenAI</option><option value="custom">Custom provider</option><option value="local">Local model</option></select></label>
-        <div className="field"><span>Model</span><CheckboxDropdown ariaLabel="Model choices" single searchable portal shortcuts options={modelOptions} selected={model ? [cleanModelId(model)] : []} onChange={(values) => setModel(cleanModelId(values[0] ?? ""))} summary={cleanModelId(model) || "Select a model"} emptyMessage={discovering ? "Loading the model catalog..." : "No models match this filter."} footer={<label><span>Exact model ID</span><input aria-label="Exact model ID" value={model} onChange={(event) => setModel(cleanModelId(event.target.value))} placeholder="Type the exact model ID" /></label>} /></div>
+        <div className="field"><span>Model</span><CheckboxDropdown ariaLabel="Model choices" single searchable portal shortcuts options={modelOptions} selected={model ? [cleanModelId(model)] : []} onChange={(values) => setModel(cleanModelId(values[0] ?? ""))} summary={cleanModelId(model) || "Select a model"} emptyMessage={discovering ? <LoadingText>Loading the model catalog</LoadingText> : "No models match this filter."} footer={<label><span>Exact model ID</span><input aria-label="Exact model ID" value={model} onChange={(event) => setModel(cleanModelId(event.target.value))} placeholder="Type the exact model ID" /></label>} /></div>
         <label className="field"><span>Base URL</span><input aria-label="Base URL" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /><small>{baseUrlHelp}</small></label>
         <label className="field"><span>{provider === "local" ? "API key (optional)" : "API key"}</span><input aria-label={provider === "local" ? "API key (optional)" : "API key"} type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} /><small>The key is never saved in browser storage or run output.</small></label>
       </div>

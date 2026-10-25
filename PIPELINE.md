@@ -65,7 +65,7 @@ stores them in `Context` under a stable handle and returns a lightweight
 | Step | Registered tool | Reads | Stores | Main work |
 |---:|---|---|---|---|
 | 1 | `resolve_study_area` | `place_name` | `study` | OSM boundary and Census state/county FIPS |
-| 2 | `prepare_demand` | `study` | `demand` | ACS/TIGER, WorldPop-weighted Landsat heat, and vulnerability diagnostics |
+| 2 | `prepare_demand` | `study` | `demand` | ACS/TIGER, population-weighted Landsat heat, and vulnerability diagnostics |
 | 3 | `prepare_built_environment` | `demand` | `demand`, `built_environment` | Landsat NDVI, NDBI, albedo, and an auditable passive-environment burden diagnostic |
 | 4 | `fetch_candidate_sites` | `study` | `candidates` | OSM library/community-centre/school points |
 | 5 | `build_travel_matrix` | `demand`, `candidates` | `travel` | ORS or declared Haversine travel minutes plus diagnostics |
@@ -120,7 +120,7 @@ registry.get("prepare_demand").fn(ctx=ctx)
 
 This step joins ACS rows to TIGER polygons by `GEOID`, rejects a join rate at
 or below 95%, merges Landsat LST and optical environment diagnostics, calculates
-WorldPop-weighted tract heat where raster coverage is sufficient, calculates
+population-weighted tract heat where coverage is sufficient (Census block-group population by default; WorldPop is an optional configured alternative), calculates
 population density in a metric CRS, and builds tract centroid demand points. The configured vulnerability
 pipeline then applies explicit missing-value and direction rules, percentile
 normalization, correlation/VIF and PCA diagnostics, and marks the top quartile

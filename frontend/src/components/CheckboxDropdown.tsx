@@ -6,7 +6,7 @@ export interface CheckboxDropdownOption { value: string; label: string; group?: 
 interface CheckboxDropdownProps {
   ariaLabel: string; options: readonly CheckboxDropdownOption[]; selected: string[];
   summary: string; detail?: string; single?: boolean; searchable?: boolean; actions?: ReactNode; footer?: ReactNode;
-  emptyMessage?: string; portal?: boolean; shortcuts?: boolean;
+  emptyMessage?: ReactNode; portal?: boolean; shortcuts?: boolean;
   defaultOpen?: boolean;
   onChange: (selected: string[]) => void;
 }

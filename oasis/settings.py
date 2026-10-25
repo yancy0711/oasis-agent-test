@@ -5,9 +5,19 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 from oasis.contracts.domain import ValueWeights
+from oasis.contracts.resident import DEFAULT_CATEGORIES
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROFILES_PATH = PROJECT_ROOT / "config" / "value_profiles.yaml"
+
+
+def load_resident_categories() -> dict:
+    """Load semantic hints for exactly the supported nearby-place adapters."""
+    path = PROJECT_ROOT / "config" / "resident_categories.yaml"
+    categories = yaml.safe_load(path.read_text(encoding="utf-8"))["categories"]
+    if set(categories) != set(DEFAULT_CATEGORIES):
+        raise ValueError("Resident category catalog must match the supported category IDs")
+    return categories
 
 
 def load_cfg() -> dict:

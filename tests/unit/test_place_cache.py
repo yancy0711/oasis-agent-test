@@ -81,7 +81,7 @@ def test_route_origin_cache_is_available_before_study_scope(monkeypatch, tmp_pat
             return [{"display_name": "Papago Park"}]
 
     monkeypatch.setattr(geocoding, "CACHE_DIR", tmp_path)
-    monkeypatch.setattr(geocoding.requests, "get", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(geocoding, "cancellable_request", lambda *args, **kwargs: Response())
     rows = geocoding.search_origin_candidates("Papago Park")
     assert rows == [{"display_name": "Papago Park"}]
     assert list((tmp_path / "shared" / "nominatim_route_origins").rglob("origin_*.json"))
@@ -455,3 +455,76 @@ def test_threshold_over_ors_policy_uses_haversine(monkeypatch):
     result = registry.get("build_travel_matrix").fn(ctx=ctx)
     assert result.ok and result.summary["router"] == "haversine"
     assert "threshold 25 minutes exceeds ORS policy limit" in result.summary["reason"]
+
+
+def test_route_origin_search_scopes_country_bounds_and_cache(monkeypatch, tmp_path):
+    calls = []
+    class Response:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return [{"display_name": "Riverside", "lon": "-117.37", "lat": "33.98"}]
+    def get(url, **kwargs):
+        calls.append(kwargs["params"])
+        return Response()
+    monkeypatch.setattr(geocoding, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(geocoding, "cancellable_request", lambda _method, *args, **kwargs: get(*args, **kwargs))
+    geocoding.search_origin_candidates("92501")
+    for _ in range(2):
+        geocoding.search_origin_candidates("92501", countrycodes="us", viewbox=(-117.5, 33.8, -117.2, 34.1))
+    assert len(calls) == 2
+    assert calls[1]["countrycodes"] == "us"
+    assert calls[1]["viewbox"] == "-117.5,34.1,-117.2,33.8"
+    assert calls[1]["bounded"] == 1
+
+
+@pytest.mark.parametrize("query,normalized", [
+    ("Riverside Convention Centre", "Riverside Convention center"),
+    ("Community Centres, Riverside", "Community centers, Riverside"),
+])
+def test_origin_spelling_fallback_preserves_scope_and_caches(monkeypatch, tmp_path, query, normalized):
+    calls = []
+    class Response:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self):
+            return [] if calls[-1]["q"] == query else [{"lon": "-117.37", "lat": "33.98"}]
+    def request(_method, _url, **kwargs):
+        calls.append(kwargs["params"])
+        return Response()
+    monkeypatch.setattr(geocoding, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(geocoding, "cancellable_request", request)
+    bounds = (-117.5, 33.8, -117.2, 34.1)
+    rows = geocoding.search_origin_candidates(query, countrycodes="us", viewbox=bounds)
+    assert rows and [call["q"] for call in calls] == [query, normalized]
+    assert all(call["countrycodes"] == "us" and call["bounded"] == 1 for call in calls)
+    assert len({call["viewbox"] for call in calls}) == 1
+    assert geocoding.search_origin_candidates(normalized, countrycodes="us", viewbox=bounds) == rows
+    assert len(calls) == 2
+
+
+def test_origin_exact_spelling_does_not_trigger_fallback(monkeypatch):
+    calls = []
+    def search(query, **kwargs):
+        calls.append(query)
+        return [{"display_name": "Existing Centre"}]
+    monkeypatch.setattr(geocoding, "_search_origin_candidates", search)
+    assert geocoding.search_origin_candidates("Existing Centre")
+    assert calls == ["Existing Centre"]
+
+
+@pytest.mark.parametrize("alias,expected", [
+    ("LA", "Los Angeles, California"), ("L.A.", "Los Angeles, California"),
+    ("losangeles", "Los Angeles, California"), ("dc", "Washington, District of Columbia"),
+    ("D.C.", "Washington, District of Columbia"), ("NYC", "New York City, New York"),
+    ("Louisiana", "Louisiana"), ("LA Fitness, Riverside", "LA Fitness, Riverside"),
+])
+def test_us_origin_shorthand_is_scoped_and_does_not_rewrite_landmarks(monkeypatch, alias, expected):
+    calls = []
+    def search(query, **kwargs):
+        calls.append((query, kwargs))
+        return [{"display_name": "Resolved US place"}]
+    monkeypatch.setattr(geocoding, "_search_origin_candidates", search)
+    bounds = (-118.7, 33.7, -118.1, 34.4)
+    geocoding.search_origin_candidates(alias, countrycodes="us", viewbox=bounds)
+    assert calls[0][0] == expected
+    assert calls[0][1]["countrycodes"] == "us" and calls[0][1]["viewbox"] == bounds

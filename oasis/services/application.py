@@ -736,10 +736,10 @@ class OasisService:
             if process is not None and process.is_alive():
                 with control.termination_lock:
                     self._terminate_process(process)
-                self.store.transition(
-                    run_id, ("queued", "running", "cancelling"), desired,
-                    progress=None, error=None,
-                )
+            self.store.transition(
+                run_id, ("queued", "running", "cancelling"), desired,
+                progress=None, error=None,
+            )
         return self.store.snapshot(run_id)
 
     @staticmethod
@@ -892,7 +892,8 @@ class OasisService:
             # A preview must become useful quickly, especially for large metros.
             # The precise phase retains the configured full sweep limits.
             cfg["optimization"]["solver_time_limit_s"] = min(
-                cfg["optimization"].get("solver_time_limit_s", 120), 30
+                cfg["optimization"].get("solver_time_limit_s", 120),
+                cfg["optimization"].get("solver_preview_time_limit_s", 60),
             )
             cfg["optimization"]["minimum_threshold_total_time_limit_s"] = min(
                 cfg["optimization"].get("minimum_threshold_total_time_limit_s", 90),
@@ -1098,7 +1099,10 @@ class OasisService:
         reason = str(exc)
         guard_note = (
             " This is an OASIS request-volume guard, not an error returned by ORS."
-            if "planned ORS requests" in reason else ""
+            if "planned ORS requests" in reason else (
+                f" OASIS limits full-matrix travel thresholds to {self.cfg.get('accessibility', {}).get('ors_max_policy_threshold_minutes', 20):g} minutes. This is a local request-budget guard; ORS did not reject this request."
+                if "exceeds ORS policy limit" in reason else ""
+            )
         )
         warning = (
             "The full study-area ORS matrix was unavailable, so the completed approximate "
@@ -1257,8 +1261,9 @@ class OasisService:
             args=(run_cfg, run_id, task.model_dump(mode="json"), spec.model_dump(mode="json")),
             name=f"oasis-run-{run_id[:8]}",
         )
-        process.start()
         with self.lock:
+            control.token.check()
+            process.start()
             control.process = process
         heartbeat_interval = max(
             1.0, float(self.cfg.get("execution", {}).get("run_heartbeat_interval_s", 5))
@@ -1375,9 +1380,10 @@ class OasisService:
         raise ValueError("point route planning requires an available map result")
 
     def plan_point_route(
-        self, run_id: str, longitude: float, latitude: float, mode: str
+        self, run_id: str, longitude: float, latitude: float, mode: str, *, check=lambda: None
     ) -> dict:
         """Plan a transient clicked-point route from the map currently visible to the user."""
+        check()
         import geopandas as gpd
         from shapely.geometry import Point, shape
         from shapely.ops import unary_union
@@ -1433,14 +1439,15 @@ class OasisService:
                     accessibility.get("ors_base_url")
                     or "https://api.heigit.org/openrouteservice/v2/matrix"
                 ),
-                timeout_s=accessibility.get("ors_timeout_s", 60),
+                timeout_s=accessibility.get("point_route_timeout_s", 15),
                 request_interval_s=accessibility.get("ors_request_interval_s", 1.6),
                 candidate_limit=accessibility.get("point_route_candidate_limit", 15),
-                study_boundary=study_boundary,
+                study_boundary=study_boundary, cancel_check=check,
             )
 
-    def plan_place_route(self, run_id: str, query: str, mode: str) -> dict:
+    def plan_place_route(self, run_id: str, query: str, mode: str, *, check=lambda: None) -> dict:
         """Geocode one US origin inside the displayed study area and plan its route."""
+        check()
         import geopandas as gpd
         from shapely.geometry import Point, shape
         from shapely.ops import unary_union
@@ -1464,9 +1471,13 @@ class OasisService:
             if boundary_features else areas.geometry.union_all()
         place_name = snapshot["task"]["place_name"]
         with scoped_cache(place_name):
-            rows = search_origin_candidates(query)
+            rows = search_origin_candidates(query, countrycodes="us", viewbox=study_boundary.bounds, check=check)
+            if not rows:
+                rows = search_origin_candidates(f"{query}, {place_name}", countrycodes="us", check=check)
+            if not rows:
+                rows = search_origin_candidates(query, countrycodes="us", check=check)
         if not rows:
-            raise ValueError(f"Location not found in the United States: {query}")
+            raise ValueError(f"No matching address or landmark found for '{query}' in {place_name} or the US. Try a street address or select the point on the map.")
         matched = None
         for row in rows:
             try:
@@ -1499,7 +1510,12 @@ class OasisService:
                 },
             }
         row, point = matched
-        result = self.plan_point_route(run_id, float(point.x), float(point.y), mode)
+        try:
+            result = self.plan_point_route(run_id, float(point.x), float(point.y), mode, check=check)
+        except RunCancelled:
+            raise
+        except RuntimeError as exc:
+            raise RuntimeError(f"Starting point found: {row.get('display_name', query)}. Route planning failed: {exc}") from exc
         result["summary"].update({
             "origin_query": query,
             "origin_label": row.get("display_name", query),

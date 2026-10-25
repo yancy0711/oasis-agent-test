@@ -220,7 +220,7 @@ def test_retry_after_header_controls_retry_delay(monkeypatch):
         def __init__(self, status_code, headers=None):
             self.status_code = status_code
             self.headers = headers or {}
-            self.ok = status_code == 200
+            self.is_success = status_code == 200
             self.text = ""
 
         def json(self):
@@ -231,7 +231,7 @@ def test_retry_after_header_controls_retry_delay(monkeypatch):
     )
     sleeps = []
     monkeypatch.setattr(
-        routing_backend.requests, "post", lambda *args, **kwargs: next(responses)
+        routing_backend, "cancellable_request", lambda *args, **kwargs: next(responses)
     )
     monkeypatch.setattr(retry.time, "sleep", sleeps.append)
     result = routing_backend.post_ors(
