@@ -454,7 +454,30 @@ def test_threshold_over_ors_policy_uses_haversine(monkeypatch):
     monkeypatch.setattr(workflow, "sparse_network_matrix", lambda *args, **kwargs: pytest.fail("ORS called"))
     result = registry.get("build_travel_matrix").fn(ctx=ctx)
     assert result.ok and result.summary["router"] == "haversine"
-    assert "threshold 25 minutes exceeds ORS policy limit" in result.summary["reason"]
+    assert "threshold 25 minutes exceeds local full-matrix threshold limit" in result.summary["reason"]
+
+
+@pytest.mark.parametrize("minutes", [30, 60])
+def test_default_policy_allows_larger_thresholds_without_raising_request_guards(monkeypatch, minutes):
+    from oasis.settings import load_cfg
+    cfg = load_cfg()["accessibility"]
+    assert cfg["ors_max_policy_threshold_minutes"] == 60
+    assert cfg["ors_max_eligible_pairs"] == 250000 and cfg["ors_max_requests"] == 500
+    ctx = Context()
+    ctx.put("config", {"accessibility": cfg})
+    ctx.put("task", TaskSpec(place_name="Test", threshold_minutes=minutes))
+    ctx.put("study", {"place_type": "city", "area_km2": 1, "cache_scope": "test"})
+    ctx.put("demand", {"points": gpd.GeoDataFrame(geometry=[Point(-117.37, 33.98)], crs=4326)})
+    ctx.put("candidates", gpd.GeoDataFrame({"cand_id": ["a"]}, geometry=[Point(-117.371, 33.981)], crs=4326))
+    calls = []
+    def network(*args, **kwargs):
+        calls.append(kwargs)
+        return np.array([[5.]]), {"router": "ors_sparse", "tier": "cache", "eligible_pairs": 1}
+    monkeypatch.setattr(workflow, "sparse_network_matrix", network)
+    result = workflow.build_travel_matrix(ctx)
+    assert result.ok and result.summary["router"] == "ors_sparse"
+    assert result.summary["policy_minutes"] == minutes and len(calls) == 1
+    assert calls[0]["max_requests"] == 500
 
 
 def test_route_origin_search_scopes_country_bounds_and_cache(monkeypatch, tmp_path):

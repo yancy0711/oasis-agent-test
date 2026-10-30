@@ -142,6 +142,12 @@ For a model server running on the Mac host, container `localhost` points to the 
 
 ### Automatic ORS matrix budget
 
+`accessibility.ors_max_policy_threshold_minutes` defaults to **60 minutes**.
+This is a local screening horizon, not an ORS provider restriction. Larger
+thresholds can require more network pairs; the pair and request guards still
+apply. If network refinement cannot finish, the computed Haversine answer,
+map, and report remain available, with the reason under ORS refinement details.
+
 `accessibility.ors_max_eligible_pairs: 250000` is a local guard for **auto**
 refinement, not ORS's per-request cap. Keep it as the demonstration default.
 For an offline rehearsal of the 311,869-pair LA case, `350000` permits that case

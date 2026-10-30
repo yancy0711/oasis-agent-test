@@ -173,7 +173,7 @@ When `router: ors`, deterministic guards run before the production sparse-routin
 1. City and county boundaries may enter sparse ORS checks when `ors_city_only: false`.
 2. Areas above `ors_max_area_km2` (default 15,000 km2) use Haversine and print a warning.
 3. Build the complete Haversine fallback and an optimistic lower bound.
-4. Keep pairs within `20 * 1.5 = 30` minutes as ORS-eligible.
+4. Keep pairs whose optimistic travel lower bound is within the task's screening threshold times `ors_pruning_margin` (default 1.5). The local full-matrix threshold ceiling is 60 minutes; an unknown-threshold diagnostic uses that horizon.
 5. Eligible-pair counts above `ors_max_eligible_pairs` use Haversine and print a warning.
 6. If tiled planning exceeds `ors_max_requests`, safely repack a dense matrix when the added route work stays within `ors_max_block_route_expansion`; otherwise retain Haversine with an explicit warning.
 7. Read eligible pairs from `data/cache/places/<place_slug>/ors/v1/pair_durations.sqlite`.
@@ -181,6 +181,9 @@ When `router: ors`, deterministic guards run before the production sparse-routin
 9. Print in-place progress bars for the cache scan and live ORS request blocks.
 
 Every fallback reason and the actual cache/live tier are recorded in provenance.
+If precise refinement fails after a successful estimate, that estimate remains
+the terminal result: its computed answer and map stay visible, and refinement
+details are collapsible. An estimated coverage plan is not an ORS network guarantee.
 
 ### Step 6: optimize and sweep trade-offs
 

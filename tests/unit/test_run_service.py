@@ -538,12 +538,41 @@ def test_auto_retains_approximate_result_when_precise_routing_fails(tmp_path, mo
         run_id = service.start_run(TaskSpec(place_name="New York"), "auto")["run_id"]
         snapshot = _terminal(service, run_id)
         assert snapshot["status"] == "succeeded"
-        assert snapshot["result"] is None
+        assert snapshot["result"]["ok"] is True
         assert snapshot["preview_result"]["ok"] is True
         assert snapshot["preview_result"]["execution"]["accuracy"] == "approximate"
-        assert "approximate selection result has been retained" in snapshot["preview_result"]["message"]
-        assert "Point route planning remains available" in snapshot["preview_result"]["message"]
+        assert snapshot["result"]["message"] == "done"
+        assert snapshot["result"]["diagnostics"]["precise_refinement"]["status"] == "unavailable"
+        report = service.artifact(run_id, "preview_report").read_text(encoding="utf-8")
+        assert "Approximate result (Haversine)" in report and "Wait for ORS refinement" not in report
         assert "Precise mode requires ORS" in snapshot["error"]
+    finally:
+        service.executor.shutdown(wait=True)
+
+
+def test_fallback_keeps_the_minimum_count_answer_and_map_as_a_terminal_result(tmp_path, monkeypatch):
+    class EstimateThenFailure(_RoutingOrchestrator):
+        def run(self, task):
+            if self.cfg["accessibility"]["router"] == "ors":
+                raise RuntimeError("Precise mode requires ORS: temporary provider failure")
+            payload = super().run(task)
+            path = Path(self.cfg["output"]["dir"]) / "minimum.geojson"
+            path.write_text('{"type":"FeatureCollection","features":[]}', encoding="utf-8")
+            payload["message"] = "Estimated minimum: 12 facilities within 45 minutes."
+            payload["diagnostics"] = {"minimum_facilities": {"feasible": True, "minimum_facilities": 12,
+                                     "feasible_facility_count": 12, "threshold_minutes": 45, "map": str(path)}}
+            return payload
+    service = _service(tmp_path, monkeypatch, EstimateThenFailure)
+    try:
+        run_id = service.start_run(TaskSpec(place_name="Riverside", analysis_goal="minimum_facilities", threshold_minutes=45), "auto")["run_id"]
+        snapshot = _terminal(service, run_id)
+        result = snapshot["result"]
+        assert snapshot["status"] == "succeeded" and result["ok"]
+        assert result["message"] == "Estimated minimum: 12 facilities within 45 minutes."
+        assert result["diagnostics"]["minimum_facilities"]["minimum_facilities"] == 12
+        assert "minimum_facilities_map" in result["artifacts"] and "map" in result["artifacts"]
+        assert service.artifact(run_id, "preview_minimum_facilities_map").is_file()
+        assert result["diagnostics"]["precise_refinement"]["retained_result"] == "approximate_haversine"
     finally:
         service.executor.shutdown(wait=True)
 
@@ -558,8 +587,10 @@ def test_auto_retains_preview_when_precise_guard_is_returned_as_agent_failure(tm
         assert snapshot["status"] == "succeeded"
         assert snapshot["preview_result"]["execution"]["accuracy"] == "approximate"
         assert snapshot["preview_result"].get("recovery") is None
-        assert "OASIS request-volume guard" in snapshot["preview_result"]["message"]
-        assert "reduce the travel threshold" in snapshot["preview_result"]["message"]
+        assert snapshot["result"]["message"] == "done"
+        refinement = snapshot["result"]["diagnostics"]["precise_refinement"]
+        assert "OASIS request-volume guard" in refinement["details"]
+        assert "Point routing remains available" in refinement["next_steps"]
     finally:
         service.executor.shutdown(wait=True)
 
@@ -688,8 +719,8 @@ def test_precise_mode_returns_an_explicit_approximate_fallback(tmp_path, monkeyp
         assert snapshot["status"] == "succeeded"
         assert "requires ORS network routing" in snapshot["error"]
         assert snapshot["result"]["execution"]["accuracy"] == "approximate"
-        assert "approximate selection result has been retained" in snapshot["result"]["message"]
-        assert "Point route planning remains available" in snapshot["result"]["message"]
+        assert snapshot["result"]["message"] == "done"
+        assert snapshot["result"]["diagnostics"]["precise_refinement"]["status"] == "unavailable"
     finally:
         service.executor.shutdown(wait=True)
 

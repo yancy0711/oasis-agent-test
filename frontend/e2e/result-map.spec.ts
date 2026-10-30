@@ -9,10 +9,10 @@ const data = {
   ],
 };
 
-async function openHarness(page: Page, key = "") {
+async function openHarness(page: Page, key = "", estimate = false) {
   await page.route("**/api/v1/config", route => route.fulfill({ json: { carto_basemap_api_key: key } }));
-  await page.route("**/result-map-test", route => route.fulfill({ contentType: "text/html", body: '<html><body><div id="root"></div><script type="module">import RefreshRuntime from "/@react-refresh"; RefreshRuntime.injectIntoGlobalHook(window); window.$RefreshReg$ = () => {}; window.$RefreshSig$ = () => (type) => type; window.__vite_plugin_react_preamble_installed__ = true;</script><script type="module" src="/e2e/result-map-harness.tsx"></script></body></html>' }));
-  await page.goto("/result-map-test");
+  await page.route("**/result-map-test*", route => route.fulfill({ contentType: "text/html", body: '<html><body><div id="root"></div><script type="module">import RefreshRuntime from "/@react-refresh"; RefreshRuntime.injectIntoGlobalHook(window); window.$RefreshReg$ = () => {}; window.$RefreshSig$ = () => (type) => type; window.__vite_plugin_react_preamble_installed__ = true;</script><script type="module" src="/e2e/result-map-harness.tsx"></script></body></html>' }));
+  await page.goto(`/result-map-test${estimate ? "?estimate=1" : ""}`);
 }
 
 async function expectFullWidth(page: Page) {
@@ -28,6 +28,21 @@ async function expectFullWidth(page: Page) {
     return Math.max(Math.abs(canvas!.width - view!.width), Math.abs(canvas!.height - view!.height));
   }).toBeLessThan(3);
 }
+
+test("ORS fallback keeps the estimated answer and interactive arrangement visible", async ({ page }) => {
+  await page.route("**/test-map.geojson", route => route.fulfill({ json: data }));
+  await page.setViewportSize({ width: 1400, height: 1050 });
+  await openHarness(page, "", true);
+  await expect(page.getByText("Estimated minimum: 10 facilities within 45 minutes.")).toBeVisible();
+  await expect(page.getByLabel("Current decision context")).toContainText("Facilities10");
+  const details = page.locator("details").filter({ has: page.locator("summary", { hasText: "ORS refinement unavailable" }) });
+  await expect(details).not.toHaveAttribute("open");
+  await expect(page.getByRole("button", { name: "Plan from map point", exact: true })).toBeEnabled();
+  await expectFullWidth(page);
+  await page.screenshot({ path: test.info().outputPath("estimate-with-map.png"), fullPage: true });
+  await details.locator("summary").click();
+  await expect(page.getByText("ORS request budget exceeded", { exact: true })).toBeVisible();
+});
 
 test("result maps use the full panel width, survive tab changes, and resize", async ({ page }) => {
   await page.route("**/test-map.geojson", route => route.fulfill({ json: data }));

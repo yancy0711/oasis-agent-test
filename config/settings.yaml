@@ -41,7 +41,8 @@ accessibility:
   detour_factor: 1.3
   ors_base_url: "https://api.heigit.org/openrouteservice/v2/matrix"
   ors_upper_speed_kmh: 6.0
-  ors_max_policy_threshold_minutes: 20
+  # Local screening horizon, not an ORS provider limit. Pair/request guards still apply.
+  ors_max_policy_threshold_minutes: 60
   ors_pruning_margin: 1.5
   ors_tile_size_m: 3000
   ors_source_chunk_size: 35

@@ -798,12 +798,12 @@ def build_travel_matrix(ctx: Context, demand_handle: str = "demand",
     configured_threshold = float(getattr(task, "threshold_minutes", cfg.get("threshold_minutes", 15.0)))
     if (task and task.analysis_goal in {"minimum_facilities", "minimum_threshold"}
             and "minimum_facilities" not in task.coverage_diagnostic_handles):
-        configured_threshold = float(cfg.get("ors_max_policy_threshold_minutes", 20))
+        configured_threshold = float(cfg.get("ors_max_policy_threshold_minutes", 60))
     sensitivity_thresholds = list(getattr(task, "sensitivity_thresholds", []) or [])
     policy_minutes = max([configured_threshold, *map(float, sensitivity_thresholds)])
     reason = None
-    if requested and policy_minutes > cfg.get("ors_max_policy_threshold_minutes", 20):
-        reason = f"threshold {policy_minutes:g} minutes exceeds ORS policy limit"
+    if requested and policy_minutes > cfg.get("ors_max_policy_threshold_minutes", 60):
+        reason = f"threshold {policy_minutes:g} minutes exceeds local full-matrix threshold limit"
     elif requested and cfg.get("ors_city_only", False) and study.get("place_type", "city") not in {
         "city", "town", "municipality", "village"
     }:

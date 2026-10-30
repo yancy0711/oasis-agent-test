@@ -1129,24 +1129,20 @@ class OasisService:
         guard_note = (
             " This is an OASIS request-volume guard, not an error returned by ORS."
             if "planned ORS requests" in reason else (
-                f" OASIS limits full-matrix travel thresholds to {self.cfg.get('accessibility', {}).get('ors_max_policy_threshold_minutes', 20):g} minutes. This is a local request-budget guard; ORS did not reject this request."
-                if "exceeds ORS policy limit" in reason else ""
+                f" OASIS limits full-matrix travel thresholds to {self.cfg.get('accessibility', {}).get('ors_max_policy_threshold_minutes', 60):g} minutes. This is a local request-budget guard; ORS did not reject this request."
+                if "exceeds local full-matrix threshold limit" in reason or "exceeds ORS policy limit" in reason else ""
             )
         )
-        warning = (
-            "The full study-area ORS matrix was unavailable, so the completed approximate "
-            f"selection result has been retained. Reason: {reason}{guard_note} Point route "
-            "planning remains available because it sends only a small shortlist to ORS. "
-            "For a full ORS matrix, reduce the travel threshold, choose fewer candidate "
-            "facility types, upload a smaller reviewed candidate set, or use a smaller "
-            "study area. Change mobility only when that matches the policy question."
-        )
+        warning = "ORS refinement is unavailable. The approximate result and its artifacts are retained."
         retained = deepcopy(payload)
-        retained["message"] = warning
+        # Keep the computed answer, including facility counts and feasibility.
+        # Refinement failure is metadata, not a replacement for the result.
         diagnostics = dict(retained.get("diagnostics") or {})
         diagnostics["precise_refinement"] = {
             "status": "unavailable", "reason": str(exc),
             "retained_result": "approximate_haversine",
+            "message": warning, "details": reason + guard_note,
+            "next_steps": "Point routing remains available on a selected-facility map. For full-matrix network refinement, review the study area, candidate types, or configured pair/request budget.",
         }
         retained["diagnostics"] = diagnostics
         artifact_name = "preview_report" if preview else "report"
@@ -1158,10 +1154,10 @@ class OasisService:
                 "the siting result as final.\n\n"
             )
             fallback_notice = (
-                "> **Approximate fallback (Haversine):** The full study-area ORS matrix "
-                "could not be completed, so the approximate selection result is retained. "
-                f"Reason: {exc} Point route planning remains available through a small "
-                "ORS shortlist.\n\n"
+                "> **Approximate result (Haversine):** The computed answer and map are retained; "
+                "they are not an ORS network guarantee.\n\n"
+                "<details><summary>ORS refinement details</summary>\n\n"
+                f"{reason}{guard_note}\n\n</details>\n\n"
             )
             report.write_text(
                 report.read_text(encoding="utf-8").replace(
@@ -1174,7 +1170,7 @@ class OasisService:
         self.store.transition(
             run_id, ("running",), "succeeded",
             preview_result=retained if preview else None,
-            result=None if preview else retained,
+            result=retained,
             error=str(exc), progress=None,
         )
         self.store.append_event(run_id, {
