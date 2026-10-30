@@ -1002,6 +1002,8 @@ export interface components {
          * @description Describe a user-confirmable recovery without silently changing constraints.
          */
         RecoveryProposal: {
+              /** Independently verified single-parameter alternatives. */
+              alternatives?: { [key: string]: unknown }[];
             /** Diagnosis */
             diagnosis: string;
             /** Question */

@@ -626,6 +626,10 @@ class OasisService:
         llm_session_id: str | None = None,
     ) -> dict:
         """Persist and submit one immutable run specification."""
+        if spec.task.allow_hypothetical_sites and spec.task.analysis_goal == "facility_siting":
+            if spec.mode == "precise":
+                raise ValueError("Fixed-budget hypothetical planning is approximate only; use Quick or Auto, not Precise network")
+            spec = spec.model_copy(update={"mode": "quick"})
         if spec.task.analysis_goal in {"minimum_facilities", "minimum_threshold"} and not spec.task.coverage_diagnostic_handles:
             raise ValueError("Fix a travel-time threshold or a facility budget before running the coverage diagnostic.")
         internal_task = self._internal_task(spec.task, candidate_upload_id)
@@ -833,6 +837,12 @@ class OasisService:
                        "population_weighted_access_gini": baseline.get("population_weighted_access_gini"),
                        "mean_access_score": baseline.get("mean_access_score"),
                        "avg_walk": baseline.get("mean_travel_minutes")}
+        elif orch.ctx.has("hypothetical_coverage"):
+            extension = orch.ctx.get("hypothetical_coverage")
+            metrics = extension.get("metrics", {})
+            if extension.get("planning_mode") == "fixed_budget":
+                payload["routing_status"] = {"router": "haversine", "tier": "approximate", "modes": [orch.ctx.get("task").mobility_scenario],
+                                             "reason": "Post-paper hypothetical-site extension; no ORS matrix is requested"}
         for item in payload.get("results", []):
             if item.get("tool") == "build_travel_matrix" and item.get("ok"):
                 routing = dict(item.get("summary", {})); provenance = item.get("provenance") or {}
@@ -1067,6 +1077,9 @@ class OasisService:
             notice = ""
             if execution.accuracy == "approximate":
                 notice = (
+                    "> **Post-paper hypothetical-site extension:** Approximate Haversine travel. "
+                    "Hypothetical premises, public access, and network coverage are unverified. No ORS refinement is scheduled.\n\n"
+                ) if task.allow_hypothetical_sites and task.analysis_goal == "facility_siting" else (
                     "> **Approximate preview (Haversine):** This report uses estimated "
                     "straight-line travel times. Wait for ORS refinement before treating "
                     "the siting result as final.\n\n"

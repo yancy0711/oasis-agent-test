@@ -7,6 +7,14 @@ vi.mock("./MapView", () => ({ MapView: ({ url, showRoutePlanner }: { url: string
   <div data-testid="map">{url} {showRoutePlanner ? "routing enabled" : "routing hidden"}</div> }));
 afterEach(cleanup);
 
+it("explains why an infeasible extension has no map rather than appearing to keep loading", () => {
+  const result = { task: { analysis_goal: "facility_siting", allow_hypothetical_sites: true },
+    artifacts: {}, diagnostics: { hypothetical_coverage: { planning_mode: "fixed_budget", feasible: false } } } as unknown as RunResult;
+  render(<ResultTabs runId="infeasible-extension" result={result} />);
+  expect(screen.getByText(/no verified portfolio was produced/i)).toBeInTheDocument();
+  expect(screen.queryByTestId("map")).not.toBeInTheDocument();
+});
+
 it("labels the hypothetical map and never offers navigation to synthetic locations", async () => {
   const result = { task: { analysis_goal: "minimum_facilities", mobility_scenario: "walking" },
     artifacts: { hypothetical_coverage_map: "/hypothetical.geojson" } } as unknown as RunResult;

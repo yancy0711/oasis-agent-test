@@ -9,7 +9,9 @@ export function RecoveryPanel({ result, onRetry, retryPending = false, retryErro
   const [dismissed, setDismissed] = useState(false);
   const editor = useTaskEditor();
   if (!result.recovery || dismissed) return null;
-  const patch = safeRecoveryPatch(result.recovery.suggested_changes ?? {});
+  const alternatives = result.recovery.alternatives ?? [];
+  const legacyCoverageAdvice = result.task?.coverage_target != null && !alternatives.length;
+  const patch = legacyCoverageAdvice ? {} : safeRecoveryPatch(result.recovery.suggested_changes ?? {});
   const canApply = Object.keys(patch).length > 0;
   const osmUnavailable = /OpenStreetMap|Overpass/i.test(result.recovery.diagnosis)
     && /failed|unavailable|timeout|timed out|budget|cooling down|rate limit/i.test(result.recovery.diagnosis);
@@ -47,6 +49,12 @@ export function RecoveryPanel({ result, onRetry, retryPending = false, retryErro
       </details>
       <details><summary>Provider diagnostics</summary><p>{result.recovery.diagnosis}</p></details>
     </> : <><p>{result.recovery.diagnosis}</p><p>{result.recovery.question}</p></>}
+    {alternatives.length > 0 && <ul className="recovery-alternatives">{alternatives.map((option, index) => {
+      const changes = option.changes && typeof option.changes === "object" ? safeRecoveryPatch(option.changes as Record<string, unknown>) : {};
+      const verified = option.status === "verified" && Object.keys(changes).length > 0;
+      return <li key={String(option.parameter ?? index)}><p>{String(option.description)}{option.accuracy === "approximate" ? " Approximate travel estimate." : ""}</p>{verified && <button type="button" className="button--secondary" onClick={() => { editor.apply(changes); setDismissed(true); document.querySelector(".task-workspace form.panel")?.scrollIntoView({ behavior: "smooth" }); }}>{option.parameter === "n_facilities" ? "Use facility-count option" : "Use travel-time option"}</button>}</li>;
+    })}</ul>}
+    {legacyCoverageAdvice && !osmUnavailable && <p className="muted">This saved recommendation has no verified repair options. Run the task again to calculate them; your coverage target is kept.</p>}
     {canApply && <dl className="change-list">{Object.entries(patch).filter(([key]) => key !== "coverage_target_enabled").map(([key, value]) => <div key={key}><dt>{key.replaceAll("_", " ")}</dt><dd>{String(value)}</dd></div>)}</dl>}
     <div className="button-row">
       {solverTimedOut && onRetry && <button type="button" disabled={retryPending} onClick={onRetry}>{retryPending ? <LoadingText>Starting retry</LoadingText> : "Retry same task"}</button>}

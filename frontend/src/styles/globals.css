@@ -208,6 +208,8 @@ button { border: 0; border-radius: 11px; background: var(--green); color: white;
 .recovery-panel p { margin-bottom: 0; }
 .recovery-panel > .button-row { margin-top: 18px; gap: 10px; }
 .recovery-panel > details { margin-top: 12px; }
+.recovery-alternatives { display: grid; gap: 12px; padding-left: 20px; }
+.recovery-alternatives li > p { margin: 0 0 8px; }
 .change-list { display: grid; gap: 4px; margin: 12px 0; }
 .change-list div { display: flex; gap: 10px; }
 .change-list dt { font-weight: 700; text-transform: capitalize; }

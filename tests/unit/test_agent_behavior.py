@@ -495,7 +495,7 @@ def test_conflicting_full_coverage_requirement_stops_for_hitl():
     result = orch.execute(PlanStep(tool="coverage_probe_behavior_test"))
     assert not result.ok and result.error.kind == "constraint_conflict" and not result.error.retryable
     assert [event.stage for event in orch.ctx.history] == ["tool_call", "observation"]
-    assert "increase the facility budget or relax" in result.error.hint
+    assert "keep the coverage target" in result.error.hint
 
 def test_low_coverage_without_a_hard_target_is_valid():
     """A fixed-budget result remains valid when the user did not require full coverage."""
@@ -1063,13 +1063,15 @@ def test_hard_constraint_hitl_reports_exact_relaxation_bounds(monkeypatch):
 
     def minimum_facilities(ctx, **kwargs):
         """Return the exact fixed-threshold lower bound."""
-        summary = {"feasible": True, "minimum_facilities": 5, "threshold_minutes": 15}
+        summary = {"feasible": True, "minimum_facilities": 5, "threshold_minutes": 15,
+                   "coverage_target": 1.0, "coverage_group": "all", "verified_for_siting": True, "minimum_proven": True}
         ctx.put("minimum_facilities", summary)
         return ToolResult(ok=True, tool="find_minimum_facilities", handle="minimum_facilities", summary=summary)
 
     def minimum_threshold(ctx, **kwargs):
         """Return the exact fixed-budget threshold lower bound."""
-        summary = {"feasible": True, "minimum_threshold_minutes": 24.0}
+        summary = {"feasible": True, "minimum_threshold_minutes": 24.0, "n_facilities": 2,
+                   "coverage_target": 1.0, "coverage_group": "all", "verified_for_siting": True, "search_complete": True}
         ctx.put("minimum_threshold", summary)
         return ToolResult(ok=True, tool="find_minimum_threshold", handle="minimum_threshold", summary=summary)
 
@@ -1083,9 +1085,10 @@ def test_hard_constraint_hitl_reports_exact_relaxation_bounds(monkeypatch):
                     coverage_target=1.0, weights=ValueWeights())
     result = Orchestrator(llm, {"max_agent_steps": 5, "max_self_correction_rounds": 0}).run(task, explain=False)
     assert not result["ok"] and result["paused"] and result["outputs"] is None
-    assert "at least 5 facilities" in result["recovery"].diagnosis
-    assert "at least 24.0 minutes" in result["recovery"].diagnosis
-    assert result["recovery"].suggested_changes == {"n_facilities": 5}
+    alternatives = result["recovery"].alternatives
+    assert "use 5 facilities" in alternatives[0]["description"]
+    assert "use 24.0 minutes" in alternatives[1]["description"]
+    assert result["recovery"].suggested_changes == {"threshold_minutes": 24.0}
     assert [item.tool for item in result["results"]] == ["infeasible_analysis_behavior_test",
                                                           "find_minimum_facilities", "find_minimum_threshold"]
 

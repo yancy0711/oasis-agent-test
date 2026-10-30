@@ -76,7 +76,7 @@ def _solve_gradual_assignment(
     coverage_target: float | None = None,
     coverage_mask: np.ndarray | None = None,
     facility_capacities: np.ndarray | None = None,
-    *, cancel_check=None, heartbeat=None,
+    *, cancel_check=None, heartbeat=None, minimize_facilities: bool = False, feasibility_only: bool = False,
 ) -> tuple[list[int], str, np.ndarray]:
     """Select sites and assign splittable demand using distance-decayed benefit."""
     deadline = monotonic() + time_limit_s
@@ -97,14 +97,14 @@ def _solve_gradual_assignment(
     if target_mask.shape != (n_demand,) or not target_mask.any():
         raise ValueError("coverage_mask must select at least one aligned demand row")
 
-    problem = pulp.LpProblem("GradualCapacitatedCoverage", pulp.LpMaximize)
+    problem = pulp.LpProblem("GradualCapacitatedCoverage", pulp.LpMinimize if minimize_facilities else pulp.LpMaximize)
     x = [pulp.LpVariable(f"x_{j}", cat="Binary") for j in range(n_supply)]
     eligible = np.argwhere(benefit > 0)
     allocation = {
         (int(i), int(j)): pulp.LpVariable(f"q_{i}_{j}", lowBound=0, upBound=1)
         for i, j in eligible
     }
-    problem += pulp.lpSum(
+    problem += 0 if feasibility_only else pulp.lpSum(x) if minimize_facilities else pulp.lpSum(
         demand_weights[i] * benefit[i, j] * variable
         for (i, j), variable in allocation.items()
     )
@@ -335,7 +335,7 @@ def solve_mclp(travel_matrix: np.ndarray, demand_weights: np.ndarray,
                coverage_target: float | None = None,
                coverage_mask: np.ndarray | None = None,
                facility_capacities: np.ndarray | None = None, *,
-               cancel_check=None, heartbeat=None) -> SiteSolution:
+               cancel_check=None, heartbeat=None, feasibility_only: bool = False) -> SiteSolution:
     """Solve gradual capacitated coverage with explicit demand assignment."""
     travel_matrix = np.asarray(travel_matrix, dtype=float)
     demand_weights = np.asarray(demand_weights, dtype=float)
@@ -384,6 +384,7 @@ def solve_mclp(travel_matrix: np.ndarray, demand_weights: np.ndarray,
         facility_capacities,
         cancel_check=cancel_check,
         heartbeat=heartbeat,
+        feasibility_only=feasibility_only,
     )
     # Solver y values can be arbitrary for zero-weight rows. Always derive
     # reported coverage from the selected geography instead.
@@ -401,6 +402,22 @@ def solve_mclp(travel_matrix: np.ndarray, demand_weights: np.ndarray,
         assignment,
         facility_capacities,
     )
+
+def minimum_assignment_facilities(travel_matrix, population, equity_population, threshold_minutes,
+                                 candidate_ids, coverage_target, coverage_mask, facility_capacities=None,
+                                 time_limit_s=30, *, cancel_check=None, heartbeat=None):
+    """Minimize site count with the unchanged primary assignment/coverage constraints."""
+    chosen, status, assignment = _solve_gradual_assignment(
+        gradual_coverage_matrix(travel_matrix, threshold_minutes), population, population,
+        len(candidate_ids), time_limit_s, coverage_target, coverage_mask, facility_capacities,
+        cancel_check=cancel_check, heartbeat=heartbeat, minimize_facilities=True,
+    )
+    return _site_solution_from_selection(
+        travel_matrix, travel_matrix <= threshold_minutes, population, equity_population,
+        candidate_ids, chosen, status, "minimum_assignment_facilities", None, threshold_minutes,
+        assignment, facility_capacities,
+    )
+
 
 def solve_lscp(travel_matrix: np.ndarray, population: np.ndarray, vulnerable_mask: np.ndarray,
                threshold_minutes: float, candidate_ids: list[str], coverage_target: float = 1.0,

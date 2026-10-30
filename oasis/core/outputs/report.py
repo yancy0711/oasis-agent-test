@@ -285,7 +285,10 @@ def append_agent_narrative(report_path: str, narrative: ResultNarrative) -> str:
 
 def render_diagnostic_report(recovery: dict | None, diagnostics: dict) -> str:
     lines = ["# Feasibility Diagnostic", ""]
-    if recovery: lines += [recovery["diagnosis"], "", f"Next decision: {recovery['question']}"]
+    if recovery:
+        lines += [recovery["diagnosis"], "", f"Next decision: {recovery['question']}"]
+        for option in recovery.get("alternatives", []):
+            lines.append(f"- {option['description']} Status: {option['status']}; travel basis: {option['accuracy']}.")
     else: lines.append("The requested diagnostic completed successfully.")
     answers = diagnostics.get("result_query_answers", {}).get("answers", [])
     if answers:
@@ -317,7 +320,9 @@ def render_diagnostic_report(recovery: dict | None, diagnostics: dict) -> str:
     if extension:
         lines += ["", "## Post-paper extension: hypothetical sites",
                   "- Approximate Haversine travel; not ORS-verified. Hypothetical locations are not verified premises or buildable land.",
-                  "- Minimum means total facilities in the finite expanded candidate set, not unrestricted continuous placement.",
+                  ("- Fixed-budget siting with confirmed value weights and coverage requirement." if extension.get("planning_mode") == "fixed_budget" else "- Minimum means total facilities in the finite expanded candidate set, not unrestricted continuous placement."),
+                  f"- Facility budget: {extension.get('facility_budget', 'not fixed')}",
+                  f"- Coverage target: {extension.get('coverage_target')}",
                   f"- Threshold: {extension.get('threshold_minutes')} minutes",
                   f"- Minimum total facilities: {extension.get('minimum_facilities')}",
                   f"- Feasible facility count: {extension.get('feasible_facility_count')}",

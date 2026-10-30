@@ -18,7 +18,6 @@ export function taskFromDraft(draft: Record<string, unknown>): TaskSpec {
 }
 
 export function toTaskFormValues(task: TaskSpec): TaskFormValues {
-  const window = task.operating_window;
   const diagnostic = ["minimum_facilities", "minimum_threshold"].includes(task.analysis_goal);
   return {
     analysis_goal: task.analysis_goal,
@@ -41,11 +40,6 @@ export function toTaskFormValues(task: TaskSpec): TaskFormValues {
     weights: task.weights
       ? { ...task.weights, environment_burden: task.weights.environment_burden ?? 0 }
       : { population_density: 0.35, elderly_ratio: 0.15, poverty_rate: 0.15, heat_exposure: 0.2, environment_burden: 0.15 },
-    operating_window_enabled: Boolean(window),
-    service_date: window?.date ?? new Date().toISOString().slice(0, 10),
-    service_start: window?.start?.slice(0, 5) ?? "09:00",
-    service_end: window?.end?.slice(0, 5) ?? "17:00",
-    unknown_policy: window?.unknown_policy ?? "include",
     sensitivity_thresholds: task.sensitivity_thresholds?.length ? task.sensitivity_thresholds : [task.threshold_minutes],
     sensitivity_facility_counts: task.sensitivity_facility_counts?.length ? task.sensitivity_facility_counts : [task.n_facilities],
     regional_requirements: task.regional_requirements ?? [],
@@ -62,7 +56,7 @@ export function toTaskSpec(draft: TaskSpec, values: TaskFormValues, confirmedPla
   return {
     ...draft,
     analysis_goal: goal,
-    allow_hypothetical_sites: goal === "minimum_facilities" && values.allow_hypothetical_sites,
+    allow_hypothetical_sites: ["minimum_facilities", "facility_siting"].includes(goal) && values.allow_hypothetical_sites,
     place_name: confirmedPlace,
     place_names: [confirmedPlace],
     ambiguities: [],
@@ -80,9 +74,7 @@ export function toTaskSpec(draft: TaskSpec, values: TaskFormValues, confirmedPla
     candidate_amenities: values.candidate_amenities,
     comparison_profiles: values.comparison_profiles,
     weights: draft.analysis_goal === "heat_review" ? null : values.weights,
-    operating_window: values.operating_window_enabled ? {
-      date: values.service_date, start: values.service_start, end: values.service_end, unknown_policy: values.unknown_policy,
-    } : null,
+    operating_window: null,
     sensitivity_thresholds: values.sensitivity_thresholds,
     sensitivity_facility_counts: values.sensitivity_facility_counts,
     regional_requirements: values.regional_requirements,

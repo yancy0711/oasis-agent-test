@@ -25,7 +25,7 @@ OASIS is not a real-time navigation or emergency service. Researcher map routes 
 
 Candidate facilities are possible existing service locations, not confirmed cooling centers. Unknown opening hours, fees, access, capacity, and official status remain explicit.
 
-An optional, default-off **hypothetical-site extension** explores new locations for fixed-time coverage planning. Its separate map and counts are approximate post-paper results, not verified premises or network coverage.
+An optional, default-off **hypothetical-site extension** explores new locations for fixed-budget siting and minimum-facility planning. Its separate map and counts are approximate post-paper results, not verified premises or network coverage.
 
 ## Use cases
 

@@ -2,12 +2,20 @@ import { describe, expect, it } from "vitest";
 import { taskFromDraft, toTaskFormValues, toTaskSpec } from "./taskForm.mapper";
 
 describe("task form mapper", () => {
-  it("requires an explicit opt-in for hypothetical fixed-time planning and clears it for ordinary siting", () => {
+  it("keeps the explicit extension opt-in for minimum-count and fixed-budget tasks", () => {
     const draft = taskFromDraft({ place_name: "Riverside", analysis_goal: "minimum_facilities", threshold_minutes: 12 });
     const values = toTaskFormValues(draft);
     expect(values.allow_hypothetical_sites).toBe(false);
     expect(toTaskSpec(draft, { ...values, allow_hypothetical_sites: true }, "Riverside").allow_hypothetical_sites).toBe(true);
-    expect(toTaskSpec(draft, { ...values, allow_hypothetical_sites: true, coverage_target_enabled: false }, "Riverside").allow_hypothetical_sites).toBe(false);
+    expect(toTaskSpec(draft, { ...values, allow_hypothetical_sites: true, coverage_target_enabled: false }, "Riverside").allow_hypothetical_sites).toBe(true);
+  });
+  it("preserves a fixed budget, exact target, mode and value weights in the extension", () => {
+    const draft = taskFromDraft({ place_name: "Riverside", n_facilities: 10, threshold_minutes: 10,
+      mobility_scenario: "cycling", coverage_target: .9 });
+    const values = { ...toTaskFormValues(draft), allow_hypothetical_sites: true };
+    const task = toTaskSpec(draft, values, "Riverside");
+    expect(task).toMatchObject({ analysis_goal: "facility_siting", allow_hypothetical_sites: true,
+      n_facilities: 10, threshold_minutes: 10, coverage_target: .9, mobility_scenario: "cycling", weights: values.weights });
   });
   it("checks a fully specified coverage plan before asking for relaxations", () => {
     const draft = taskFromDraft({ place_name: "Riverside", analysis_goal: "minimum_facilities", threshold_minutes: 12 });
@@ -50,12 +58,11 @@ describe("task form mapper", () => {
     const values = {
       ...toTaskFormValues(draft), coverage_target_enabled: true, coverage_target: 0.9,
       facility_capacity_enabled: true, facility_capacity: 750,
-      operating_window_enabled: true, service_date: "2026-08-05", service_start: "09:00", service_end: "17:00",
       sensitivity_thresholds: [10, 15, 20], sensitivity_facility_counts: [4, 8],
       regional_requirements: [{ region: "South Phoenix", minimum_facilities: 2 }],
     };
     const task = toTaskSpec(draft, values, "Phoenix, Arizona, USA");
-    expect(task.operating_window).toEqual({ date: "2026-08-05", start: "09:00", end: "17:00", unknown_policy: "include" });
+    expect(task.operating_window).toBeNull();
     expect(task.regional_requirements).toEqual([{ region: "South Phoenix", minimum_facilities: 2 }]);
     expect(task.coverage_target).toBe(.9);
     expect(task.facility_capacity).toBe(750);

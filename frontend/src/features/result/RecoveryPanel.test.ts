@@ -13,9 +13,35 @@ describe("recovery patch allowlist", () => {
       n_facilities: 12, threshold_minutes: 20, coverage_target: .85,
       candidate_amenities: ["library", "school"], place_name: "Do not overwrite", weights: { poverty_rate: 1 },
     })).toEqual({
-      n_facilities: 12, threshold_minutes: 20, coverage_target: .85,
-      coverage_target_enabled: true, candidate_amenities: ["library", "school"],
+      n_facilities: 12, threshold_minutes: 20, candidate_amenities: ["library", "school"],
     });
+  });
+
+  it("rejects invalid numeric edits and preserves a user coverage target", () => {
+    expect(safeRecoveryPatch({ n_facilities: 148, threshold_minutes: Number.NaN, coverage_target: .9 })).toEqual({});
+    expect(safeRecoveryPatch({ threshold_minutes: 148 })).toEqual({ threshold_minutes: 148 });
+  });
+
+  it("shows both verified options and applies only the recommended single value", () => {
+    const apply = vi.fn();
+    function EditorListener() {
+      const editor = useTaskEditor();
+      useEffect(() => { editor.register(apply); return () => editor.register(null); }, [editor]);
+      return null;
+    }
+    const result = { task: { coverage_target: 1 }, recovery: {
+      diagnosis: "The confirmed plan is infeasible.", question: "Coverage target stays 100%.",
+      suggested_changes: { threshold_minutes: 20.1, coverage_target: .9 },
+      alternatives: [
+        { parameter: "n_facilities", status: "verified", changes: { n_facilities: 2 }, description: "Keep 15 minutes: use 2 facilities." },
+        { parameter: "threshold_minutes", status: "verified", changes: { threshold_minutes: 20.1 }, description: "Keep 1 facility: use 20.1 minutes." },
+      ],
+    } } as never;
+    render(createElement(TaskEditorProvider, null, createElement(EditorListener), createElement(RecoveryPanel, { result })));
+    expect(screen.getByText("Keep 15 minutes: use 2 facilities.")).toBeInTheDocument();
+    expect(screen.getByText("Keep 1 facility: use 20.1 minutes.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Apply to task editor" }));
+    expect(apply).toHaveBeenCalledWith({ threshold_minutes: 20.1 });
   });
 
   it("offers a study-area action for unsupported boundary recovery", () => {

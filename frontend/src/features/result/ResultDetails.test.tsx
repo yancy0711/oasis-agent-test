@@ -8,6 +8,18 @@ import { taskFromDraft } from "../task/taskForm.mapper";
 afterEach(cleanup);
 
 describe("facility-siting analysis", () => {
+  it("shows a standalone fixed-budget hypothetical result without claiming a minimum count", () => {
+    const result = { task: taskFromDraft({ place_name: "Riverside", allow_hypothetical_sites: true }),
+      message: "Fixed-budget extension completed.", diagnostics: { hypothetical_coverage: {
+        planning_mode: "fixed_budget", facility_budget: 10, threshold_minutes: 10, coverage_target: .9,
+        feasible_facility_count: 10, existing_selected_count: 3, hypothetical_selected_count: 7, solver_status: "Optimal",
+      } } } as unknown as RunResult;
+    render(<AnalysisView result={result} />);
+    expect(screen.getByRole("heading", { name: "Hypothetical sites: post-paper extension" })).toBeInTheDocument();
+    expect(screen.getByText("Fixed-budget extension completed.")).toBeInTheDocument();
+    expect(screen.getByText(/confirmed budget, time, coverage requirement, and value weights are retained/)).toBeInTheDocument();
+    expect(screen.queryByText("No additional diagnostics were produced for this run.")).not.toBeInTheDocument();
+  });
   it("renders wide routing metadata as a contained two-column field/value table", () => {
     const result = {
       ok: true, paused: false, message: "done", task: taskFromDraft({ place_name: "Phoenix" }),

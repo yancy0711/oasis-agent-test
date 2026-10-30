@@ -100,7 +100,7 @@ class TaskSpec(BaseModel):
     candidate_source: Literal["osm", "csv"] = "osm"
     candidate_file: str | None = None
     allow_hypothetical_sites: bool = Field(
-        False, description="Explicit opt-in post-paper extension for minimum-facility coverage planning. Adds tract-centroid hypothetical sites; uses approximate travel, not verified venues or network coverage.",
+        False, description="Explicit opt-in post-paper extension for fixed-budget siting or fixed-threshold minimum-facility planning. Adds tract-centroid hypothetical sites; uses approximate travel, not verified venues or network coverage.",
     )
     mobility_scenario: MobilityScenario = "walking"
     recommended_mobility_scenario: MobilityScenario | None = None
@@ -167,10 +167,11 @@ class TaskSpec(BaseModel):
         if self.equity_alpha is not None and self.coverage_target is not None:
             raise ValueError("equity_alpha cannot be combined with a hard coverage_target")
         if self.allow_hypothetical_sites:
-            if self.analysis_goal != "minimum_facilities" or self.coverage_diagnostic_handles != ("minimum_facilities",):
-                raise ValueError("Hypothetical sites require a fixed threshold with the facility count to calculate")
-            if self.mobility_scenario == "walk_drive_equity" or self.operating_window or self.facility_capacity or self.regional_requirements:
-                raise ValueError("Hypothetical sites currently support a single travel mode without capacity, operating-window, or regional constraints")
+            if not (self.analysis_goal == "facility_siting" or (
+                    self.analysis_goal == "minimum_facilities" and self.coverage_diagnostic_handles == ("minimum_facilities",))):
+                raise ValueError("Hypothetical sites support fixed-budget siting or a fixed-threshold minimum-facility question")
+            if self.mobility_scenario == "walk_drive_equity" or self.operating_window or self.facility_capacity or self.regional_requirements or self.equity_alpha is not None or self.result_queries:
+                raise ValueError("Hypothetical sites currently support a single travel mode without capacity, operating-window, regional, Pareto-alpha, or extra ranking constraints")
         return self
 
     def is_complete(self) -> bool:
@@ -312,3 +313,4 @@ class RecoveryProposal(BaseModel):
     diagnosis: str
     question: str
     suggested_changes: dict[str, Any] = Field(default_factory=dict)
+    alternatives: list[dict[str, Any]] = Field(default_factory=list)

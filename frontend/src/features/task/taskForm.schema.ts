@@ -29,11 +29,6 @@ export const taskFormSchema = z.object({
   candidate_amenities: z.array(z.string()).min(1, "Select at least one OpenStreetMap facility type."),
   comparison_profiles: z.array(z.string()).max(6),
   weights: weightsSchema,
-  operating_window_enabled: z.boolean(),
-  service_date: z.string(),
-  service_start: z.string(),
-  service_end: z.string(),
-  unknown_policy: z.enum(["include", "exclude"]),
   sensitivity_thresholds: z.array(z.number().positive()).max(12),
   sensitivity_facility_counts: z.array(z.number().int().min(1).max(100)).max(12),
   regional_requirements: z.array(z.object({
@@ -41,20 +36,12 @@ export const taskFormSchema = z.object({
     minimum_facilities: z.number().int().min(1).max(100),
   })),
 }).superRefine((values, context) => {
-  if (values.allow_hypothetical_sites && values.coverage_target_enabled
-      && values.diagnostic_fixed_inputs.length === 1 && values.diagnostic_fixed_inputs[0] === "threshold_minutes"
-      && (values.facility_capacity_enabled || values.operating_window_enabled || values.regional_requirements.length || values.mobility_scenario === "walk_drive_equity")) {
-    context.addIssue({ code: "custom", path: ["allow_hypothetical_sites"], message: "Use a single travel mode without capacity, service-hour, or regional constraints for this extension." });
+  if (values.allow_hypothetical_sites
+      && (values.facility_capacity_enabled || values.regional_requirements.length || values.mobility_scenario === "walk_drive_equity" || values.equity_alpha_enabled)) {
+    context.addIssue({ code: "custom", path: ["allow_hypothetical_sites"], message: "Use a single travel mode without capacity, regional constraints, or Pareto alpha for this extension." });
   }
   if ((values.coverage_target_enabled || ["minimum_facilities", "minimum_threshold"].includes(values.analysis_goal)) && !values.diagnostic_fixed_inputs.length) {
     context.addIssue({ code: "custom", path: ["diagnostic_fixed_inputs"], message: "Fix a travel-time threshold or a facility budget." });
-  }
-  if (values.operating_window_enabled) {
-    if (!values.service_date || !values.service_start || !values.service_end) {
-      context.addIssue({ code: "custom", path: ["service_date"], message: "Complete the date and service hours." });
-    } else if (values.service_end <= values.service_start) {
-      context.addIssue({ code: "custom", path: ["service_end"], message: "End time must be after start time." });
-    }
   }
   if (values.analysis_goal === "sensitivity_analysis") {
     if (!values.sensitivity_thresholds.length || !values.sensitivity_facility_counts.length) {

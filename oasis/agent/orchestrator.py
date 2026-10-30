@@ -619,10 +619,20 @@ class Orchestrator:
         defaults = {"n_facilities": self.cfg.get("optimization", {}).get("n_facilities", 10),
                     "threshold_minutes": self.cfg.get("accessibility", {}).get("threshold_minutes", 15)}
         runtime = {"defaults": defaults, "value_profiles": self.cfg.get("value_profiles", {})}
+        schema = TaskSpec.model_json_schema()
+        schema["properties"]["coverage_intent"] = {
+            "type": "object", "properties": {
+                "scope": {"type": "string", "enum": ["full", "partial", "none", "unclear"]},
+                "evidence": {"type": "string", "description": "Exact quote expressing who must have access; empty if no hard guarantee."},
+                "fraction": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+            }, "required": ["scope", "evidence", "fraction"], "additionalProperties": False,
+            "description": "Interpret coverage semantically: reachable throughout the whole area means full, even without the word coverage. A study-area mention alone means none. Respect negation and explicit percentages.",
+        }
+        schema.setdefault("required", []).append("coverage_intent")
         raw = self.llm.structured(
             load_prompt("task_parsing"),
             f"Runtime configuration: {json.dumps(runtime)}\nUser request: {user_prompt}",
-            schema=TaskSpec.model_json_schema(),
+            schema=schema,
         )
         if not isinstance(raw, dict):
             raw = {}
@@ -634,6 +644,26 @@ class Orchestrator:
             raw["notes"] = json.dumps(notes, sort_keys=True)
         elif not isinstance(notes, str):
             raw["notes"] = "" if notes is None else str(notes)
+        coverage_intent = raw.pop("coverage_intent", {})
+        if isinstance(coverage_intent, dict):
+            if coverage_intent.get("scope") == "none":
+                raw["coverage_target"] = None
+            evidence = str(coverage_intent.get("evidence") or "").strip()
+            if evidence and evidence.casefold() in user_prompt.casefold():
+                # Copy an explicit percentage from the quoted coverage evidence;
+                # a contradictory scope label must not turn 90% into 100%.
+                percent = _single_explicit_number(evidence, (r"(?<![\w.])(\d+(?:\.\d+)?)\s*(?:%|percent\b|per\s+cent\b)",))
+                if coverage_intent.get("scope") in {"full", "partial"} and percent is not None and 0 <= percent <= 100:
+                    raw["coverage_target"] = percent / 100
+                    if re.search(r"\barea\b", evidence, re.I):
+                        _append_note(raw, "Coverage uses modeled population/demand, not land area")
+                elif coverage_intent.get("scope") == "full":
+                    raw["coverage_target"] = 1.0
+                elif coverage_intent.get("scope") == "partial":
+                    fraction = _bounded_number(coverage_intent.get("fraction"), float, 0, 1)
+                    if fraction is not None:
+                        raw["coverage_target"] = fraction
+                _append_note(raw, f"Coverage requirement evidence: {evidence}")
         llm_count = raw.get("n_facilities")
         llm_threshold = raw.get("threshold_minutes")
         legacy_query = raw.pop("tract_ranking", None)
@@ -1008,6 +1038,8 @@ class Orchestrator:
 
     def _goal_handle(self, task: TaskSpec) -> str:
         """Return the handle proving the primary executable goal is complete."""
+        if task.allow_hypothetical_sites and task.analysis_goal == "facility_siting":
+            return "hypothetical_coverage"
         if task.analysis_goal in {"minimum_facilities", "minimum_threshold"} and task.coverage_diagnostic_handles:
             return task.coverage_diagnostic_handles[0]
         return {"facility_siting": "outputs", "tract_review": "result_query_answers", "heat_review": "heat_summary",
@@ -1032,7 +1064,7 @@ class Orchestrator:
 
     def _validated_changes(self, task: TaskSpec, changes: dict[str, Any]) -> dict[str, Any]:
         """Keep only typed human-editable changes proposed by the model."""
-        allowed = {"n_facilities", "threshold_minutes", "coverage_target", "candidate_amenities"}
+        allowed = {"n_facilities", "threshold_minutes", "candidate_amenities"}
         filtered = {key: value for key, value in changes.items() if key in allowed}
         amenities = filtered.get("candidate_amenities")
         if amenities and "school" not in task.candidate_amenities:
@@ -1047,18 +1079,19 @@ class Orchestrator:
         task = self.ctx.get("task", None)
         if not task: return None
         candidates = result.summary.get("candidates")
-        if isinstance(candidates, int) and task.analysis_goal == "facility_siting" and candidates < task.n_facilities:
+        if isinstance(candidates, int) and task.analysis_goal == "facility_siting" and not task.allow_hypothetical_sites and candidates < task.n_facilities:
             supplied = step.tool == "load_candidate_sites" or task.candidate_source == "csv"
             return ToolError(kind="constraint_conflict" if supplied else "insufficient_candidates",
                              message=f"Only {candidates} candidates are available for {task.n_facilities} requested facilities.",
                              hint=("Upload more candidate points or reduce the facility count." if supplied else
                                    "Broaden candidate amenity types or ask the user to reduce the facility count."),
                              retryable=not supplied)
+        # The primary solver constrains assigned target population. A descriptive
+        # tract-count ratio is not an independent failure of that constraint.
         covered = result.summary.get("covered_tract_ratio")
-        if task.coverage_target is not None and isinstance(covered, (int, float)) and covered + 1e-9 < task.coverage_target:
-            return ToolError(kind="constraint_conflict",
-                             message=f"The solution covers {covered:.1%} of tracts, below the requested {task.coverage_target:.1%}.",
-                             hint="Ask whether to increase the facility budget or relax the access threshold.", retryable=False)
+        if task.coverage_target == 1 and isinstance(covered, (int, float)) and covered + 1e-9 < 1:
+            return ToolError(kind="constraint_conflict", message="The reported solution leaves modeled demand uncovered under a full-coverage requirement.",
+                             hint="Review verified facility-count or travel-threshold alternatives; keep the coverage target.", retryable=False)
         return None
 
     def execute(self, step: PlanStep) -> ToolResult:
@@ -1116,7 +1149,7 @@ class Orchestrator:
 
     def propose_recovery(self, task: TaskSpec, result: ToolResult) -> RecoveryProposal:
         """Ask the LLM for a bounded HITL proposal after terminal tool feedback."""
-        allowed = {"n_facilities", "threshold_minutes", "coverage_target", "candidate_amenities"}
+        allowed = {"n_facilities", "threshold_minutes", "candidate_amenities"}
         evidence = {"task": task.model_dump(mode="json"), "failed_tool": result.tool,
                     "error": result.error.model_dump(mode="json") if result.error else None,
                     "summary": result.summary, "allowed_changes": sorted(allowed)}
@@ -1130,6 +1163,12 @@ class Orchestrator:
         return proposal
     def _completion_tool(self, task: TaskSpec) -> str | None:
         """Return the next deterministic dependency or finalizer for a confirmed goal."""
+        if task.allow_hypothetical_sites and task.analysis_goal == "facility_siting":
+            if not self.ctx.has("study"): return "resolve_study_area"
+            if not self.ctx.has("demand"): return "prepare_demand"
+            if not self.ctx.has("candidates"):
+                return "load_candidate_sites" if task.candidate_source == "csv" else "fetch_candidate_sites"
+            return None if self.ctx.has("hypothetical_coverage") else "plan_hypothetical_portfolio"
         primary_ready = self.ctx.has(self._goal_handle(task))
         if (
             task.result_queries
@@ -1229,6 +1268,12 @@ class Orchestrator:
                 question="Retry the same task, or increase the solver time budget in configuration. A timeout does not prove infeasibility; changing facility count or travel threshold is optional.",
                 suggested_changes={},
             )
+        if task.coverage_target is not None and (self.ctx.has("minimum_facilities") or self.ctx.has("minimum_threshold")):
+            from oasis.agent.recovery import coverage_recovery
+            travel = self.ctx.get("travel", {})
+            report = travel.get("routing_report", {})
+            accuracy = "network" if str(report.get("router", travel.get("router", ""))).startswith("ors") else "approximate"
+            return coverage_recovery(task, self.ctx.get("minimum_facilities", {}), self.ctx.get("minimum_threshold", {}), diagnosis, accuracy)
         options, changes = [], {}
         facilities = self.ctx.get("minimum_facilities", {})
         minimum = facilities.get("minimum_facilities") if facilities.get("feasible") else None
@@ -1353,6 +1398,16 @@ class Orchestrator:
                         f"Top {len(rows)} for {answer.get('metric_label')}: {ranking}."
                     )
         query_suffix = (" " + " ".join(query_parts)) if query_parts else ""
+        if task.allow_hypothetical_sites and task.analysis_goal == "facility_siting":
+            extension = self.ctx.get("hypothetical_coverage", {})
+            if extension.get("feasible"):
+                target = f" Confirmed coverage target: {task.coverage_target * 100:g}%." if task.coverage_target is not None else " No hard coverage target was imposed."
+                return (f"Post-paper hypothetical-site extension: selected {extension['feasible_facility_count']} facilities within the unchanged budget of {task.n_facilities}, at {task.threshold_minutes:g} minutes by {task.mobility_scenario}. "
+                        f"{extension['existing_selected_count']} existing and {extension['hypothetical_selected_count']} hypothetical locations.{target} "
+                        "The confirmed value weights are retained. Travel is approximate Haversine; locations and network coverage are unverified. See the extension map.")
+            reason = ("No feasible portfolio was found in the expanded finite candidate set under the confirmed budget and coverage constraints."
+                      if extension.get("solver_status") == "Infeasible" else "No verified portfolio was established within the extension's limits; infeasibility has not been proved.")
+            return f"Post-paper hypothetical-site extension: {reason} Budget, threshold, and coverage target are unchanged. " + str(extension.get("reason") or "")
         if task.analysis_goal == "heat_review" and self.ctx.has("heat_summary"):
             summary = self.ctx.get("heat_summary")
             top = summary.get("top_tracts", [])
@@ -1519,7 +1574,7 @@ class Orchestrator:
                 self._complete_constraint_diagnostics(task, results, steps)
                 recovery = self._failure_recovery(task, results, action.message)
                 last_error = next((item.error for item in reversed(results) if item.error), None)
-                if not recovery.suggested_changes and not (last_error and last_error.kind == "timeout"):
+                if task.coverage_target is None and not recovery.suggested_changes and not (last_error and last_error.kind == "timeout"):
                     recovery.suggested_changes = self._validated_changes(task, action.suggested_changes)
                 self.ctx.record("hitl", "The agent paused for a human-confirmed decision.",
                                 diagnosis=recovery.diagnosis, question=recovery.question,
@@ -1543,6 +1598,15 @@ class Orchestrator:
         else:
             safety_limited = True
             self.ctx.record("observation", f"The agent reached its {max_steps}-action safety limit.")
+
+        if ok and task.allow_hypothetical_sites and task.analysis_goal == "facility_siting":
+            extension_recovery = self.ctx.get("hypothetical_coverage", {}).get("recovery")
+            if extension_recovery:
+                recovery = RecoveryProposal(**extension_recovery)
+                ok, paused, message = False, True, recovery.diagnosis
+                self.ctx.record("hitl", "The hypothetical portfolio requires a confirmed repair.",
+                                diagnosis=recovery.diagnosis, question=recovery.question,
+                                suggested_changes=recovery.suggested_changes)
 
         if not ok and recovery is None:
             self._complete_constraint_diagnostics(task, results, steps)

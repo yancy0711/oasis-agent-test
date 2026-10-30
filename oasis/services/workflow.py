@@ -31,7 +31,8 @@ from oasis.core.data.overpass import OverpassUnavailable
 from oasis.core.data.opening_hours import filter_candidates_by_hours
 from oasis.core.optimization.mobility import compose_demand, scenario_modes
 from oasis.core.optimization.models import (build_demand_weights, minimum_coverage_threshold,
-                                       solve_lscp, solve_mclp)
+                                       minimum_assignment_facilities, solve_lscp, solve_mclp)
+from oasis.core.optimization.recovery import minimum_assignment_threshold
 from oasis.core.optimization.pareto import coverage_pareto_sweep, non_dominated
 from oasis.services.registry import registry
 from oasis.core.spatial.accessibility import (
@@ -652,16 +653,26 @@ def prepare_built_environment(
 def fetch_candidate_sites(ctx: Context, amenities: list[str], study_handle: str = "study") -> ToolResult:
     """Fetch candidate facility points for the requested OSM amenities."""
     study = ctx.get(study_handle)
+    task = ctx.get("task", None)
+    expanded_siting = bool(task and task.allow_hypothetical_sites and task.analysis_goal == "facility_siting")
     ctx.progress("Candidate facilities: querying OpenStreetMap", 0, 3, unit="stages")
     with scoped_cache(study["cache_scope"]):
         candidates, error = fetch_candidates(study["boundary"], amenities, check=ctx.check_cancelled, progress=ctx.progress)
-    if error: return ToolResult(ok=False, tool="fetch_candidate_sites", error=error)
+    if error:
+        if not (expanded_siting and error.kind == "not_found"):
+            return ToolResult(ok=False, tool="fetch_candidate_sites", error=error)
+        # A successful, empty lookup is different from a provider failure.
+        candidates = gpd.GeoDataFrame({"cand_id": pd.Series(dtype=str), "name": pd.Series(dtype=str)},
+                                       geometry=gpd.GeoSeries([], crs="EPSG:4326"), crs="EPSG:4326")
     acquisition = candidates.attrs.get("osm_acquisition", {})
     ctx.progress("Candidate facilities: received candidate records", 1, 3, unit="stages")
     ctx.progress("Candidate facilities: checking access and opening hours", 2, 3, unit="stages")
     potential = len(candidates)
     candidates, access = _filter_candidate_access(candidates)
-    candidates, hours = _filter_candidate_hours(ctx, candidates)
+    if candidates.empty and expanded_siting:
+        hours = {"enabled": False, "potential_candidates": 0, "available_candidates": 0}
+    else:
+        candidates, hours = _filter_candidate_hours(ctx, candidates)
     capacity_summary = {
         "observed_capacity_sites": int(candidates.get(
             "capacity_observed_people", pd.Series(dtype=float)
@@ -1052,7 +1063,7 @@ def optimize_sites(ctx: Context, n_facilities: int = 10, threshold_minutes: floa
             hint = "Retry the same inputs or allow more solver time. Feasibility has not been established."
         elif coverage_target is not None and max_tract_coverage + 1e-9 < coverage_target:
             hint = "Even all current candidates cannot meet the target at this threshold; increase the threshold or expand candidates."
-        else: hint = "Increase the facility budget or threshold, or relax the coverage target."
+        else: hint = "Review separately verified facility-count and travel-threshold alternatives; the coverage target is unchanged."
         analysis = {"solution": solution, "points": points, "frontier": non_dominated(points),
                     "n_facilities": n_facilities, "threshold_minutes": threshold_minutes,
                     "coverage_target": coverage_target, "diagnostics": diagnostics}
@@ -1104,6 +1115,20 @@ def optimize_sites(ctx: Context, n_facilities: int = 10, threshold_minutes: floa
                                "covered_tract_ratio": covered_tract_ratio, "all_tract_ratio": all_tract_ratio,
                                "frontier_points": len(analysis["frontier"]), **diagnostics})
 
+@registry.register("plan_hypothetical_portfolio", "Post-paper extension: fixed-budget siting over existing and hypothetical locations, using approximate travel.")
+@_guard("plan_hypothetical_portfolio")
+def plan_hypothetical_portfolio(ctx: Context) -> ToolResult:
+    """Keep the original portfolio budget and population-coverage constraint."""
+    task = ctx.get("task")
+    if not task.allow_hypothetical_sites or task.analysis_goal != "facility_siting":
+        raise ValueError("Fixed-budget hypothetical planning requires explicit opt-in")
+    from oasis.services.hypothetical import plan_hypothetical_sites
+    summary = plan_hypothetical_sites(ctx, _coverage_mask(ctx.get("demand"), task.coverage_group),
+                                      _cfg(ctx, "optimization").get("solver_time_limit_s", 120))
+    ctx.put("hypothetical_coverage", summary)
+    return ToolResult(ok=True, tool="plan_hypothetical_portfolio", handle="hypothetical_coverage", summary=summary)
+
+
 @registry.register("find_minimum_facilities", "Use LSCP to find the minimum facility count for a fixed threshold and coverage target.",
                    {"threshold_minutes": {"type": "number"}, "coverage_target": {"type": "number"},
                     "coverage_group": {"type": "string", "enum": ["all", "vulnerable"]}})
@@ -1115,15 +1140,24 @@ def find_minimum_facilities(ctx: Context, threshold_minutes: float = 15,
     matrix, population, vulnerable, _ = _decision_inputs(demand, travel)
     candidate_ids = candidates["cand_id"].astype(str).tolist(); mask = _coverage_mask(demand, coverage_group, travel)
     deadline = monotonic() + _cfg(ctx, "optimization").get("solver_time_limit_s", 120)
+    current = ctx.get("task", None)
+    siting_recovery = bool(current and current.analysis_goal == "facility_siting" and current.coverage_target is not None)
     ctx.progress("LSCP", 0, 1)
-    solution = solve_lscp(matrix, population, vulnerable,
-                          threshold_minutes, candidate_ids, coverage_target, mask,
-                          _cfg(ctx, "optimization").get("solver_time_limit_s", 120),
-                          cancel_check=ctx.check_cancelled,
-                          heartbeat=lambda: ctx.progress("LSCP", 0, 1))
+    if siting_recovery:
+        capacities, _ = _candidate_capacities(candidates, current.facility_capacity)
+        solution = minimum_assignment_facilities(
+            matrix, population, vulnerable, threshold_minutes, candidate_ids, coverage_target, mask,
+            capacities, max(0, deadline - monotonic()), cancel_check=ctx.check_cancelled,
+            heartbeat=lambda: ctx.progress("Checking facility-count alternative", 0, 1),
+        )
+    else:
+        solution = solve_lscp(matrix, population, vulnerable,
+                              threshold_minutes, candidate_ids, coverage_target, mask,
+                              _cfg(ctx, "optimization").get("solver_time_limit_s", 120),
+                              cancel_check=ctx.check_cancelled,
+                              heartbeat=lambda: ctx.progress("LSCP", 0, 1))
     ctx.progress("LSCP", 1, 1)
     feasible = solution.solver_status in {"Optimal", "Feasible"}
-    current = ctx.get("task", None)
     minimum = len(solution.selected_ids) if solution.solver_status == "Optimal" else None
     fixed_budget = (current.n_facilities if current and (
         current.analysis_goal not in {"minimum_facilities", "minimum_threshold"}
@@ -1136,10 +1170,12 @@ def find_minimum_facilities(ctx: Context, threshold_minutes: float = 15,
                "threshold_minutes": threshold_minutes, "coverage_target": coverage_target,
                "coverage_group": coverage_group, "solver_status": solution.solver_status,
                "selected_ids": solution.selected_ids}
+    if siting_recovery:
+        summary.update(verified_for_siting=feasible, coverage_model="linear_gradual_assignment")
     nearest = matrix.min(axis=1)
     targeted = nearest[mask]
     summary.update(target_demand_units=int(mask.sum()),
-                   uncovered_demand_units=int((targeted > threshold_minutes).sum()),
+                   uncovered_demand_units=int(((targeted >= threshold_minutes) if siting_recovery else (targeted > threshold_minutes)).sum()),
                    candidate_count=len(candidate_ids))
     study = ctx.get("study", {})
     if feasible and study and "areas" in demand:
@@ -1150,7 +1186,7 @@ def find_minimum_facilities(ctx: Context, threshold_minutes: float = 15,
             study.get("boundary"), task=ctx.get("task", None),
         )
     ctx.put("minimum_facilities", {"solution": solution, **summary})
-    if current and current.allow_hypothetical_sites:
+    if current and current.allow_hypothetical_sites and current.analysis_goal == "minimum_facilities":
         from oasis.services.hypothetical import plan_hypothetical_sites
         ctx.put("hypothetical_coverage", plan_hypothetical_sites(ctx, mask, deadline - monotonic()))
     # With no fixed budget, a failed time constraint needs a concrete alternative,
@@ -1208,18 +1244,28 @@ def find_minimum_threshold(ctx: Context, n_facilities: int = 10,
     candidate_ids = candidates["cand_id"].astype(str).tolist(); mask = _coverage_mask(demand, coverage_group, travel)
     optimization = _cfg(ctx, "optimization")
     search_diagnostics = {}
-    threshold, solution = minimum_coverage_threshold(
-        matrix, population, vulnerable, candidate_ids,
-        n_facilities, coverage_target, mask,
-        optimization.get("solver_time_limit_s", 120), ctx.progress,
-        total_time_limit_s=optimization.get("minimum_threshold_total_time_limit_s", 90),
-        search_diagnostics=search_diagnostics,
-        cancel_check=ctx.check_cancelled,
-    )
     current = ctx.get("task", None)
     report = travel.get("routing_report") or {}
     policy_limit = report.get("policy_minutes")
     pruned = any(int(mode.get("pruned_pairs", 0)) > 0 for mode in report.get("mode_reports", {}).values())
+    siting_recovery = bool(current and current.analysis_goal == "facility_siting" and current.coverage_target is not None)
+    if siting_recovery:
+        capacities, _ = _candidate_capacities(candidates, current.facility_capacity)
+        threshold, solution, search_diagnostics = minimum_assignment_threshold(
+            matrix, population, vulnerable, candidate_ids, n_facilities, coverage_target, mask, capacities,
+            optimization.get("minimum_threshold_total_time_limit_s", 90),
+            policy_limit=policy_limit if pruned and str(report.get("router", travel.get("router", ""))).startswith("ors") else None,
+            cancel_check=ctx.check_cancelled, progress=ctx.progress,
+        )
+    else:
+        threshold, solution = minimum_coverage_threshold(
+            matrix, population, vulnerable, candidate_ids,
+            n_facilities, coverage_target, mask,
+            optimization.get("solver_time_limit_s", 120), ctx.progress,
+            total_time_limit_s=optimization.get("minimum_threshold_total_time_limit_s", 90),
+            search_diagnostics=search_diagnostics,
+            cancel_check=ctx.check_cancelled,
+        )
     scope_limited = (str(report.get("router", travel.get("router", ""))).startswith("ors")
                      and pruned and search_diagnostics.get("status") == "complete"
                      and policy_limit is not None
@@ -1239,6 +1285,8 @@ def find_minimum_threshold(ctx: Context, n_facilities: int = 10,
                "search": search_diagnostics,
                "search_complete": search_diagnostics.get("status") == "complete",
                "selected_ids": solution.selected_ids if solution else []}
+    if siting_recovery:
+        summary.update(verified_for_siting=threshold is not None, coverage_model="linear_gradual_assignment")
     study = ctx.get("study", {})
     if solution and threshold is not None and study and "areas" in demand:
         out = Path(_cfg(ctx, "output").get("dir", "outputs_run")) / study["cache_scope"]

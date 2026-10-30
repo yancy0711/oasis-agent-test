@@ -7,11 +7,29 @@ import { taskFromDraft } from "./taskForm.mapper";
 afterEach(cleanup);
 
 describe("advanced task editor", () => {
+  it("enables the extension for a fixed budget without changing confirmed inputs", async () => {
+    const submit = vi.fn();
+    const changeMode = vi.fn();
+    const task = taskFromDraft({ place_name: "Riverside", n_facilities: 10, threshold_minutes: 10,
+      coverage_target: .9, mobility_scenario: "cycling" });
+    render(<TaskEditorProvider><TaskForm task={task} mode="auto" ready pending={false} uploadPending={false} uploadedName={null}
+      profiles={[]} onModeChange={changeMode} onUpload={() => undefined} onSubmit={submit} /></TaskEditorProvider>);
+    const extension = screen.getByRole("checkbox", { name: "Allow hypothetical sites (extension)" });
+    expect(extension).toBeEnabled();
+    fireEvent.click(extension);
+    expect(changeMode).toHaveBeenCalledWith("quick");
+    expect(screen.getByLabelText("Execution")).toHaveValue("quick");
+    expect(screen.getByLabelText("Execution")).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Run confirmed agent" }));
+    await waitFor(() => expect(submit).toHaveBeenCalledOnce());
+    expect(submit.mock.calls[0][0]).toMatchObject({ allow_hypothetical_sites: true, n_facilities: 10,
+      threshold_minutes: 10, mobility_scenario: "cycling", coverage_target: .9 });
+  });
   it("offers hypothetical placement only as an unchecked post-paper extension", async () => {
     const submit = vi.fn();
     render(<TaskEditorProvider><TaskForm task={taskFromDraft({ place_name: "Riverside", analysis_goal: "minimum_facilities", threshold_minutes: 12 })} mode="quick" ready pending={false} uploadPending={false} uploadedName={null}
       profiles={[]} onModeChange={() => undefined} onUpload={() => undefined} onSubmit={submit} /></TaskEditorProvider>);
-    const option = screen.getByRole("checkbox", { name: "Allow hypothetical sites (post-paper extension)" });
+    const option = screen.getByRole("checkbox", { name: "Allow hypothetical sites (extension)" });
     expect(option).not.toBeChecked();
     fireEvent.click(option);
     fireEvent.click(screen.getByRole("button", { name: "Run confirmed agent" }));
@@ -115,7 +133,7 @@ describe("advanced task editor", () => {
     expect(choose).toHaveBeenCalledWith(0, "minimum_facilities");
   });
 
-  it("applies recommendations and submits operating and sensitivity controls", async () => {
+  it("applies recommendations and submits sensitivity controls without operating-window controls", async () => {
     const submit = vi.fn();
     const task = taskFromDraft({
       place_name: "Phoenix", analysis_goal: "sensitivity_analysis",
@@ -141,18 +159,14 @@ describe("advanced task editor", () => {
     fireEvent.change(poverty, { target: { value: "0.4" } });
     expect(screen.getByText("Weights are ready.")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByLabelText(/Filter candidate availability/));
-    expect(screen.getAllByRole("button", { name: "More information" }).length).toBeGreaterThan(0);
-    expect(screen.getByRole("tooltip", { name: /Filters candidate facilities using the selected local date/ })).toBeInTheDocument();
-    fireEvent.change(container.querySelector('[name="service_date"]')!, { target: { value: "2026-08-05" } });
-    fireEvent.change(container.querySelector('[name="service_start"]')!, { target: { value: "09:00" } });
-    fireEvent.change(container.querySelector('[name="service_end"]')!, { target: { value: "17:00" } });
+    expect(screen.queryByLabelText(/Filter candidate availability/)).not.toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "Allow hypothetical sites (extension)" })).toBeDisabled();
     expect(screen.queryByRole("button", { name: "Add regional requirement" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Run confirmed agent" }));
 
     await waitFor(() => expect(submit).toHaveBeenCalledOnce());
     const values = submit.mock.calls[0][0];
-    expect(values.operating_window_enabled).toBe(true);
+    expect(values).not.toHaveProperty("operating_window_enabled");
     expect(values.regional_requirements).toEqual([]);
     expect(values.sensitivity_thresholds).toEqual([10, 20]);
   });
