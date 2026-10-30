@@ -58,6 +58,7 @@ export function MapView({ initialRouteMode = "walking", url, runId, paretoPrevie
   const mobile = useMediaQuery("(max-width: 620px)");
   const [data, setData] = useState<MapDataset | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const [mapReady, setMapReady] = useState(false);
   const [bearing, setBearing] = useState(0);
   const [planningEnabled, setPlanningEnabled] = useState(false);
@@ -210,20 +211,32 @@ export function MapView({ initialRouteMode = "walking", url, runId, paretoPrevie
     if (!url) { setData(null); return; }
     const controller = new AbortController();
     setError(null);
-    fetch(url, { signal: controller.signal }).then((response) => {
+    setData(null);
+    setMapReady(false);
+    fetch(url, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]) }).then((response) => {
       if (!response.ok) throw new Error(`Map data request failed (${response.status})`);
       return response.json() as Promise<MapDataset>;
     }).then((payload) => {
       if (payload.type !== "FeatureCollection" || payload.metadata?.renderer !== "maplibre") throw new Error("The map artifact is not valid OASIS MapLibre data.");
-      setData(payload);
-    }).catch((reason: unknown) => { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : "Could not load map data."); });
+      if (!controller.signal.aborted) setData(payload);
+    }).catch((reason: unknown) => {
+      if (!controller.signal.aborted) setError(reason instanceof Error && reason.name === "TimeoutError"
+        ? "Map data request timed out. Retry loading the map."
+        : reason instanceof Error ? reason.message : "Could not load map data.");
+    });
     return () => controller.abort();
-  }, [url]);
+  }, [url, loadAttempt]);
 
   useEffect(() => {
     if (!data || !containerRef.current) return;
     setMapReady(false);
-    const map = new maplibregl.Map({ container: containerRef.current, style: baseMapStyle, attributionControl: false });
+    let map: MapLibreMap;
+    try {
+      map = new maplibregl.Map({ container: containerRef.current, style: baseMapStyle, attributionControl: false });
+    } catch {
+      setError("The interactive map could not start. Check browser WebGL support and retry loading the map.");
+      return;
+    }
     mapRef.current = map;
     const mapSizeObserver = new ResizeObserver(() => map.resize());
     mapSizeObserver.observe(containerRef.current);
@@ -234,7 +247,8 @@ export function MapView({ initialRouteMode = "walking", url, runId, paretoPrevie
     map.on("rotate", updateBearing);
     let popup: maplibregl.Popup | null = null;
 
-    map.on("load", () => {
+    // Result layers must not wait for remote basemap tiles to finish loading.
+    map.once("style.load", () => {
       map.addSource(MAP_SOURCE_ID, { type: "geojson", data });
       map.addSource(ROUTE_SOURCE_ID, { type: "geojson", data: EMPTY_ROUTE });
       map.addSource(PARETO_SOURCE_ID, { type: "geojson", data: EMPTY_ROUTE });
@@ -340,7 +354,7 @@ export function MapView({ initialRouteMode = "walking", url, runId, paretoPrevie
   }, [paretoPreview, mapReady]);
 
   useEffect(() => {
-    const map = mapRef.current; if (!mapReady || !map?.isStyleLoaded()) return;
+    const map = mapRef.current; if (!mapReady || !map) return;
     const visibility = (visible: boolean) => visible ? "visible" : "none";
     [MAP_LAYER_IDS.tracts, MAP_LAYER_IDS.tractOutline].forEach((id) => map.setLayoutProperty(id, "visibility", visibility(layers.tracts)));
     map.setLayoutProperty(MAP_LAYER_IDS.boundary, "visibility", visibility(layers.boundary));
@@ -465,13 +479,13 @@ export function MapView({ initialRouteMode = "walking", url, runId, paretoPrevie
   };
 
   if (!url) return <p className="empty-tab">A map is produced after a successful spatial analysis.</p>;
-  if (error) return <p className="error error--block">{error}</p>;
+  if (error) return <div className="error error--block" role="alert"><p>{error}</p><button type="button" className="button--secondary" onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry map</button></div>;
   const range = data?.metadata.value_range;
   const displayIndicator = data ? indicatorLabel(data.metadata.indicator_label) : "";
   const routeWarning = !routeBusy && /outside the (?:current study area|analyzed boundary)|not found|denied|could not|failed|timed out|not available|invalid/i.test(routeStatus);
   return <div className="map-view">
     <div ref={containerRef} className="map-canvas" aria-label="Interactive analysis map" />
-    {!data && <p className="map-loading"><LoadingText>Loading interactive map</LoadingText></p>}
+    {!mapReady && <p className="map-loading" role="status"><LoadingText>Loading interactive map</LoadingText></p>}
     {data && <>
       {showRoutePlanner && <div ref={routeControlRef} className={`map-route-control${routeCollapsed ? " is-collapsed" : ""}`} style={{ transform: `translate(${routePosition.x}px, ${routePosition.y}px)` }}>
         <div className="map-route-control__handle" onPointerDown={startPanelDrag} onPointerMove={movePanel} onPointerUp={stopPanelDrag} onPointerCancel={stopPanelDrag}>

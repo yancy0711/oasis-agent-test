@@ -25,6 +25,8 @@ OASIS is not a real-time navigation or emergency service. Researcher map routes 
 
 Candidate facilities are possible existing service locations, not confirmed cooling centers. Unknown opening hours, fees, access, capacity, and official status remain explicit.
 
+An optional, default-off **hypothetical-site extension** explores new locations for fixed-time coverage planning. Its separate map and counts are approximate post-paper results, not verified premises or network coverage.
+
 ## Use cases
 
 **Researcher / planner.** Analyze cooling-facility access in a US city or county, diagnose underserved areas, compare scenarios, and explore efficiency-equity Pareto trade-offs. Results include interactive maps, coverage and fairness metrics, reports, and data provenance.
@@ -32,6 +34,7 @@ Candidate facilities are possible existing service locations, not confirmed cool
 ```text
 Select 10 candidate cooling facilities in Riverside, California within a 15-minute walk.
 Which Riverside tracts are hardest to serve? Compare efficiency and access inequality.
+How many facilities are needed to cover all modeled demand within a 10-minute walk in Riverside? Also find the minimum threshold with a budget of 10 facilities.
 ```
 
 **Individual resident.** Find nearby candidate cooling places from an address, a map point, or your current location. Filter by place category and walking, cycling, or driving time, then select a destination for directions. No facility budget or analysis run is required; listed places are not guaranteed to be officially designated or currently open cooling centers.

@@ -72,6 +72,51 @@ Different CBC versions can choose different tied optima or make different progre
 
 ## 4. Update configuration or code
 
+### Fast recovery when the page reports 502 or stops responding
+
+A successful rebuild also restarts services, so recovery after a rebuild does
+not prove that rebuilding was necessary. Check both network hops first:
+
+```bash
+docker compose ps -a
+curl --max-time 3 --fail http://127.0.0.1:8000/health
+curl --max-time 3 --fail http://127.0.0.1:5173/api/health
+docker compose logs --tail=80 frontend backend
+```
+
+If port 8000 works but the proxied health check fails, restart only Nginx:
+
+```bash
+docker compose restart frontend
+```
+
+If the backend is stopped or unreachable, first save the logs above, then:
+
+```bash
+docker inspect "$(docker compose ps -a -q backend)" --format 'status={{.State.Status}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}} restarts={{.RestartCount}}'
+docker compose restart backend
+docker compose restart frontend
+```
+
+A backend restart interrupts active jobs and clears in-memory LLM/resident
+sessions; reconnect the model and rerun the task as needed. Disk caches and
+outputs remain. If `oom=true`, review Docker Desktop memory allocation and
+close competing work before repeating a large analysis. If both health checks
+work, diagnose the particular LLM/OSM/ORS error instead of restarting the app.
+If Docker itself is unavailable after sleep, resume/start Docker Desktop, then
+run `docker compose up -d --no-build`.
+
+Nginx now uses Docker DNS to refresh the backend address every five seconds.
+Both services use `restart: unless-stopped`; this restarts an exited process,
+not an unhealthy-but-running process, and does not undo a manual stop. BLAS
+threads are bounded to reduce resource multiplication in Pareto worker processes.
+The lightweight `/health` endpoint does not wait for the synchronous API worker
+pool. These measures do not guarantee third-party provider availability.
+
+For the demonstration, keep the Mac awake and connected to power, pre-run the
+main cases, and avoid pulling/rebuilding during the live session. Use
+`caffeinate -i` in a separate open terminal to prevent idle sleep.
+
 After changing only `.env`, recreate the backend and restart Nginx so it resolves the backend's current container address:
 
 ```bash

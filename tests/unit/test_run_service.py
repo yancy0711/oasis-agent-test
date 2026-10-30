@@ -48,6 +48,19 @@ def test_solver_phase_budgets_use_configured_preview_limit():
     assert service.cfg["optimization"]["solver_preview_time_limit_s"] == 60
 
 
+@pytest.mark.parametrize("primary", ["minimum_facilities", "minimum_threshold"])
+def test_diagnostic_artifacts_publish_both_maps_and_prefer_primary(tmp_path, primary):
+    service = _parse_service({})
+    diagnostics = {}
+    for name in ("minimum_facilities", "minimum_threshold"):
+        path = tmp_path / f"{name}.geojson"
+        path.write_text('{"type":"FeatureCollection","features":[]}', encoding="utf-8")
+        diagnostics[name] = {"map": str(path)}
+    result = service._artifacts("paired", {"task": {"analysis_goal": primary}, "diagnostics": diagnostics}, tmp_path)
+    assert result["map"] == result[f"{primary}_map"]
+    assert "minimum_facilities_map" in result and "minimum_threshold_map" in result
+
+
 def test_parse_requires_one_choice_when_the_model_extracts_multiple_places():
     service = _parse_service({
         "place_name": "Phoenix, Arizona, USA",
@@ -144,6 +157,7 @@ def test_precise_minimum_diagnostic_keeps_labeled_approximate_threshold_bound():
     task = TaskSpec(
         place_name="Phoenix, Arizona, USA", analysis_goal="minimum_facilities",
         n_facilities=10, threshold_minutes=15, coverage_target=1.0,
+        diagnostic_fixed_inputs=["n_facilities", "threshold_minutes"],
     )
     preview = {
         "message": (
@@ -171,8 +185,23 @@ def test_precise_minimum_diagnostic_keeps_labeled_approximate_threshold_bound():
     bound = precise["diagnostics"]["approximate_minimum_threshold"]
     assert bound["accuracy"] == "approximate_haversine"
     assert bound["minimum_threshold_minutes"] == 131.6
-    assert "No number of the retained candidate facilities" in precise["message"]
+    assert "not an ORS network bound" in precise["message"]
     assert precise["message"].count(ranking) == 1
+
+
+def test_count_only_diagnostic_retains_a_labeled_approximate_arrangement():
+    task = TaskSpec(place_name="Riverside", analysis_goal="minimum_facilities", threshold_minutes=12)
+    preview = {"diagnostics": {"coverage_alternative": {
+        "feasible": True, "threshold_minutes": 38.7, "minimum_facilities": 12,
+        "feasible_facility_count": 12, "selected_ids": ["a", "b"],
+    }}}
+    precise = {"message": "12 minutes is infeasible.", "diagnostics": {}}
+    OasisService._carry_preview_diagnostic_bounds(task, preview, precise)
+    alternative = precise["diagnostics"]["coverage_alternative"]
+    assert alternative["accuracy"] == "approximate_haversine"
+    assert alternative["selected_ids"] == ["a", "b"]
+    assert "minimum_threshold" not in precise["diagnostics"]
+    assert "38.7 minutes" in precise["message"] and "not been verified by ORS" in precise["message"]
 
 
 def test_parse_rejects_only_when_every_requested_result_is_unavailable():

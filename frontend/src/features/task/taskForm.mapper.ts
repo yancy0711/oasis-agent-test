@@ -19,16 +19,20 @@ export function taskFromDraft(draft: Record<string, unknown>): TaskSpec {
 
 export function toTaskFormValues(task: TaskSpec): TaskFormValues {
   const window = task.operating_window;
+  const diagnostic = ["minimum_facilities", "minimum_threshold"].includes(task.analysis_goal);
   return {
     analysis_goal: task.analysis_goal,
+    allow_hypothetical_sites: task.allow_hypothetical_sites ?? false,
     n_facilities: task.n_facilities,
     threshold_minutes: task.threshold_minutes,
+    diagnostic_fixed_inputs: task.diagnostic_fixed_inputs ?? (task.analysis_goal === "minimum_facilities"
+      ? ["threshold_minutes"] : task.analysis_goal === "minimum_threshold" ? ["n_facilities"] : ["n_facilities", "threshold_minutes"]),
     facility_capacity_enabled: task.facility_capacity != null,
     facility_capacity: task.facility_capacity ?? 1000,
     equity_alpha_enabled: task.equity_alpha != null,
     equity_alpha: task.equity_alpha ?? 0.5,
-    coverage_target_enabled: task.coverage_target != null,
-    coverage_target: task.coverage_target ?? 0.8,
+    coverage_target_enabled: diagnostic || task.coverage_target != null,
+    coverage_target: task.coverage_target ?? (diagnostic ? 1 : 0.8),
     mobility_scenario: task.mobility_scenario,
     candidate_source: task.candidate_source,
     coverage_group: task.coverage_group,
@@ -49,14 +53,23 @@ export function toTaskFormValues(task: TaskSpec): TaskFormValues {
 }
 
 export function toTaskSpec(draft: TaskSpec, values: TaskFormValues, confirmedPlace: string): TaskSpec {
+  let goal = values.analysis_goal as TaskSpec["analysis_goal"];
+  if (values.coverage_target_enabled && values.diagnostic_fixed_inputs.length === 1) {
+    goal = values.diagnostic_fixed_inputs.includes("threshold_minutes") ? "minimum_facilities" : "minimum_threshold";
+  } else if (["minimum_facilities", "minimum_threshold"].includes(goal)) {
+    goal = "facility_siting";
+  }
   return {
     ...draft,
-    analysis_goal: values.analysis_goal as TaskSpec["analysis_goal"],
+    analysis_goal: goal,
+    allow_hypothetical_sites: goal === "minimum_facilities" && values.allow_hypothetical_sites,
     place_name: confirmedPlace,
     place_names: [confirmedPlace],
     ambiguities: [],
     n_facilities: values.n_facilities,
     threshold_minutes: values.threshold_minutes,
+    diagnostic_fixed_inputs: ["minimum_facilities", "minimum_threshold"].includes(goal)
+      ? values.diagnostic_fixed_inputs : null,
     facility_capacity: values.facility_capacity_enabled ? values.facility_capacity : null,
     equity_alpha: values.equity_alpha_enabled ? values.equity_alpha : null,
     coverage_target: values.coverage_target_enabled ? values.coverage_target : null,

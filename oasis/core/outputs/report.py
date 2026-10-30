@@ -313,6 +313,25 @@ def render_diagnostic_report(recovery: dict | None, diagnostics: dict) -> str:
                   f"- Feasible facility count: {facilities.get('feasible_facility_count', value)}",
                   f"- Threshold: {facilities.get('threshold_minutes', 'unknown')} minutes"]
     threshold = diagnostics.get("minimum_threshold", {})
+    extension = diagnostics.get("hypothetical_coverage", {})
+    if extension:
+        lines += ["", "## Post-paper extension: hypothetical sites",
+                  "- Approximate Haversine travel; not ORS-verified. Hypothetical locations are not verified premises or buildable land.",
+                  "- Minimum means total facilities in the finite expanded candidate set, not unrestricted continuous placement.",
+                  f"- Threshold: {extension.get('threshold_minutes')} minutes",
+                  f"- Minimum total facilities: {extension.get('minimum_facilities')}",
+                  f"- Feasible facility count: {extension.get('feasible_facility_count')}",
+                  f"- Existing / hypothetical selected: {extension.get('existing_selected_count')} / {extension.get('hypothetical_selected_count')}",
+                  f"- Solver status: {extension.get('solver_status')}"]
+    alternative = diagnostics.get("coverage_alternative", {})
+    if alternative:
+        lines += ["", "## Alternative coverage plan",
+                  f"- Accuracy: {alternative.get('accuracy')}",
+                  f"- Alternative threshold: {alternative.get('threshold_minutes')} minutes",
+                  f"- Minimum facilities: {alternative.get('minimum_facilities', 'not proven')}",
+                  f"- Feasible facility count: {alternative.get('feasible_facility_count')}",
+                  "- The original time requirement is not met; this is an explicitly relaxed alternative.",
+                  "- Selected facilities: " + ", ".join(str(site.get("name", site.get("id"))) for site in alternative.get("selected_sites", []))]
     if threshold:
         value = threshold.get("minimum_threshold_minutes")
         complete = threshold.get("search_complete", True)

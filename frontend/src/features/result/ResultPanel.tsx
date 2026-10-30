@@ -10,6 +10,8 @@ export function ResultPanel({ snapshot }: { snapshot: RunSnapshot }) {
   const retry = useReviseRun(snapshot.run_id);
   const result = visibleResult(snapshot);
   const message = agentMessage(snapshot);
+  const diagnostic = result && ["minimum_facilities", "minimum_threshold"].includes(result.task.analysis_goal);
+  const fixedInputs = result?.task.diagnostic_fixed_inputs ?? (result?.task.analysis_goal === "minimum_facilities" ? ["threshold_minutes"] : ["n_facilities"]);
   const approximateFallback = Boolean(
     snapshot.error && result?.execution.accuracy === "approximate"
   );
@@ -31,8 +33,8 @@ export function ResultPanel({ snapshot }: { snapshot: RunSnapshot }) {
         <>
           <div className="run-context" aria-label="Current decision context">
             <span><b>Place</b>{result.task.place_name}</span>
-            <span><b>Facilities</b>{result.task.n_facilities}</span>
-            <span><b>Threshold</b>{result.task.threshold_minutes} min</span>
+            <span><b>Facilities</b>{diagnostic && !fixedInputs.includes("n_facilities") ? "To calculate" : result.task.n_facilities}</span>
+            <span><b>Threshold</b>{diagnostic && !fixedInputs.includes("threshold_minutes") ? "To calculate" : `${result.task.threshold_minutes} min`}</span>
             <span><b>Mobility</b>{result.task.mobility_scenario}</span>
             <span><b>Equity setting</b>{result.task.equity_alpha == null ? "Not applied" : `α = ${result.task.equity_alpha}`}</span>
           </div>

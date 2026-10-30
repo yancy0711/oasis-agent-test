@@ -120,6 +120,8 @@ def _site_properties(row: pd.Series, task: TaskSpec | None) -> dict[str, Any]:
             getattr(task, "mobility_scenario", "Not specified"),
         ),
     }
+    if row.get("is_hypothetical") is True or str(row.get("is_hypothetical")) == "True":
+        properties.update(is_hypothetical=True, facility_type="Hypothetical site (post-paper extension)")
     access_label = {
             "osm_public": "OSM marks access as public/permissive",
             "conditional": "OSM access is conditional; verify the stated restriction",

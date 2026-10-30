@@ -33,7 +33,7 @@ function valueOrThrow<T>(data: T | undefined, error: unknown, fallback: string):
 }
 
 export async function getConfig(): Promise<UiConfigResponse> {
-  const { data, error } = await client.GET("/v1/config");
+  const { data, error } = await client.GET("/v1/config", { signal: AbortSignal.timeout(10_000) });
   return valueOrThrow(data, error, "Could not load application configuration.");
 }
 

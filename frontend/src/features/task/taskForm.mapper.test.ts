@@ -2,6 +2,37 @@ import { describe, expect, it } from "vitest";
 import { taskFromDraft, toTaskFormValues, toTaskSpec } from "./taskForm.mapper";
 
 describe("task form mapper", () => {
+  it("requires an explicit opt-in for hypothetical fixed-time planning and clears it for ordinary siting", () => {
+    const draft = taskFromDraft({ place_name: "Riverside", analysis_goal: "minimum_facilities", threshold_minutes: 12 });
+    const values = toTaskFormValues(draft);
+    expect(values.allow_hypothetical_sites).toBe(false);
+    expect(toTaskSpec(draft, { ...values, allow_hypothetical_sites: true }, "Riverside").allow_hypothetical_sites).toBe(true);
+    expect(toTaskSpec(draft, { ...values, allow_hypothetical_sites: true, coverage_target_enabled: false }, "Riverside").allow_hypothetical_sites).toBe(false);
+  });
+  it("checks a fully specified coverage plan before asking for relaxations", () => {
+    const draft = taskFromDraft({ place_name: "Riverside", analysis_goal: "minimum_facilities", threshold_minutes: 12 });
+    const values = { ...toTaskFormValues(draft), n_facilities: 7,
+      diagnostic_fixed_inputs: ["n_facilities", "threshold_minutes"] as const };
+    const task = toTaskSpec(draft, { ...values, diagnostic_fixed_inputs: [...values.diagnostic_fixed_inputs] }, "Riverside");
+    expect(task.analysis_goal).toBe("facility_siting");
+    expect(task.n_facilities).toBe(7);
+    expect(task.coverage_target).toBe(1);
+    expect(task.diagnostic_fixed_inputs).toBeNull();
+  });
+
+  it("returns to ordinary full analysis when the coverage target is removed", () => {
+    const draft = taskFromDraft({ place_name: "Riverside", analysis_goal: "minimum_facilities" });
+    const task = toTaskSpec(draft, { ...toTaskFormValues(draft), coverage_target_enabled: false }, "Riverside");
+    expect(task.analysis_goal).toBe("facility_siting");
+    expect(task.coverage_target).toBeNull();
+  });
+  it.each(["minimum_facilities", "minimum_threshold"] as const)("preserves the unknown variable in %s", (goal) => {
+    const draft = taskFromDraft({ place_name: "Phoenix", analysis_goal: goal });
+    const values = toTaskFormValues(draft);
+    const expected = goal === "minimum_facilities" ? ["threshold_minutes"] : ["n_facilities"];
+    expect(values.diagnostic_fixed_inputs).toEqual(expected);
+    expect(toTaskSpec(draft, values, "Phoenix").diagnostic_fixed_inputs).toEqual(expected);
+  });
   it("fills deterministic UI defaults and binds the confirmed place", () => {
     const draft = taskFromDraft({ place_name: "Phoenix", n_facilities: 4 });
     const values = toTaskFormValues(draft);

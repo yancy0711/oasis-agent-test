@@ -86,6 +86,22 @@ The additional agent-selectable tools are:
 | `compare_scenarios` | How do the last two successful optimization scenarios differ? |
 | `compare_value_profiles` | How do two or more confirmed value profiles differ on one shared spatial baseline? |
 
+Coverage diagnostics distinguish fixed inputs from unknowns: a fixed travel
+threshold requests the minimum facility count; a fixed facility budget requests
+the minimum threshold. When both inputs are fixed, solve the coverage plan first;
+an infeasible pair triggers the complementary relaxations. Siting defaults do not
+become diagnostic constraints. A sparse ORS matrix
+cannot establish infeasibility beyond its evaluated routing range. Ordinary
+facility selection retains its existing workflow; hard-coverage failures can
+offer these two complementary relaxations.
+
+If a fixed time cannot cover the target even with all candidates, report the
+unserved demand count. Without a fixed budget, a separate alternative finds the
+earliest supported threshold rounded up to 0.1 minute, then minimizes facilities
+at that threshold and maps their locations. Approximate alternatives retained
+from the quick phase remain labeled as such; they do not satisfy the original
+time constraint and are not certified network results.
+
 ### Step 1: resolve the study area
 
 ```python
@@ -246,6 +262,8 @@ in `tests/integration/test_pipeline_agent.py`. It runs both paths on the same sy
 data and compares the complete serialized `SiteSolution` objects.
 
 ## 5. Agent entry
+
+The optional **Allow hypothetical sites (post-paper extension)** control applies only to fixed-threshold minimum-facility diagnostics and is off by default. It adds one hypothetical location at each target tract demand centre (up to 250 target tracts), then minimizes total facilities over the existing and generated finite candidate set. Existing-only diagnostics remain separate. This extension uses a consistent Haversine approximation for both types of site and reports the travel assumptions, solver status, selected coordinates, and existing/hypothetical counts. It does not establish a continuous-space minimum, buildability, public access, or ORS network coverage. Capacity, operating-window, regional-count, and mixed-mode constraints are not supported by this extension; ordinary paper-model analysis and resident navigation are unchanged.
 
 `cli.main.run_agent()` validates the task through HITL and then runs a bounded observation-action loop:
 

@@ -1604,6 +1604,10 @@ export interface components {
          * @description Structured, human-confirmable task extracted from natural language.
          */
         TaskSpec: {
+              /** Explicit post-paper hypothetical-site planning extension; disabled by default. */
+              allow_hypothetical_sites?: boolean;
+            /** Explicit fixed inputs for coverage diagnostics; defaults are not constraints. */
+            diagnostic_fixed_inputs?: ("n_facilities" | "threshold_minutes")[] | null;
             /**
              * Place Name
              * @description One human-confirmed geocodable US city or county

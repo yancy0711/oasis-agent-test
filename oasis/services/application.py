@@ -626,6 +626,8 @@ class OasisService:
         llm_session_id: str | None = None,
     ) -> dict:
         """Persist and submit one immutable run specification."""
+        if spec.task.analysis_goal in {"minimum_facilities", "minimum_threshold"} and not spec.task.coverage_diagnostic_handles:
+            raise ValueError("Fix a travel-time threshold or a facility budget before running the coverage diagnostic.")
         internal_task = self._internal_task(spec.task, candidate_upload_id)
         run_id = uuid4().hex
         public_spec = spec.model_dump(mode="json")
@@ -748,10 +750,13 @@ class OasisService:
         if process.pid is None:
             return
         if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                capture_output=True, check=False, timeout=5,
-            )
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    capture_output=True, check=False, timeout=3,
+                )
+            except subprocess.TimeoutExpired:
+                process.kill()
         else:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
@@ -852,7 +857,12 @@ class OasisService:
         self._add_artifact(manifest, "heat_analysis", heat.get("analysis_chart"), root)
         if "report" not in manifest: self._add_artifact(manifest, "report", heat.get("report"), root)
         diagnostics = payload.get("diagnostics") or {}
-        for handle in ("minimum_facilities", "minimum_threshold", "reachability_analysis",
+        primary = (payload.get("task") or {}).get("analysis_goal")
+        for handle in ("minimum_facilities", "minimum_threshold", "coverage_alternative", "hypothetical_coverage"):
+            self._add_artifact(manifest, f"{handle}_map", (diagnostics.get(handle) or {}).get("map"), root)
+        if "map" not in manifest and primary in {"minimum_facilities", "minimum_threshold"}:
+            self._add_artifact(manifest, "map", (diagnostics.get(primary) or {}).get("map"), root)
+        for handle in ("minimum_facilities", "minimum_threshold", "coverage_alternative", "hypothetical_coverage", "reachability_analysis",
                        "scenario_comparison", "result_query_answers"):
             if "map" not in manifest:
                 diagnostic = diagnostics.get(handle) or {}
@@ -923,15 +933,24 @@ class OasisService:
         task: TaskSpec, prior_preview: dict | None, payload: dict
     ) -> None:
         """Keep an explicitly labeled screening bound that sparse ORS cannot recompute."""
-        if task.analysis_goal != "minimum_facilities" or not prior_preview:
+        if task.analysis_goal not in {"minimum_facilities", "minimum_threshold"} or not prior_preview:
             return
         precise_diagnostics = payload.setdefault("diagnostics", {})
-        precise_facilities = precise_diagnostics.get("minimum_facilities") or {}
+        preview_alternative = (prior_preview.get("diagnostics") or {}).get("coverage_alternative") or {}
+        if not (precise_diagnostics.get("coverage_alternative") or {}).get("feasible") and preview_alternative.get("feasible"):
+            alternative = deepcopy(preview_alternative)
+            alternative["accuracy"] = "approximate_haversine"
+            precise_diagnostics["coverage_alternative"] = alternative
+            count = alternative.get("minimum_facilities")
+            count_text = f"a minimum of {count}" if count is not None else f"a feasible set of {alternative['feasible_facility_count']}"
+            payload["message"] = (str(payload.get("message") or "") +
+                f" Approximate Haversine alternative: at {alternative['threshold_minutes']:.1f} minutes, {count_text} facilities meet the coverage target. Their arrangement is available on the alternative map. This changes the requested threshold and has not been verified by ORS.")
+        if "minimum_threshold" not in task.coverage_diagnostic_handles:
+            return
         precise_threshold = precise_diagnostics.get("minimum_threshold") or {}
         preview_threshold = (prior_preview.get("diagnostics") or {}).get("minimum_threshold") or {}
         if (
-            precise_facilities.get("feasible")
-            or precise_threshold.get("feasible")
+            precise_threshold.get("feasible")
             or not preview_threshold.get("feasible")
         ):
             return
@@ -943,20 +962,11 @@ class OasisService:
         )
         precise_diagnostics["approximate_minimum_threshold"] = screening
         prefix = str(payload.get("message") or "").strip()
-        preview_facilities = (prior_preview.get("diagnostics") or {}).get("minimum_facilities") or {}
-        coverage_target = float(preview_facilities.get("coverage_target", 1.0))
-        coverage_group = str(preview_facilities.get("coverage_group", "all")).replace("_", " ")
-        confirmed_threshold = float(preview_facilities.get("threshold_minutes", task.threshold_minutes))
         minutes = float(screening["minimum_threshold_minutes"])
         facilities = int(screening.get("n_facilities", task.n_facilities))
-        preview_message = (
-            f"No number of the retained candidate facilities can cover {coverage_target:.0%} "
-            f"of the {coverage_group} group within {confirmed_threshold:g} minutes. With "
-            f"{facilities} facilities, the smallest computed threshold is {minutes:.1f} "
-            f"minutes by {task.mobility_scenario.replace('_', ' ')}."
-        )
-        supplement = " The approximate Haversine screening result is retained"
-        supplement += f": {preview_message}"
+        qualifier = "minimum" if screening.get("search_complete", True) else "best feasible (minimum not proven)"
+        supplement = (f" The approximate Haversine screening result is retained: {qualifier} threshold "
+                      f"{minutes:.1f} minutes with {facilities} facilities. This is not an ORS network bound.")
         payload["message"] = prefix + supplement
 
     def _execute_phase(
@@ -1073,6 +1083,12 @@ class OasisService:
         payload = self._public(internal)
         payload["task"] = spec.task.model_dump(mode="json")
         payload["artifacts"] = self._publish_artifacts(run_id, phase, manifest, preview=preview)
+        if (phase == "precise" and prior_preview
+                and (payload.get("diagnostics", {}).get("coverage_alternative") or {}).get("accuracy") == "approximate_haversine"
+                and "coverage_alternative_map" not in payload["artifacts"]):
+            alternative_map = (prior_preview.get("artifacts") or {}).get("coverage_alternative_map")
+            if alternative_map:
+                payload["artifacts"]["coverage_alternative_map"] = alternative_map
         if (
             phase == "precise" and prior_preview
             and "map" not in payload["artifacts"]

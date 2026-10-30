@@ -263,6 +263,13 @@ def test_lscp_can_guarantee_only_the_vulnerable_demand_group():
     assert solution.solver_status == "Optimal" and solution.selected_ids == ["a"]
 
 
+def test_minimum_threshold_accepts_a_budget_larger_than_the_candidate_set():
+    matrix = np.array([[3., 8.], [8., 4.]])
+    threshold, solution = minimum_coverage_threshold(
+        matrix, np.ones(2), np.zeros(2, bool), ["a", "b"], n_facilities=10, time_limit_s=5)
+    assert threshold == 4 and len(solution.selected_ids) == 2
+
+
 def test_minimum_threshold_search_uses_observed_matrix_breakpoints():
     """The fixed-budget search must return the exact first feasible travel-time breakpoint."""
     threshold, solution = minimum_coverage_threshold(

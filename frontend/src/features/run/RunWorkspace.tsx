@@ -19,13 +19,14 @@ export function RunWorkspace() {
   if (query.isLoading) {
     return <section className="panel empty-state"><p><LoadingText>{`Loading run ${runId.slice(0, 8)}`}</LoadingText></p></section>;
   }
-  if (query.isError || !query.data) {
-    return <section className="panel"><p className="error error--block">{query.error?.message ?? "Run unavailable."}</p></section>;
+  if (!query.data) {
+    return <section className="panel"><p className="error error--block">{query.error?.message ?? "Run unavailable."}</p><button type="button" onClick={() => void query.refetch()}>Retry connection</button></section>;
   }
 
   const snapshot = query.data;
   return (
     <div className="run-workspace">
+      {query.isError && <div className="notice" role="alert"><p>Connection interrupted. Showing the last received result; the server's current state is unknown.</p><button type="button" className="button--secondary" onClick={() => void query.refetch()}>Retry connection</button></div>}
       <section className="panel run-summary">
         <div className="section-heading">
           <div><p className="eyebrow">Run {snapshot.run_id.slice(0, 8)}</p><h2>{snapshot.task.place_name}</h2></div>

@@ -389,6 +389,35 @@ def test_structured_output_uses_json_schema_when_one_is_supplied():
     assert calls[0]["extra_body"]["provider"]["require_parameters"] is True
 
 
+@pytest.mark.parametrize("source", ["openrouter_admission_control", "upstream_provider_shared_pool"])
+@pytest.mark.parametrize("header_in_metadata", [False, True])
+def test_rate_limit_stops_json_fallback_and_preserves_provider_wait(source, header_in_metadata):
+    import httpx
+    from openai import OpenAI
+    calls = []
+    def respond(request):
+        calls.append(request)
+        metadata = {"limit_source": source}
+        if header_in_metadata:
+            metadata["headers"] = {"Retry-After": "10"}
+        return httpx.Response(429, json={"error": {
+            "code": 429, "message": "Request admission failed.", "metadata": metadata,
+        }}, headers={} if header_in_metadata else {"Retry-After": "10"})
+    client = LLMClient.__new__(LLMClient)
+    client.cfg = {"provider": "openrouter", "model": "vendor/model"}
+    with OpenAI(api_key="test-only", max_retries=0,
+                http_client=httpx.Client(transport=httpx.MockTransport(respond))) as sdk:
+        client.client = sdk
+        with pytest.raises(RuntimeError) as caught:
+            client.structured("Parse.", "Find cooling facilities.", schema=TaskSpec.model_json_schema())
+    message = str(caught.value)
+    assert len(calls) == 1  # No switch to JSON/tool/prompt after a provider 429.
+    assert "Wait at least 10 seconds" in message and "HTTP 429" in message
+    assert "compatibility attempts" not in message
+    if source == "openrouter_admission_control":
+        assert "does not by itself mean your balance is exhausted" in message
+
+
 def test_gemini_region_failure_stops_before_json_compatibility_retries():
     calls = []
 
@@ -1085,16 +1114,16 @@ def test_hard_coverage_with_travel_requires_feasibility_optimization():
                     threshold_minutes=15, coverage_target=1.0, weights=ValueWeights())
     assert orch._completion_tool(task) == "optimize_sites"
 
-def test_fixed_count_and_minimum_goal_conflict_requires_confirmation():
-    """A fixed budget conflicting with a minimum-count goal must not be silently overwritten."""
+def test_explicit_coverage_budget_is_solved_before_relaxation():
+    """Two explicit coverage inputs define a plan to solve before relaxing it."""
     llm = RecordingLLM([{"place_name": "San Francisco, California, USA",
                          "analysis_goal": "minimum_facilities", "n_facilities": 1,
                          "threshold_minutes": 15, "coverage_target": 1.0, "weights": None}])
     task = Orchestrator(llm, {}).parse_task(
         "Give me a plan of setting 1 site in San Francisco, and every tract must be reachable within 15 minutes.")
-    assert task.analysis_goal == "minimum_facilities"
+    assert task.analysis_goal == "facility_siting"
     assert task.n_facilities == 1 and task.coverage_target == 1.0
-    assert any(item.field == "analysis_goal" for item in task.ambiguities)
+    assert not any(item.field == "analysis_goal" for item in task.ambiguities)
 
 
 def test_explicit_minimum_facility_question_keeps_diagnostic_goal():
@@ -1104,6 +1133,17 @@ def test_explicit_minimum_facility_question_keeps_diagnostic_goal():
                          "threshold_minutes": 15, "coverage_target": 1.0, "weights": None}])
     task = Orchestrator(llm, {}).parse_task("How many sites are needed to cover every tract within 15 minutes?")
     assert task.analysis_goal == "minimum_facilities"
+
+
+def test_paired_diagnostic_preserves_a_custom_time_and_companion_budget():
+    llm = RecordingLLM([{"place_name": "Riverside, California, USA", "analysis_goal": "minimum_facilities",
+                         "threshold_minutes": 12, "n_facilities": 7, "coverage_target": 1.0}])
+    task = Orchestrator(llm, {}).parse_task(
+        "How many facilities are needed to cover everyone in Riverside within a 12-minute walk? "
+        "Also find the minimum threshold with a budget of 7 facilities.")
+    assert task.threshold_minutes == 12 and task.n_facilities == 7
+    assert task.analysis_goal == "facility_siting"
+    assert not any(item.field == "analysis_goal" for item in task.ambiguities)
 
 
 def test_minimal_number_wording_is_not_silently_downgraded():
@@ -1133,7 +1173,7 @@ def test_minimum_and_reachability_goals_have_deterministic_finalizers():
     )) == "analyze_reachability"
 
 
-def test_infeasible_minimum_facilities_continues_to_threshold_answer(monkeypatch):
+def test_infeasible_minimum_facilities_does_not_invent_a_budget(monkeypatch):
     def minimum_facilities(ctx, **_kwargs):
         summary = {
             "feasible": False, "minimum_facilities": None,
@@ -1170,11 +1210,160 @@ def test_infeasible_minimum_facilities_continues_to_threshold_answer(monkeypatch
     ), explain=False)
 
     assert result["ok"]
-    assert [item.tool for item in result["results"]] == [
-        "find_minimum_facilities", "find_minimum_threshold",
-    ]
+    assert [item.tool for item in result["results"]] == ["find_minimum_facilities"]
     assert "No number of the retained candidate facilities" in result["message"]
-    assert "42.1 minutes by walking" in result["message"]
+    assert "42.1" not in result["message"] and "10 facilities" not in result["message"]
+
+
+@pytest.mark.parametrize("primary", ["minimum_facilities", "minimum_threshold"])
+@pytest.mark.parametrize("minutes,expected_count", [(8, 3), (10, 2), (25, 1)])
+def test_minimum_diagnostics_solve_both_questions_and_write_both_maps(tmp_path, primary, minutes, expected_count):
+    cfg = {"output": {"dir": str(tmp_path)}, "optimization": {
+        "solver_time_limit_s": 5, "minimum_threshold_total_time_limit_s": 5,
+    }}
+    orch = Orchestrator(RecordingLLM([]), cfg)
+    orch.ctx.put("config", cfg)
+    areas = gpd.GeoDataFrame({"GEOID": ["1", "2", "3"], "population": [10., 10., 10.],
+                              "heat_exposure": [30., 31., 32.]},
+                             geometry=[box(i, 0, i + .5, .5) for i in range(3)], crs="EPSG:4326")
+    orch.ctx.put("study", {"cache_scope": "paired", "boundary": None})
+    orch.ctx.put("demand", {"areas": areas, "population": np.ones(3) * 10,
+                            "vulnerable_mask": np.ones(3, bool)})
+    orch.ctx.put("candidates", gpd.GeoDataFrame({"cand_id": ["a", "b", "c"],
+                                                "name": ["A", "B", "C"]},
+                                               geometry=[Point(i, 0) for i in range(3)], crs="EPSG:4326"))
+    orch.ctx.put("travel", {"matrix": np.array([[1., 9., 20.], [9., 1., 20.], [20., 20., 2.]])})
+    result = orch.run(TaskSpec(place_name="Test city", analysis_goal=primary,
+                              n_facilities=1, threshold_minutes=minutes, coverage_target=1,
+                              diagnostic_fixed_inputs=["n_facilities", "threshold_minutes"]), explain=False)
+    assert result["ok"] and not orch.llm.calls
+    facilities, threshold = (result["diagnostics"][name] for name in ("minimum_facilities", "minimum_threshold"))
+    assert facilities["minimum_facilities"] == expected_count and facilities["minimum_proven"]
+    assert facilities["threshold_minutes"] == minutes
+    assert threshold["minimum_threshold_minutes"] == 20 and threshold["search_complete"]
+    assert len(facilities["selected_ids"]) == expected_count and len(threshold["selected_ids"]) == 1
+    for name, diagnostic in (("minimum_facilities", facilities), ("minimum_threshold", threshold)):
+        data = json.loads(Path(diagnostic["map"]).read_text())
+        sites = [feature for feature in data["features"] if feature["properties"]["layer_kind"] == "selected_site"]
+        assert len(sites) == len(diagnostic["selected_ids"])
+    assert f"At least {expected_count}" in result["message"] and "20.0 minutes" in result["message"]
+
+
+def test_complementary_answer_survives_an_unverified_count_timeout():
+    orch = Orchestrator(RecordingLLM([]), {})
+    orch.ctx.put("minimum_facilities", {"feasible": False, "solver_status": "Not Solved", "threshold_minutes": 10})
+    orch.ctx.put("minimum_threshold", {"feasible": True, "search_complete": False,
+                                     "minimum_threshold_minutes": 20, "n_facilities": 5})
+    message = orch._completion_message(TaskSpec(place_name="Test", analysis_goal="minimum_facilities",
+                                               diagnostic_fixed_inputs=["n_facilities", "threshold_minutes"]))
+    assert "does not establish infeasibility" in message
+    assert "best feasible threshold" in message and "20.0 minutes" in message
+
+
+@pytest.mark.parametrize("goal", ["minimum_facilities", "minimum_threshold"])
+def test_single_unknown_diagnostic_does_not_use_the_other_default(goal):
+    cfg = {"optimization": {"solver_time_limit_s": 5, "minimum_threshold_total_time_limit_s": 5}}
+    orch = Orchestrator(RecordingLLM([]), cfg)
+    count = 12 if goal == "minimum_facilities" else 2
+    matrix = np.full((count, count), 99. if count == 12 else 40.)
+    np.fill_diagonal(matrix, 1. if count == 12 else 30.)
+    orch.ctx.put("study", {})
+    orch.ctx.put("demand", {"population": np.ones(count), "vulnerable_mask": np.ones(count, bool)})
+    orch.ctx.put("candidates", pd.DataFrame({"cand_id": list(map(str, range(count)))}))
+    orch.ctx.put("travel", {"matrix": matrix})
+    task = TaskSpec(place_name="Test", analysis_goal=goal, coverage_target=1,
+                    **({"threshold_minutes": 2} if count == 12 else {"n_facilities": 1}))
+    result = orch.run(task, explain=False)
+    assert result["ok"] and [item.tool for item in result["results"]] == [f"find_{goal}"]
+    summary = result["diagnostics"][goal]
+    if count == 12:
+        assert summary["minimum_facilities"] == 12 and summary["current_facilities"] is None
+        assert "10 facilities" not in result["message"]
+    else:
+        assert summary["minimum_threshold_minutes"] == 40 and summary["current_threshold_minutes"] is None
+
+
+def test_parser_does_not_turn_a_numeric_default_into_a_diagnostic_budget():
+    llm = RecordingLLM([{"place_name": "Riverside", "analysis_goal": "minimum_facilities",
+                         "n_facilities": 10, "threshold_minutes": 12, "coverage_target": 1,
+                         "diagnostic_fixed_inputs": ["threshold_minutes"]}])
+    task = Orchestrator(llm, {}).parse_task("How many facilities are needed to cover every tract in Riverside within 12 minutes?")
+    assert task.coverage_diagnostic_handles == ("minimum_facilities",)
+    with pytest.raises(ValueError, match="input is unknown"):
+        Orchestrator(RecordingLLM([]), {})._bind_task_args(PlanStep(tool="find_minimum_threshold"), task)
+
+
+def test_explicit_paired_constraints_report_the_original_budget_as_infeasible():
+    orch = Orchestrator(RecordingLLM([]), {})
+    task = TaskSpec(place_name="Test", analysis_goal="minimum_facilities", n_facilities=7, threshold_minutes=12,
+                    diagnostic_fixed_inputs=["n_facilities", "threshold_minutes"])
+    orch.ctx.put("minimum_facilities", {"feasible": True, "minimum_facilities": 9, "threshold_minutes": 12})
+    orch.ctx.put("minimum_threshold", {"feasible": True, "minimum_threshold_minutes": 18,
+                                     "search_complete": True, "n_facilities": 7})
+    message = orch._completion_message(task)
+    assert "combination of 7 facilities and 12 minutes is infeasible" in message
+    assert "At least 9" in message and "18.0 minutes" in message
+
+
+def test_network_scope_limit_does_not_claim_global_infeasibility():
+    cfg = {"optimization": {"solver_time_limit_s": 5, "minimum_threshold_total_time_limit_s": 5}}
+    orch = Orchestrator(RecordingLLM([]), cfg)
+    orch.ctx.put("demand", {"population": np.ones(2), "vulnerable_mask": np.ones(2, bool)})
+    orch.ctx.put("candidates", pd.DataFrame({"cand_id": ["a", "b"]}))
+    orch.ctx.put("travel", {"matrix": np.array([[5., np.inf], [np.inf, np.inf]]),
+                            "routing_report": {"router": "ors_sparse", "policy_minutes": 12,
+                                               "mode_reports": {"walking": {"pruned_pairs": 2}}}})
+    task = TaskSpec(place_name="Test", analysis_goal="minimum_threshold", n_facilities=1)
+    orch.ctx.put("task", task)
+    result = registry.get("find_minimum_threshold").fn(ctx=orch.ctx, n_facilities=1)
+    assert result.ok and result.summary["search"]["status"] == "routing_scope_limited"
+    assert not result.summary["search_complete"]
+    assert "feasibility beyond it is unknown" in orch._completion_message(task)
+
+
+def test_impossible_time_returns_an_arrangement_without_inventing_a_budget(tmp_path):
+    count = 12
+    cfg = {"output": {"dir": str(tmp_path)}, "optimization": {"solver_time_limit_s": 5}}
+    o = Orchestrator(RecordingLLM([]), cfg)
+    matrix = np.full((count, count), 99.); np.fill_diagonal(matrix, 1.)
+    areas = gpd.GeoDataFrame({"GEOID": list(map(str, range(count))), "heat_exposure": np.ones(count) * 30},
+                             geometry=[box(i, 0, i + .1, .1) for i in range(count)], crs="EPSG:4326")
+    o.ctx.put("study", {"cache_scope": "test", "boundary": None})
+    o.ctx.put("demand", {"population": np.ones(count), "vulnerable_mask": np.ones(count, bool), "areas": areas})
+    o.ctx.put("candidates", gpd.GeoDataFrame({"cand_id": list(map(str, range(count)))},
+                                           geometry=[Point(i, 0) for i in range(count)], crs="EPSG:4326"))
+    o.ctx.put("travel", {"matrix": matrix})
+    task = TaskSpec(place_name="Test", analysis_goal="minimum_facilities", threshold_minutes=.5, coverage_target=1)
+    result = o.run(task, explain=False)
+    requested = result["diagnostics"]["minimum_facilities"]
+    alternative = result["diagnostics"]["coverage_alternative"]
+    assert result["ok"] and not requested["feasible"] and requested["minimum_facilities"] is None
+    assert requested["uncovered_demand_units"] == count
+    assert alternative["feasible"] and alternative["minimum_facilities"] == count
+    assert alternative["threshold_minutes"] == 1 and alternative["requested_threshold_minutes"] == .5
+    features = json.loads(Path(alternative["map"]).read_text())["features"]
+    assert sum(f["properties"]["layer_kind"] == "selected_site" for f in features) == count
+    assert "10 facilities" not in result["message"]
+    assert "does not satisfy the original time limit" in result["message"]
+
+
+def test_normal_main_analysis_does_not_schedule_minimum_searches():
+    orch = Orchestrator(RecordingLLM([]), {})
+    task = TaskSpec(place_name="Phoenix", n_facilities=10, threshold_minutes=15)
+    for handle in ("study", "demand", "candidates", "travel"):
+        orch.ctx.put(handle, {})
+    assert orch._completion_tool(task) is None  # The original siting workflow decides its next action.
+    assert task.coverage_target is None
+
+
+def test_parser_keeps_regular_siting_free_of_diagnostic_controls():
+    llm = RecordingLLM([{"place_name": "Riverside", "analysis_goal": "facility_siting",
+                         "n_facilities": 10, "threshold_minutes": 12, "coverage_target": None,
+                         "diagnostic_fixed_inputs": []}])
+    task = Orchestrator(llm, {}).parse_task("Select 10 candidate cooling facilities in Riverside within 12 minutes.")
+    assert task.analysis_goal == "facility_siting" and task.coverage_target is None
+    assert task.diagnostic_fixed_inputs is None
+    assert task.n_facilities == 10 and task.threshold_minutes == 12
 
 
 def test_explicit_null_route_origin_prevents_conceptual_from_fallback():
@@ -1225,6 +1414,7 @@ def test_result_query_completion_does_not_block_minimum_threshold_finalizer():
     task = TaskSpec(
         place_name="Washington, District of Columbia, USA",
         analysis_goal="minimum_facilities", coverage_target=1.0,
+        diagnostic_fixed_inputs=["n_facilities", "threshold_minutes"],
         result_queries=[{"metric": "heat_exposure", "limit": 5}],
     )
     orch = Orchestrator(RecordingLLM([]), {})
@@ -1236,35 +1426,8 @@ def test_result_query_completion_does_not_block_minimum_threshold_finalizer():
     assert orch._completion_tool(task) == "find_minimum_threshold"
 
 
-def test_route_request_replaces_a_destination_misread_as_the_origin():
-    task = Orchestrator(RecordingLLM([{
-        "place_name": "Miami Beach, Florida, USA",
-        "analysis_goal": "reachability_review",
-        "route_origin": {
-            "entity": "cooling center", "context": "Miami Beach",
-            "positional_hint": "", "raw_text": "cooling center, Miami Beach",
-            "source": "llm",
-        },
-    }]), {}).parse_task("From Miami Beach, where's the closest cooling center?")
-
-    assert task.analysis_goal == "facility_siting"
-    assert task.route_origin.entity == "Miami Beach"
-    assert task.route_origin.source == "fallback"
 
 
-def test_result_query_completion_does_not_block_minimum_threshold_finalizer():
-    task = TaskSpec(
-        place_name="Washington, District of Columbia, USA",
-        analysis_goal="minimum_facilities", coverage_target=1.0,
-        result_queries=[{"metric": "heat_exposure", "limit": 5}],
-    )
-    orch = Orchestrator(RecordingLLM([]), {})
-    for handle in ("study", "demand", "candidates", "travel"):
-        orch.ctx.put(handle, {})
-    orch.ctx.put("minimum_facilities", {"feasible": False})
-    assert orch._completion_tool(task) == "answer_result_queries"
-    orch.ctx.put("result_query_answers", {"answers": [{"top_rows": []}]})
-    assert orch._completion_tool(task) == "find_minimum_threshold"
 
 
 def test_chinese_request_can_use_the_same_typed_schema():

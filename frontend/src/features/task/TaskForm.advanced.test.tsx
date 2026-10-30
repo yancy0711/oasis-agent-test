@@ -7,6 +7,46 @@ import { taskFromDraft } from "./taskForm.mapper";
 afterEach(cleanup);
 
 describe("advanced task editor", () => {
+  it("offers hypothetical placement only as an unchecked post-paper extension", async () => {
+    const submit = vi.fn();
+    render(<TaskEditorProvider><TaskForm task={taskFromDraft({ place_name: "Riverside", analysis_goal: "minimum_facilities", threshold_minutes: 12 })} mode="quick" ready pending={false} uploadPending={false} uploadedName={null}
+      profiles={[]} onModeChange={() => undefined} onUpload={() => undefined} onSubmit={submit} /></TaskEditorProvider>);
+    const option = screen.getByRole("checkbox", { name: "Allow hypothetical sites (post-paper extension)" });
+    expect(option).not.toBeChecked();
+    fireEvent.click(option);
+    fireEvent.click(screen.getByRole("button", { name: "Run confirmed agent" }));
+    await waitFor(() => expect(submit).toHaveBeenCalledOnce());
+    expect(submit.mock.calls[0][0].allow_hypothetical_sites).toBe(true);
+  });
+  it("keeps an unknown facility count out of the budget until explicitly fixed", async () => {
+    const submit = vi.fn();
+    const task = taskFromDraft({ place_name: "Phoenix", analysis_goal: "minimum_facilities", threshold_minutes: 12 });
+    render(<TaskEditorProvider><TaskForm task={task} mode="auto" ready pending={false} uploadPending={false} uploadedName={null}
+      profiles={[]} onModeChange={() => undefined} onUpload={() => undefined} onSubmit={submit} /></TaskEditorProvider>);
+    expect(screen.getByRole("button", { name: "Facilities" })).toHaveTextContent("To calculate");
+    expect(screen.getByRole("button", { name: "Threshold (minutes)" })).toHaveTextContent("12");
+    expect(screen.queryByText(/Fix the inputs you know/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: "Fix facility budget" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Run confirmed agent" }));
+    await waitFor(() => expect(submit).toHaveBeenCalledOnce());
+    expect(submit.mock.calls[0][0].diagnostic_fixed_inputs).toEqual(["threshold_minutes"]);
+    fireEvent.click(screen.getByRole("button", { name: "Facilities" }));
+    fireEvent.change(screen.getByLabelText("Custom Facilities"), { target: { value: "7" } });
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.getByRole("button", { name: "Facilities" })).toHaveTextContent("7");
+    fireEvent.click(screen.getByRole("button", { name: "Run confirmed agent" }));
+    await waitFor(() => expect(submit).toHaveBeenCalledTimes(2));
+    expect(submit.mock.calls[1][0].diagnostic_fixed_inputs).toContain("n_facilities");
+    expect(submit.mock.calls[1][0].n_facilities).toBe(7);
+  });
+
+  it("retains the ordinary full-analysis budget and time controls", () => {
+    render(<TaskEditorProvider><TaskForm task={taskFromDraft({ place_name: "Phoenix" })} mode="auto" ready pending={false} uploadPending={false} uploadedName={null}
+      profiles={[]} onModeChange={() => undefined} onUpload={() => undefined} onSubmit={() => undefined} /></TaskEditorProvider>);
+    expect(screen.getByLabelText("Facilities")).toHaveValue(10);
+    expect(screen.getByLabelText("Threshold (minutes)")).toHaveValue(15);
+    expect(screen.queryByRole("checkbox", { name: "Fix facility budget" })).not.toBeInTheDocument();
+  });
   it("keeps route tasks simple while leaving advanced controls available", () => {
     const task = taskFromDraft({
       place_name: "Phoenix",

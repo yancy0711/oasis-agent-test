@@ -5,6 +5,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 from pathlib import Path
+from time import monotonic
 from typing import Callable
 
 import geopandas as gpd
@@ -784,6 +785,9 @@ def build_travel_matrix(ctx: Context, demand_handle: str = "demand",
         raise ValueError("ORS routing requires a concrete study cache scope")
 
     configured_threshold = float(getattr(task, "threshold_minutes", cfg.get("threshold_minutes", 15.0)))
+    if (task and task.analysis_goal in {"minimum_facilities", "minimum_threshold"}
+            and "minimum_facilities" not in task.coverage_diagnostic_handles):
+        configured_threshold = float(cfg.get("ors_max_policy_threshold_minutes", 20))
     sensitivity_thresholds = list(getattr(task, "sensitivity_thresholds", []) or [])
     policy_minutes = max([configured_threshold, *map(float, sensitivity_thresholds)])
     reason = None
@@ -1110,6 +1114,7 @@ def find_minimum_facilities(ctx: Context, threshold_minutes: float = 15,
     demand, candidates, travel = ctx.get("demand"), ctx.get("candidates"), ctx.get("travel")
     matrix, population, vulnerable, _ = _decision_inputs(demand, travel)
     candidate_ids = candidates["cand_id"].astype(str).tolist(); mask = _coverage_mask(demand, coverage_group, travel)
+    deadline = monotonic() + _cfg(ctx, "optimization").get("solver_time_limit_s", 120)
     ctx.progress("LSCP", 0, 1)
     solution = solve_lscp(matrix, population, vulnerable,
                           threshold_minutes, candidate_ids, coverage_target, mask,
@@ -1120,14 +1125,22 @@ def find_minimum_facilities(ctx: Context, threshold_minutes: float = 15,
     feasible = solution.solver_status in {"Optimal", "Feasible"}
     current = ctx.get("task", None)
     minimum = len(solution.selected_ids) if solution.solver_status == "Optimal" else None
+    fixed_budget = (current.n_facilities if current and (
+        current.analysis_goal not in {"minimum_facilities", "minimum_threshold"}
+        or "minimum_threshold" in current.coverage_diagnostic_handles) else None)
     summary = {"feasible": feasible, "minimum_facilities": minimum,
                "minimum_proven": solution.solver_status == "Optimal",
                "feasible_facility_count": len(solution.selected_ids) if feasible else None,
-               "current_facilities": getattr(current, "n_facilities", None),
-               "facility_gap": (minimum - current.n_facilities if minimum is not None and current else None),
+               "current_facilities": fixed_budget,
+               "facility_gap": (minimum - fixed_budget if minimum is not None and fixed_budget is not None else None),
                "threshold_minutes": threshold_minutes, "coverage_target": coverage_target,
                "coverage_group": coverage_group, "solver_status": solution.solver_status,
                "selected_ids": solution.selected_ids}
+    nearest = matrix.min(axis=1)
+    targeted = nearest[mask]
+    summary.update(target_demand_units=int(mask.sum()),
+                   uncovered_demand_units=int((targeted > threshold_minutes).sum()),
+                   candidate_count=len(candidate_ids))
     study = ctx.get("study", {})
     if feasible and study and "areas" in demand:
         out = Path(_cfg(ctx, "output").get("dir", "outputs_run")) / study["cache_scope"]
@@ -1137,6 +1150,49 @@ def find_minimum_facilities(ctx: Context, threshold_minutes: float = 15,
             study.get("boundary"), task=ctx.get("task", None),
         )
     ctx.put("minimum_facilities", {"solution": solution, **summary})
+    if current and current.allow_hypothetical_sites:
+        from oasis.services.hypothetical import plan_hypothetical_sites
+        ctx.put("hypothetical_coverage", plan_hypothetical_sites(ctx, mask, deadline - monotonic()))
+    # With no fixed budget, a failed time constraint needs a concrete alternative,
+    # not a threshold search under the unrelated siting default. First find the
+    # earliest achievable time with all candidates, then minimize sites at that time.
+    if (solution.solver_status == "Infeasible" and current
+            and not current.allow_hypothetical_sites
+            and current.analysis_goal == "minimum_facilities"
+            and "minimum_threshold" not in current.coverage_diagnostic_handles):
+        required = int(np.ceil(coverage_target * len(targeted) - 1e-9))
+        attainable = float(np.ceil(np.sort(targeted)[required - 1] * 10 - 1e-9) / 10) if required > 0 else 0.0
+        report = travel.get("routing_report") or {}
+        network = str(report.get("router", travel.get("router", ""))).startswith("ors")
+        pruned = any(int(mode.get("pruned_pairs", 0)) > 0 for mode in report.get("mode_reports", {}).values())
+        in_scope = not (network and pruned and attainable > float(report.get("policy_minutes", threshold_minutes)))
+        remaining = deadline - monotonic()
+        if np.isfinite(attainable) and in_scope and remaining > 0:
+            ctx.progress("Alternative coverage plan", 0, 1)
+            alternative_solution = solve_lscp(matrix, population, vulnerable, attainable, candidate_ids,
+                                              coverage_target, mask, remaining, cancel_check=ctx.check_cancelled,
+                                              heartbeat=lambda: ctx.progress("Alternative coverage plan", 0, 1))
+            alternative = {
+                "requested_threshold_minutes": threshold_minutes, "threshold_minutes": attainable,
+                "coverage_target": coverage_target, "coverage_group": coverage_group,
+                "accuracy": "network" if network else "approximate_haversine",
+                "feasible": alternative_solution.solver_status in {"Optimal", "Feasible"},
+                "minimum_facilities": len(alternative_solution.selected_ids) if alternative_solution.solver_status == "Optimal" else None,
+                "feasible_facility_count": len(alternative_solution.selected_ids),
+                "minimum_proven": alternative_solution.solver_status == "Optimal",
+                "selected_ids": alternative_solution.selected_ids,
+                "selected_sites": [{"id": str(row["cand_id"]), "name": str(row.get("name") or row["cand_id"])}
+                                   for _, row in candidates[candidates["cand_id"].astype(str).isin(alternative_solution.selected_ids)].iterrows()],
+                "interpretation": "Alternative: find the earliest supported threshold rounded up to 0.1 minute with unrestricted candidate count, then minimize facilities at that threshold. The requested threshold is unchanged.",
+            }
+            if alternative["feasible"] and study and "areas" in demand:
+                path = Path(_cfg(ctx, "output").get("dir", "outputs_run")) / study["cache_scope"] / "coverage_alternative_map.geojson"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                map_task = current.model_copy(update={"threshold_minutes": attainable, "n_facilities": len(alternative_solution.selected_ids)})
+                coverage_map(demand["areas"], candidates, alternative_solution, "heat_exposure", str(path), study.get("boundary"), task=map_task)
+                alternative["map"] = str(path)
+            ctx.put("coverage_alternative", alternative)
+            ctx.progress("Alternative coverage plan", 1, 1)
     return ToolResult(ok=True, tool="find_minimum_facilities", handle="minimum_facilities", summary=summary)
 
 
@@ -1161,9 +1217,23 @@ def find_minimum_threshold(ctx: Context, n_facilities: int = 10,
         cancel_check=ctx.check_cancelled,
     )
     current = ctx.get("task", None)
+    report = travel.get("routing_report") or {}
+    policy_limit = report.get("policy_minutes")
+    pruned = any(int(mode.get("pruned_pairs", 0)) > 0 for mode in report.get("mode_reports", {}).values())
+    scope_limited = (str(report.get("router", travel.get("router", ""))).startswith("ors")
+                     and pruned and search_diagnostics.get("status") == "complete"
+                     and policy_limit is not None
+                     and (threshold is None or threshold > float(policy_limit)))
+    if scope_limited:
+        search_diagnostics["matrix_search_status"] = search_diagnostics.get("status")
+        search_diagnostics["status"] = "routing_scope_limited"
+    fixed_threshold = (current.threshold_minutes if current and (
+        current.analysis_goal not in {"minimum_facilities", "minimum_threshold"}
+        or "minimum_facilities" in current.coverage_diagnostic_handles) else None)
     summary = {"feasible": threshold is not None, "minimum_threshold_minutes": threshold,
-               "current_threshold_minutes": getattr(current, "threshold_minutes", None),
-               "threshold_gap_minutes": (threshold - current.threshold_minutes if threshold is not None and current else None),
+               "current_threshold_minutes": fixed_threshold,
+               "threshold_gap_minutes": (threshold - fixed_threshold if threshold is not None and fixed_threshold is not None else None),
+               "evaluated_up_to_minutes": policy_limit if scope_limited else None,
                "n_facilities": n_facilities, "coverage_target": coverage_target,
                "coverage_group": coverage_group,
                "search": search_diagnostics,

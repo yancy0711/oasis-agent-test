@@ -49,6 +49,16 @@ function WeightField({ name, label, weights, control }: {
   }} /></label>} />;
 }
 
+function CoverageNumber({ label, value, calculated, integer = false, onChange }: {
+  label: string; value: number; calculated: boolean; integer?: boolean; onChange: (value: number | null) => void;
+}) {
+  const values = [...new Set([value, ...(integer ? [1, 3, 5, 10, 15, 20, 30, 50, 100] : [5, 10, 12, 15, 20, 30, 45, 60, 90])])].sort((a, b) => a - b);
+  return <CheckboxDropdown ariaLabel={label} single selected={[calculated ? "calculate" : String(value)]}
+    options={[{ value: "calculate", label: "To calculate" }, ...values.map((number) => ({ value: String(number), label: String(number) }))]}
+    summary={calculated ? "To calculate" : String(value)} onChange={(selected) => onChange(selected[0] === "calculate" ? null : Number(selected[0]))}
+    footer={<label className="field"><span>Custom value</span><input aria-label={`Custom ${label}`} type="number" min={integer ? 1 : 0.5} max={integer ? 100 : undefined} step={integer ? 1 : 0.5} value={calculated ? "" : value} placeholder="Enter a value" onChange={(event) => onChange(event.target.value === "" ? null : Number(event.target.value))} /></label>} />;
+}
+
 const AMENITY_OPTIONS = [
   { value: "library", label: "Public library" },
   { value: "community_centre", label: "Community center" },
@@ -88,6 +98,10 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
   const sensitivity = task.analysis_goal === "sensitivity_analysis";
   const comparison = task.analysis_goal === "scenario_comparison";
   const heatOnly = task.analysis_goal === "heat_review";
+  const coverageControls = hasTarget;
+  const fixedInputs = watch("diagnostic_fixed_inputs");
+  const fixedBudget = !coverageControls || fixedInputs.includes("n_facilities");
+  const fixedTime = !coverageControls || fixedInputs.includes("threshold_minutes");
   const facilityCount = watch("n_facilities");
   const threshold = watch("threshold_minutes");
   const mobility = watch("mobility_scenario");
@@ -95,6 +109,10 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
   const appliedProfile = allProfiles.find((profile) => Object.entries(profile.weights).every(([key, value]) =>
     Math.abs(Number(weights[key as keyof typeof weights]) - value) < 0.000001));
   const recommended = profiles.find((profile) => profile.name === task.recommended_value_profile);
+  function changeCoverageInput(field: "n_facilities" | "threshold_minutes", value: number | null) {
+    if (value !== null) setValue(field, value, { shouldDirty: true, shouldValidate: true });
+    setValue("diagnostic_fixed_inputs", value === null ? fixedInputs.filter((item) => item !== field) : [...new Set([...fixedInputs, field])], { shouldDirty: true, shouldValidate: true });
+  }
 
   function applyProfile(profile: ValueProfile | undefined) { if (profile) setValue("weights", profile.weights, { shouldDirty: true, shouldValidate: true }); }
   function applyRecommendations() {
@@ -122,12 +140,13 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
     {routeFocused && <div className="route-essential-settings"><label className="field"><InfoLabel label="Travel mode">Used by the point route planner after candidate facilities have been prepared.</InfoLabel><select aria-label="Mobility" {...register("mobility_scenario")}><option value="walking">Walking</option><option value="cycling">Cycling</option><option value="driving">Driving</option></select></label><p>Supporting defaults: {facilityCount} candidate facilities, {threshold} minute planning threshold, and all supported facility types.</p></div>}
 
     <details className="task-settings-disclosure" open={settingsOpen} onToggle={(event) => setSettingsOpen(event.currentTarget.open)}>
-      <summary><span>{routeFocused ? "Customize supporting analysis" : "Analysis settings"}</span><small>{heatOnly ? "Heat diagnostic" : `${facilityCount} facilities - ${threshold} min - ${mobility.replaceAll("_", " ")}`}</small></summary>
+      <summary><span>{routeFocused ? "Customize supporting analysis" : "Analysis settings"}</span><small>{heatOnly ? "Heat diagnostic" : `${fixedBudget ? `${facilityCount} facilities` : "Facilities to calculate"} - ${fixedTime ? `${threshold} min` : "Time to calculate"} - ${mobility.replaceAll("_", " ")}`}</small></summary>
       <div className="task-settings-body">
     {!heatOnly && <>
       <div className="form-grid">
-        <label className="field"><span>Facilities</span><input type="number" {...register("n_facilities", { valueAsNumber: true })} />{errors.n_facilities && <small className="error">{errors.n_facilities.message}</small>}</label>
-        <label className="field"><span>Threshold (minutes)</span><input type="number" step="0.5" {...register("threshold_minutes", { valueAsNumber: true })} />{errors.threshold_minutes && <small className="error">{errors.threshold_minutes.message}</small>}</label>
+        <div className="field"><span>Facilities</span>{coverageControls ? <CoverageNumber label="Facilities" value={facilityCount} calculated={!fixedBudget} integer onChange={(value) => changeCoverageInput("n_facilities", value)} /> : <input aria-label="Facilities" type="number" {...register("n_facilities", { valueAsNumber: true })} />}{errors.n_facilities && <small className="error">{errors.n_facilities.message}</small>}</div>
+        <div className="field"><span>Threshold (minutes)</span>{coverageControls ? <CoverageNumber label="Threshold (minutes)" value={threshold} calculated={!fixedTime} onChange={(value) => changeCoverageInput("threshold_minutes", value)} /> : <input aria-label="Threshold (minutes)" type="number" step="0.5" {...register("threshold_minutes", { valueAsNumber: true })} />}{errors.threshold_minutes && <small className="error">{errors.threshold_minutes.message}</small>}</div>
+        {errors.diagnostic_fixed_inputs && <small className="error">{errors.diagnostic_fixed_inputs.message}</small>}
         <label className="field"><InfoLabel label="Facility capacity">Limits how many people each selected candidate facility can be assigned. Leave disabled when reliable capacity data are unavailable.</InfoLabel><span className="check-row"><input type="checkbox" {...register("facility_capacity_enabled")} />Apply capacity</span>{hasCapacity && <input aria-label="People per facility" type="number" min="1" step="1" {...register("facility_capacity", { valueAsNumber: true })} />}</label>
         <label className="field"><InfoLabel label="Efficiency–equality trade-off">When enabled, selects the final recommendation from the computed efficiency–Gini frontier. α = 0 emphasizes average gradual access; α = 1 emphasizes equal access. This cannot be combined with a hard coverage target.</InfoLabel><span className="check-row"><input type="checkbox" {...register("equity_alpha_enabled")} />Select final solution by α</span>{hasEquityAlpha && <><input aria-label="Equity alpha" type="range" min="0" max="1" step="0.1" {...register("equity_alpha", { valueAsNumber: true })} /><small>α = {watch("equity_alpha").toFixed(1)} · 0 means efficiency, 1 means equality</small>{errors.equity_alpha && <small className="error">{errors.equity_alpha.message}</small>}</>}</label>
         {!routeFocused && <label className="field"><InfoLabel label="Mobility">Chooses the travel mode used to calculate access times between demand and candidate facilities.</InfoLabel><select aria-label="Mobility" {...register("mobility_scenario")}><option value="walking">Walking</option><option value="cycling">Cycling</option><option value="driving">Driving</option><option value="walk_drive_equity">Walk/drive equity</option></select><small>{watch("mobility_scenario") === "walk_drive_equity" ? "Evaluates access across walking and driving populations." : "Used for travel-time routing."}</small></label>}
@@ -142,6 +161,7 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
       </div>
       <label className="check-row"><input type="checkbox" {...register("coverage_target_enabled")} /><InfoLabel label="Require a coverage target">Adds a minimum share of the selected population group that the solution must cover within the travel-time threshold.</InfoLabel></label>
       {hasTarget && <label className="field compact-field"><span>Coverage target (0–1)</span><input type="number" min="0" max="1" step="0.05" {...register("coverage_target", { valueAsNumber: true })} /></label>}
+      {hasTarget && fixedTime && !fixedBudget && <div className="field"><label className="check-row"><input type="checkbox" aria-label="Allow hypothetical sites (post-paper extension)" {...register("allow_hypothetical_sites")} /><InfoLabel label="Allow hypothetical sites (post-paper extension)">Adds one hypothetical site at each target tract demand centre and minimizes total facilities over the expanded set. Approximate Haversine travel only; locations are not verified premises or buildable land. Original candidate-only results stay separate. Supports up to 250 target tracts.</InfoLabel></label>{errors.allow_hypothetical_sites && <small className="error">{errors.allow_hypothetical_sites.message}</small>}</div>}
       {comparison && <Controller control={control} name="comparison_profiles" render={({ field }) => {
         const options = profiles.map((profile) => ({ value: profile.name, label: profile.label }));
         const labels = profiles.filter((profile) => field.value.includes(profile.name)).map((profile) => profile.label);

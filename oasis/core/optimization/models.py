@@ -471,8 +471,8 @@ def minimum_coverage_threshold(travel_matrix: np.ndarray, population: np.ndarray
                                cancel_check=None) -> tuple[float | None, SiteSolution | None]:
     """Find the smallest feasible observed threshold within one bounded search budget."""
     matrix = np.asarray(travel_matrix, dtype=float)
-    if matrix.ndim != 2 or not 1 <= n_facilities <= matrix.shape[1]:
-        raise ValueError("n_facilities must be between 1 and candidate count")
+    if matrix.ndim != 2 or n_facilities < 1:
+        raise ValueError("n_facilities must be positive and travel_matrix must be two-dimensional")
     values = np.unique(matrix[np.isfinite(matrix)])
     if not len(values):
         if search_diagnostics is not None:

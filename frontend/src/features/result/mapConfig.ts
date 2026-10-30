@@ -65,7 +65,7 @@ export function resultLayers(range: [number, number] | null) {
   const sites: CircleLayerSpecification = {
     id: MAP_LAYER_IDS.sites, type: "circle", source: MAP_SOURCE_ID,
     filter: ["==", ["get", "layer_kind"], "selected_site"],
-    paint: { "circle-radius": 8, "circle-color": "#2455ff",
+    paint: { "circle-radius": 8, "circle-color": ["case", ["==", ["get", "is_hypothetical"], true], "#853bd1", "#2455ff"],
       "circle-stroke-color": "#ffffff", "circle-stroke-width": 2.5 },
   };
   return [tracts, tractOutline, boundary, sites];

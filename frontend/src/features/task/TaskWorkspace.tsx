@@ -497,6 +497,7 @@ export function TaskWorkspace() {
       <section className="panel panel--hero">
         <p className="eyebrow">Policy and research decision support</p>
         <h1>OASIS: A bounded LLM agent for auditable, equity-aware cooling center siting</h1>
+        {configQuery.isError && <div className="error error--block" role="alert"><p>Cannot reach the application backend. {configQuery.error.message}</p><button type="button" className="button--secondary" disabled={configQuery.isFetching} onClick={() => void configQuery.refetch()}>Retry connection</button></div>}
         <LlmSettings defaults={configQuery.data?.agent as Record<string, unknown> | undefined} />
           <PromptInput audience={audience} autoDetect={autoDetect} onAutoDetectChange={setAutoDetect} pending={interpreting || (audience === "personal" ? residentBusy : parseMutation.isPending)}
           onSubmit={(prompt) => void submitPrompt(prompt)}

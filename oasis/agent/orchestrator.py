@@ -538,6 +538,27 @@ class LLMClient:
     @staticmethod
     def _non_retryable_provider_error(exc: Exception) -> str | None:
         """Translate provider failures that no structured-output retry can repair."""
+        if getattr(exc, "status_code", None) == 429:
+            body = getattr(exc, "body", None)
+            error = body.get("error", body) if isinstance(body, dict) else {}
+            metadata = (error.get("metadata") or {}) if isinstance(error, dict) else {}
+            response = getattr(exc, "response", None)
+            headers = getattr(response, "headers", {})
+            retry_after = headers.get("Retry-After") or (metadata.get("headers") or {}).get("Retry-After")
+            wait = (f" Wait at least {retry_after} seconds before retrying."
+                    if retry_after and re.fullmatch(r"\d+(?:\.\d+)?", str(retry_after))
+                    else " Wait for the provider's rate-limit reset before retrying.")
+            if metadata.get("limit_source") == "openrouter_admission_control":
+                return (
+                    "OpenRouter could not verify available credits in time (HTTP 429). "
+                    "This is a temporary admission-control failure, not a JSON-format error; "
+                    "it does not by itself mean your balance is exhausted."
+                    + wait + " Avoid simultaneous requests on this account. If it persists, check OpenRouter status, account credits and key limits."
+                )
+            return (
+                "The LLM provider rate-limited this request (HTTP 429), not a JSON-format error."
+                + wait + " Avoid simultaneous requests and check the provider's account limits."
+            )
         detail = str(exc)
         lowered = detail.lower()
         if "user location is not supported for the api use" in lowered:
@@ -681,7 +702,10 @@ class Orchestrator:
                         ),
                     })
                 raw["n_facilities"] = bounded_count
-            if bounded_count is not None and raw.get("analysis_goal") == "minimum_facilities":
+            fixed_siting = re.search(
+                r"\b(?:select|choose|site|locate|open|recommend|setting)\s+(?:up\s+to\s+)?\d+\b", user_prompt, re.I,
+            )
+            if bounded_count is not None and raw.get("analysis_goal") == "minimum_facilities" and fixed_siting:
                 ambiguities.append({
                     "field": "analysis_goal",
                     "candidates": ["facility_siting", "minimum_facilities"],
@@ -836,12 +860,32 @@ class Orchestrator:
             raw["weights"] = None
         if raw.get("recommended_value_profile") not in profiles:
             raw["recommended_value_profile"] = None
+        if raw.get("analysis_goal") in {"minimum_facilities", "minimum_threshold"}:
+            if raw.get("diagnostic_fixed_inputs") is None:
+                fixed = ["threshold_minutes"] if raw["analysis_goal"] == "minimum_facilities" else ["n_facilities"]
+                if explicit_count is not None and "n_facilities" not in fixed:
+                    fixed.append("n_facilities")
+                if explicit_threshold is not None and "threshold_minutes" not in fixed:
+                    fixed.append("threshold_minutes")
+                raw["diagnostic_fixed_inputs"] = fixed
+            if raw["diagnostic_fixed_inputs"] == []:
+                ambiguities.append({"field": "analysis_goal", "candidates": [],
+                                    "question": "Fix a travel-time threshold or a facility budget before running the coverage diagnostic."})
+            elif set(raw["diagnostic_fixed_inputs"]) == {"n_facilities", "threshold_minutes"} and raw.get("coverage_target") is not None:
+                raw["analysis_goal"] = "facility_siting"
+                raw["diagnostic_fixed_inputs"] = None
+                ambiguities = [item for item in ambiguities if not (
+                    item.get("field") == "analysis_goal"
+                    and set(item.get("candidates", [])) == {"facility_siting", "minimum_facilities"})]
+                _append_note(raw, "both coverage inputs are fixed; solve the confirmed pair before proposing relaxations")
+        else:
+            raw["diagnostic_fixed_inputs"] = None
         raw["ambiguities"] = _normalize_ambiguities(ambiguities)
         raw = _converge_task_payload(raw, defaults)
         place = raw.get("place_name")
         self.ctx.record("parse", "Natural-language request parsed into a proposed task.",
                         fields={k: raw.get(k) for k in ("place_name", "analysis_goal", "candidate_source", "n_facilities",
-                                                        "threshold_minutes", "coverage_target", "coverage_group", "mobility_scenario",
+                                                        "threshold_minutes", "diagnostic_fixed_inputs", "coverage_target", "coverage_group", "mobility_scenario",
                                                         "operating_window", "recommended_value_profile",
                                                         "recommended_mobility_scenario", "recommendation_rationale",
                                                         "sensitivity_thresholds", "sensitivity_facility_counts",
@@ -865,6 +909,10 @@ class Orchestrator:
 
     def _bind_task_args(self, step: PlanStep, task: TaskSpec) -> PlanStep:
         """Bind confirmed TaskSpec values to their corresponding tool calls."""
+        if (task.analysis_goal in {"minimum_facilities", "minimum_threshold"}
+                and step.tool in {"find_minimum_facilities", "find_minimum_threshold"}
+                and step.tool.removeprefix("find_") not in task.coverage_diagnostic_handles):
+            raise ValueError("This diagnostic input is unknown; confirm the fixed budget or time before computing its complementary answer.")
         if step.tool in {"fetch_candidate_sites", "load_candidate_sites"}:
             tool = "load_candidate_sites" if task.candidate_source == "csv" else "fetch_candidate_sites"
             step = PlanStep(tool=tool, args={}, rationale=step.rationale)
@@ -960,6 +1008,8 @@ class Orchestrator:
 
     def _goal_handle(self, task: TaskSpec) -> str:
         """Return the handle proving the primary executable goal is complete."""
+        if task.analysis_goal in {"minimum_facilities", "minimum_threshold"} and task.coverage_diagnostic_handles:
+            return task.coverage_diagnostic_handles[0]
         return {"facility_siting": "outputs", "tract_review": "result_query_answers", "heat_review": "heat_summary",
                 "minimum_facilities": "minimum_facilities", "minimum_threshold": "minimum_threshold",
                 "reachability_review": "reachability_analysis",
@@ -971,9 +1021,8 @@ class Orchestrator:
         if not self.ctx.has(self._goal_handle(task)):
             return False
         if (
-            task.analysis_goal == "minimum_facilities"
-            and not self.ctx.get("minimum_facilities", {}).get("feasible")
-            and not self.ctx.has("minimum_threshold")
+            task.analysis_goal in {"minimum_facilities", "minimum_threshold"}
+            and not all(self.ctx.has(handle) for handle in task.coverage_diagnostic_handles)
         ):
             return False
         if not task.result_queries:
@@ -1109,19 +1158,12 @@ class Orchestrator:
                 "load_candidate_sites" if task.candidate_source == "csv" else "fetch_candidate_sites"
             )
             if not self.ctx.has("travel"): return "build_travel_matrix"
-            if task.analysis_goal == "minimum_facilities":
-                if not self.ctx.has("minimum_facilities"):
-                    return "find_minimum_facilities"
-                if (
-                    not self.ctx.get("minimum_facilities", {}).get("feasible")
-                    and not self.ctx.has("minimum_threshold")
-                ):
-                    return "find_minimum_threshold"
+            if task.analysis_goal in {"minimum_facilities", "minimum_threshold"}:
+                for handle in task.coverage_diagnostic_handles:
+                    if not self.ctx.has(handle):
+                        return f"find_{handle}"
                 return None
-            return {
-                "minimum_threshold": "find_minimum_threshold",
-                "reachability_review": "analyze_reachability",
-            }[task.analysis_goal]
+            return "analyze_reachability"
         if task.analysis_goal in {"sensitivity_analysis", "scenario_comparison"}:
             if not self.ctx.has("study"): return "resolve_study_area"
             if not self.ctx.has("demand"): return "prepare_demand"
@@ -1336,72 +1378,61 @@ class Orchestrator:
                     f"{float(summary.get('threshold_minutes', task.threshold_minutes)):g}-minute threshold. "
                     f"Basis: {summary.get('evidence_basis', 'the recorded nearest-candidate travel matrix')}"
                 )
-        if task.analysis_goal == "minimum_facilities" and self.ctx.has("minimum_facilities"):
-            summary = self.ctx.get("minimum_facilities")
-            if summary.get("feasible"):
-                if summary.get("minimum_facilities") is None:
-                    return (
-                        f"A feasible solution uses {int(summary['feasible_facility_count'])} facilities "
-                        f"within {float(summary['threshold_minutes']):g} minutes. "
-                        "The time limit was reached before the minimum count could be proven."
-                    ) + query_suffix
-                return (
-                    f"At least {int(summary['minimum_facilities'])} candidate facilities are required "
-                    f"to cover {float(summary.get('coverage_target', 1.0)):.0%} of the "
-                    f"{str(summary.get('coverage_group', 'all')).replace('_', ' ')} group within "
-                    f"{float(summary['threshold_minutes']):g} minutes."
-                ) + query_suffix
-            if summary.get("solver_status") not in {None, "Optimal", "Infeasible"}:
-                return (
-                    "The facility-count search reached its time limit without a verified solution. "
-                    "This does not establish that the requested coverage is infeasible."
-                ) + query_suffix
-            threshold = self.ctx.get("minimum_threshold", {})
-            if threshold.get("feasible"):
-                bound = (
-                    "the smallest computed threshold is"
-                    if threshold.get("search_complete", True)
-                    else "the best feasible threshold found before the search time limit is"
-                )
-                return (
-                    f"No number of the retained candidate facilities can cover "
-                    f"{float(summary.get('coverage_target', 1.0)):.0%} of the "
-                    f"{str(summary.get('coverage_group', 'all')).replace('_', ' ')} group within "
-                    f"{float(summary['threshold_minutes']):g} minutes. With "
-                    f"{int(threshold['n_facilities'])} facilities, {bound} "
-                    f"{float(threshold['minimum_threshold_minutes']):.1f} minutes by "
-                    f"{task.mobility_scenario.replace('_', ' ')}."
-                ) + query_suffix
-            if not threshold.get("search_complete", True):
-                return (
-                    "The retained candidate set cannot meet the requested coverage at the confirmed "
-                    "threshold. The bounded minimum-threshold search reached its time limit before "
-                    "it could establish a defensible alternative bound."
-                ) + query_suffix
-            return (
-                "The retained candidate set cannot meet the requested coverage at the confirmed "
-                "threshold, and no feasible alternative threshold exists in the computed matrix."
-            ) + query_suffix
-        if task.analysis_goal == "minimum_threshold" and self.ctx.has("minimum_threshold"):
-            summary = self.ctx.get("minimum_threshold")
-            if summary.get("feasible"):
-                qualifier = (
-                    "A threshold of at least"
-                    if summary.get("search_complete", True)
-                    else "The best feasible threshold found before the search time limit was"
-                )
-                return (
-                    f"{qualifier} {float(summary['minimum_threshold_minutes']):.1f} minutes "
-                    f"with {int(summary['n_facilities'])} facilities to cover "
-                    f"{float(summary.get('coverage_target', 1.0)):.0%} of the "
-                    f"{str(summary.get('coverage_group', 'all')).replace('_', ' ')} group."
-                )
-            if not summary.get("search_complete", True):
-                return (
-                    "The bounded minimum-threshold search reached its time limit before it could "
-                    "establish a defensible bound for the confirmed facility budget."
-                )
-            return "No feasible threshold was found in the computed travel matrix for the confirmed facility budget."
+        if task.analysis_goal in {"minimum_facilities", "minimum_threshold"}:
+            handles = task.coverage_diagnostic_handles
+            facilities = self.ctx.get("minimum_facilities", {}) if "minimum_facilities" in handles else {}
+            threshold = self.ctx.get("minimum_threshold", {}) if "minimum_threshold" in handles else {}
+            parts = []
+            if facilities:
+                minutes = float(facilities.get("threshold_minutes", task.threshold_minutes))
+                target = float(facilities.get("coverage_target", 1.0))
+                group = str(facilities.get("coverage_group", "all")).replace("_", " ")
+                if facilities.get("feasible"):
+                    count = facilities.get("minimum_facilities")
+                    if count is not None:
+                        parts.append(f"At least {int(count)} candidate facilities are required to cover {target:.0%} of the {group} modeled demand units within {minutes:g} minutes.")
+                    else:
+                        parts.append(f"A feasible solution uses {int(facilities['feasible_facility_count'])} facilities within {minutes:g} minutes; the minimum count was not proven before the time limit.")
+                elif facilities.get("solver_status") in {None, "Infeasible"}:
+                    parts.append(f"No number of the retained candidate facilities can cover {target:.0%} of the {group} modeled demand units within {minutes:g} minutes.")
+                    if facilities.get("uncovered_demand_units"):
+                        parts.append(f"Even all {facilities['candidate_count']} candidates leave {facilities['uncovered_demand_units']} of {facilities['target_demand_units']} target demand units outside that time.")
+                else:
+                    parts.append("The facility-count search reached its time limit without a verified solution. This does not establish infeasibility.")
+            if threshold:
+                budget = int(threshold.get("n_facilities", task.n_facilities))
+                if threshold.get("feasible"):
+                    qualifier = ("the smallest computed threshold is" if threshold.get("search_complete", True)
+                                 else "the best feasible threshold found before the search time limit is")
+                    target = float(threshold.get("coverage_target", 1.0))
+                    parts.append(f"With {budget} facilities, {qualifier} {float(threshold['minimum_threshold_minutes']):.1f} minutes by {task.mobility_scenario.replace('_', ' ')} to meet the {target:.0%} coverage target.")
+                elif threshold.get("search", {}).get("status") == "routing_scope_limited":
+                    limit = threshold.get("evaluated_up_to_minutes")
+                    parts.append(f"The ORS matrix was evaluated only within a {limit:g}-minute routing range. No feasible threshold was established in that range with {budget} facilities; feasibility beyond it is unknown.")
+                elif not threshold.get("search_complete", True):
+                    parts.append(f"With a budget of {budget} facilities, the bounded minimum-threshold search reached its time limit before establishing a feasible threshold.")
+                else:
+                    parts.append(f"No feasible threshold was found in the computed travel matrix with a budget of {budget} facilities.")
+            if facilities and threshold:
+                minimum = facilities.get("minimum_facilities")
+                infeasible = (facilities.get("solver_status") == "Infeasible"
+                              or (minimum is not None and minimum > task.n_facilities))
+                if infeasible:
+                    parts.insert(0, f"The requested combination of {task.n_facilities} facilities and {task.threshold_minutes:g} minutes is infeasible.")
+            alternative = self.ctx.get("coverage_alternative", {})
+            if alternative.get("feasible"):
+                count = alternative.get("minimum_facilities")
+                count_text = f"a minimum of {count}" if count is not None else f"a feasible set of {alternative['feasible_facility_count']}"
+                basis = "Approximate Haversine alternative" if alternative.get("accuracy") == "approximate_haversine" else "Network alternative"
+                parts.append(f"{basis}: relaxing the threshold to {alternative['threshold_minutes']:.1f} minutes allows {count_text} facilities to meet the coverage target; their arrangement is shown on the alternative map. This does not satisfy the original time limit.")
+            extension = self.ctx.get("hypothetical_coverage", {})
+            if extension.get("feasible"):
+                count = extension.get("minimum_facilities")
+                label = f"minimum {count}" if count is not None else f"feasible {extension['feasible_facility_count']} (minimum not proven)"
+                parts.append(f"Post-paper hypothetical-site extension: {label} total facilities at {extension['threshold_minutes']:g} minutes, including {extension['hypothetical_selected_count']} hypothetical and {extension['existing_selected_count']} existing locations. This is an approximate Haversine plan over a finite candidate set, not ORS-verified coverage or verified new premises; see the extension map.")
+            elif extension:
+                parts.append("The hypothetical-site extension did not establish a feasible plan: " + str(extension.get("reason") or extension.get("solver_status")))
+            return " ".join(parts) + query_suffix
         if task.result_queries and self.ctx.has("result_query_answers"):
             answers = self.ctx.get("result_query_answers").get("answers", [])
             parts = []
@@ -1539,7 +1570,7 @@ class Orchestrator:
             except Exception as exc: log.warning("result interpretation skipped: %s", exc)
         if ok:
             self.ctx.progress("Finalizing: packaging result", 1, 2, unit="stages")
-        diagnostic_handles = ["constraint_validation", "minimum_facilities", "minimum_threshold",
+        diagnostic_handles = ["constraint_validation", "minimum_facilities", "minimum_threshold", "coverage_alternative", "hypothetical_coverage",
                               "reachability_analysis", "scenario_comparison", "sensitivity_results",
                               "vulnerability_analysis", "result_query_answers"]
         diagnostics = {name: json.loads(json.dumps(self.ctx.get(name), default=lambda value: value.model_dump(mode="json")))

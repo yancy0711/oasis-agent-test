@@ -29,7 +29,7 @@ def create_app(service: OasisService | None = None) -> FastAPI:
     router = APIRouter(prefix="/v1")
 
     @app.get("/health")
-    def health() -> dict:
+    async def health() -> dict:
         """Report process health without invoking external providers."""
         return {"status": "ok"}
 

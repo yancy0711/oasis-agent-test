@@ -90,6 +90,7 @@ export function popupContent(
     ["Candidate ID", properties.candidate_id], ["Preview alpha", properties.alpha],
     ["Status", "Temporary preview; the current recommendation is unchanged"],
   ] : selectedSite ? [
+    ["Status", properties.is_hypothetical ? "Hypothetical location; suitability and access unverified" : null],
     ["Comparison", properties.comparison_label], ["Candidate ID", properties.candidate_id],
     ["Facility type", properties.facility_type ?? "Unknown"], ["Mobility", properties.mobility],
     ["Public access", properties.public_access], ["Cooling service", properties.cooling_service],

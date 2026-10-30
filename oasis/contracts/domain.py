@@ -99,6 +99,9 @@ class TaskSpec(BaseModel):
                            "sensitivity_analysis"] = "facility_siting"
     candidate_source: Literal["osm", "csv"] = "osm"
     candidate_file: str | None = None
+    allow_hypothetical_sites: bool = Field(
+        False, description="Explicit opt-in post-paper extension for minimum-facility coverage planning. Adds tract-centroid hypothetical sites; uses approximate travel, not verified venues or network coverage.",
+    )
     mobility_scenario: MobilityScenario = "walking"
     recommended_mobility_scenario: MobilityScenario | None = None
     recommended_value_profile: str | None = None
@@ -106,6 +109,10 @@ class TaskSpec(BaseModel):
     operating_window: OperatingWindow | None = None
     n_facilities: int = Field(10, ge=1, le=100)
     threshold_minutes: float = Field(15.0, gt=0)
+    diagnostic_fixed_inputs: list[Literal["n_facilities", "threshold_minutes"]] | None = Field(
+        None, max_length=2,
+        description="For coverage diagnostics, only inputs explicitly fixed by the user. A question asking how many facilities fixes threshold_minutes, not n_facilities; a minimum-time question fixes n_facilities. Include both only when both constraints were supplied. Defaults are not fixed inputs. Use [] if neither is known. Null preserves legacy single-question behavior.",
+    )
     facility_capacity: float | None = Field(
         None, gt=0, description="Optional people served per selected facility"
     )
@@ -159,11 +166,28 @@ class TaskSpec(BaseModel):
     def _compatible_optimization_controls(self) -> "TaskSpec":
         if self.equity_alpha is not None and self.coverage_target is not None:
             raise ValueError("equity_alpha cannot be combined with a hard coverage_target")
+        if self.allow_hypothetical_sites:
+            if self.analysis_goal != "minimum_facilities" or self.coverage_diagnostic_handles != ("minimum_facilities",):
+                raise ValueError("Hypothetical sites require a fixed threshold with the facility count to calculate")
+            if self.mobility_scenario == "walk_drive_equity" or self.operating_window or self.facility_capacity or self.regional_requirements:
+                raise ValueError("Hypothetical sites currently support a single travel mode without capacity, operating-window, or regional constraints")
         return self
 
     def is_complete(self) -> bool:
         """Return whether all human value judgments have been supplied."""
         return self.analysis_goal != "facility_siting" or self.weights is not None
+
+    @property
+    def coverage_diagnostic_handles(self) -> tuple[str, ...]:
+        fixed = self.diagnostic_fixed_inputs
+        if fixed is None:
+            fixed = ["threshold_minutes"] if self.analysis_goal == "minimum_facilities" else ["n_facilities"]
+        handles = []
+        if "threshold_minutes" in fixed:
+            handles.append("minimum_facilities")
+        if "n_facilities" in fixed:
+            handles.append("minimum_threshold")
+        return tuple(handles)
 
 
 RoutingMode = Literal["quick", "precise", "auto"]
