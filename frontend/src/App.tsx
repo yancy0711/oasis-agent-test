@@ -1,18 +1,13 @@
-import { AppShell } from "./app/AppShell";
-import { RunWorkspace } from "./features/run/RunWorkspace";
 import { TaskWorkspace } from "./features/task/TaskWorkspace";
 import { TaskEditorProvider } from "./features/task/TaskEditorContext";
-
-import { useAppStore } from "./store/appStore";
+import { WorkspacePreferences } from "./app/WorkspacePreferences";
 
 export default function App() {
-  const audience = useAppStore((state) => state.audience);
   return (
-    <AppShell>
+    <WorkspacePreferences>
       <TaskEditorProvider>
         <TaskWorkspace />
-        {audience === "research" && <RunWorkspace />}
       </TaskEditorProvider>
-    </AppShell>
+    </WorkspacePreferences>
   );
 }

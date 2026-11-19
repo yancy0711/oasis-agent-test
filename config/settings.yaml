@@ -89,7 +89,7 @@ data:
     enabled: true
     resolution_m: 120
     products: [ndvi, ndbi, broadband_albedo_proxy]
-    processing: same_scenes_same_120m_grid_no_full_scene_download
+    processing: independent_clear_pixel_surface_reflectance_windows
   population_grid:
     enabled: true
     provider: census_block_group

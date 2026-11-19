@@ -3,12 +3,30 @@ import type { RunResult } from "../../api/models";
 import { useTaskEditor } from "../task/TaskEditorContext";
 import { safeRecoveryPatch } from "./recovery.utils";
 import { LoadingText } from "../../components/LoadingText";
+import { useWorkspacePreferences } from "../../app/WorkspacePreferences";
 
-interface Props { result: RunResult; onRetry?: () => void; retryPending?: boolean; retryError?: string; }
-export function RecoveryPanel({ result, onRetry, retryPending = false, retryError }: Props) {
+interface Props { result: RunResult; onRetry?: () => void; onRetryWithLandsat?: () => void; retryPending?: boolean; retryError?: string; onEditTask?: () => void; }
+export function RecoveryPanel({ result, onRetry, onRetryWithLandsat, retryPending = false, retryError, onEditTask }: Props) {
   const [dismissed, setDismissed] = useState(false);
   const editor = useTaskEditor();
+  const { t } = useWorkspacePreferences();
   if (!result.recovery || dismissed) return null;
+  const utciUnavailable = result.task?.heat_metric === "utci" &&
+    (result.recovery.suggested_changes?.heat_metric === "landsat_lst" ||
+      /Could not use UTCI for this run|OASIS_UTCI_PATH/i.test(result.recovery.diagnosis));
+  if (utciUnavailable) {
+    return <div className="recovery-panel error" role="alert">
+      <strong>{t("ERA5-HEAT UTCI unavailable")}</strong>
+      <p>{t("Retry with UTCI, or use Landsat land-surface temperature for this task.")}</p>
+      <details><summary>{t("Provider diagnostics")}</summary><p>{result.recovery.diagnosis}</p></details>
+      <div className="button-row">
+        {onRetry && <button type="button" disabled={retryPending} onClick={onRetry}>{t("Retry UTCI")}</button>}
+        {onRetryWithLandsat && <button type="button" className="button--secondary" disabled={retryPending} onClick={onRetryWithLandsat}>{t("Run with Landsat LST")}</button>}
+        {retryPending && <LoadingText>{t("Starting retry")}</LoadingText>}
+      </div>
+      {retryError && <p className="error">{retryError}</p>}
+    </div>;
+  }
   const alternatives = result.recovery.alternatives ?? [];
   const legacyCoverageAdvice = result.task?.coverage_target != null && !alternatives.length;
   const patch = legacyCoverageAdvice ? {} : safeRecoveryPatch(result.recovery.suggested_changes ?? {});
@@ -19,24 +37,36 @@ export function RecoveryPanel({ result, onRetry, retryPending = false, retryErro
   const solverTimedOut = !osmUnavailable
     && /solve|optimization/i.test(result.recovery.diagnosis)
     && /time limit|timed out|timeout/i.test(result.recovery.diagnosis);
-  const reviewSettings = (csv = false) => {
-    if (csv) editor.apply({ candidate_source: "csv" });
+  const focusSettings = (selectSource = false) => {
+    onEditTask?.();
+    const focus = () => {
     const settings = document.querySelector<HTMLDetailsElement>(".task-settings-disclosure");
     if (settings) settings.open = true;
     const form = document.querySelector(".task-workspace form.panel");
-    form?.scrollIntoView({ behavior: "smooth", block: "start" });
-    form?.querySelector<HTMLSelectElement>('[aria-label="Candidate source"]')?.focus();
+      form?.scrollIntoView({ block: "nearest" });
+      if (selectSource) form?.querySelector<HTMLSelectElement>('[aria-label="Candidate source"]')?.focus();
+      else form?.querySelector("summary")?.focus();
+    };
+    if (onEditTask) requestAnimationFrame(focus);
+    else focus();
+  };
+  const reviewSettings = (csv = false) => {
+    if (csv) editor.apply({ candidate_source: "csv" });
+    focusSettings(true);
   };
   const needsStudyArea = /study.?area|city or county|boundary type/i.test(
     `${result.recovery.diagnosis} ${result.recovery.question}`,
   );
   const reviewStudyArea = () => {
     setDismissed(true);
-    const section = document.querySelector("[data-study-area-step]");
-    if (section instanceof HTMLDetailsElement) section.open = true;
-    const target = section?.querySelector(".candidate-list, input") ?? document.querySelector("#prompt");
-    target?.scrollIntoView({ behavior: "smooth", block: "center" });
-    if (target instanceof HTMLElement) target.focus();
+    onEditTask?.();
+    requestAnimationFrame(() => {
+      const section = document.querySelector("[data-study-area-step]");
+      if (section instanceof HTMLDetailsElement) section.open = true;
+      const target = section?.querySelector("button, input") ?? document.querySelector("#prompt");
+      target?.scrollIntoView({ block: "center" });
+      if (target instanceof HTMLElement) target.focus();
+    });
   };
   return <div className={`recovery-panel${result.execution?.status === "failed" ? " error" : ""}`} role="alert">
     <strong>Human decision required</strong>
@@ -52,7 +82,7 @@ export function RecoveryPanel({ result, onRetry, retryPending = false, retryErro
     {alternatives.length > 0 && <ul className="recovery-alternatives">{alternatives.map((option, index) => {
       const changes = option.changes && typeof option.changes === "object" ? safeRecoveryPatch(option.changes as Record<string, unknown>) : {};
       const verified = option.status === "verified" && Object.keys(changes).length > 0;
-      return <li key={String(option.parameter ?? index)}><p>{String(option.description)}{option.accuracy === "approximate" ? " Approximate travel estimate." : ""}</p>{verified && <button type="button" className="button--secondary" onClick={() => { editor.apply(changes); setDismissed(true); document.querySelector(".task-workspace form.panel")?.scrollIntoView({ behavior: "smooth" }); }}>{option.parameter === "n_facilities" ? "Use facility-count option" : "Use travel-time option"}</button>}</li>;
+      return <li key={String(option.parameter ?? index)}><p>{String(option.description)}{option.accuracy === "approximate" ? " Approximate travel estimate." : ""}</p>{verified && <button type="button" className="button--secondary" onClick={() => { editor.apply(changes); setDismissed(true); focusSettings(); }}>{option.parameter === "n_facilities" ? "Use facility-count option" : "Use travel-time option"}</button>}</li>;
     })}</ul>}
     {legacyCoverageAdvice && !osmUnavailable && <p className="muted">This saved recommendation has no verified repair options. Run the task again to calculate them; your coverage target is kept.</p>}
     {canApply && <dl className="change-list">{Object.entries(patch).filter(([key]) => key !== "coverage_target_enabled").map(([key, value]) => <div key={key}><dt>{key.replaceAll("_", " ")}</dt><dd>{String(value)}</dd></div>)}</dl>}
@@ -63,7 +93,7 @@ export function RecoveryPanel({ result, onRetry, retryPending = false, retryErro
         <button type="button" className="button--secondary" disabled={retryPending} onClick={() => reviewSettings()}>Edit search settings</button>
         <button type="button" className="button--secondary" disabled={retryPending} onClick={() => reviewSettings(true)}>Use candidate CSV</button>
       </>}
-      {canApply && <button type="button" onClick={() => { editor.apply(patch); setDismissed(true); document.querySelector(".task-workspace form.panel")?.scrollIntoView({ behavior: "smooth" }); }}>Apply to task editor</button>}
+      {canApply && <button type="button" onClick={() => { editor.apply(patch); setDismissed(true); focusSettings(); }}>Apply to task editor</button>}
       {needsStudyArea && <button type="button" onClick={reviewStudyArea}>Choose a city or county</button>}
       {!osmUnavailable && <button type="button" className="button--secondary" onClick={() => setDismissed(true)}>Keep editing manually</button>}
     </div>

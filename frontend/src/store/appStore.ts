@@ -8,6 +8,9 @@ const initialState: AppSessionState = {
   taskVersion: 0,
   confirmedPlace: null,
   candidateUploadId: null,
+  candidateUploadName: null,
+  uploadedPoints: [],
+  studyLayerVisibility: { boundary: true, demand: true, heat: true, candidate: true, uploaded: true },
   llmSessionId: null,
   llmSessionLabel: null,
   completedRunIds: [],
@@ -24,7 +27,11 @@ export const useAppStore = create<AppStore>()(
       setAudience: (audience) => set({ audience }),
       setActiveRunId: (activeRunId) => set({ activeRunId }),
       setConfirmedPlace: (confirmedPlace) => set({ confirmedPlace }),
-      setCandidateUploadId: (candidateUploadId) => set({ candidateUploadId }),
+      setCandidateUploadId: (candidateUploadId, points = [], filename) => set({
+        candidateUploadId, candidateUploadName: candidateUploadId ? filename ?? null : null,
+        uploadedPoints: candidateUploadId ? points : [],
+      }),
+      setStudyLayerVisibility: (layer, visible) => set((state) => ({ studyLayerVisibility: { ...state.studyLayerVisibility, [layer]: visible } })),
       setLlmSession: (llmSessionId, llmSessionLabel) => set({ llmSessionId, llmSessionLabel }),
       registerCompletedRun: (runId) => set((state) => ({
         completedRunIds: state.completedRunIds.includes(runId)
@@ -50,6 +57,7 @@ export const useAppStore = create<AppStore>()(
         activeRunId: state.activeRunId,
         confirmedPlace: state.confirmedPlace,
         candidateUploadId: state.candidateUploadId,
+        candidateUploadName: state.candidateUploadName,
         completedRunIds: state.completedRunIds,
         comparisonRunIds: state.comparisonRunIds,
         mobilitySignature: state.mobilitySignature,

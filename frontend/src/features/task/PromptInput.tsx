@@ -1,13 +1,12 @@
-import { useState, type FormEvent } from "react";
-import { InfoLabel } from "../../components/InfoLabel";
+import { useWorkspacePreferences } from "../../app/WorkspacePreferences";
+import { useRef, useState, type FormEvent, type ReactNode } from "react";
+import { WorkspaceIcon } from "../../app/WorkspaceIcon";
 import { LoadingText } from "../../components/LoadingText";
-import { useMediaQuery } from "../../hooks/useMediaQuery";
 
 type PromptAudience = "research" | "personal";
 
 const AUDIENCES: Record<PromptAudience, {
   label: string;
-  audience: string;
   description: string;
   placeholder: string;
   note?: string;
@@ -15,8 +14,7 @@ const AUDIENCES: Record<PromptAudience, {
 }> = {
   research: {
     label: "Research and planning",
-    audience: "For planners, public-health teams, and researchers.",
-    description: "Analyze a US city or county through facility siting, value-profile comparison, heat exposure, or accessibility assessment.",
+    description: "Analyze a study area through facility siting, value-profile comparison, heat exposure, or accessibility assessment.",
     placeholder: "Select 10 candidate cooling facilities in Phoenix within a 15-minute walk.",
     examples: [
       { label: "Candidate facility siting", prompt: "Select 10 candidate cooling facilities in Phoenix, Arizona within a 15-minute walking threshold." },
@@ -27,7 +25,6 @@ const AUDIENCES: Record<PromptAudience, {
   },
   personal: {
     label: "Find a nearby facility",
-    audience: "For Users starting from a specific address or landmark.",
     description: "Start from a specific US address or landmark and plan a route to a nearby candidate facility.",
     placeholder: "I'm at the Lincoln Memorial. How can I find the nearest cooling facility?",
     note: "Search nearby places without a facility budget. OASIS does not confirm real-time opening or emergency availability.",
@@ -49,19 +46,67 @@ interface PromptInputProps {
   onUseLocation?: () => void;
   autoDetect?: boolean;
   onAutoDetectChange?: (enabled: boolean) => void;
+  onShowUpload?: () => void;
+  hasActiveRun?: boolean;
+  activity?: ReactNode;
 }
 
-export function PromptInput({ pending, onSubmit, onCancel, onUseLocation, audience: controlledAudience, onAudienceChange, autoDetect = true, onAutoDetectChange }: PromptInputProps) {
+const historyKey = "oasis-prompt-history";
+
+function readHistory(): string[] {
+  try {
+    const entries: unknown = JSON.parse(sessionStorage.getItem(historyKey) ?? "[]");
+    return Array.isArray(entries) ? entries.filter((value): value is string => typeof value === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+export function PromptInput({ pending, onSubmit, onCancel, onUseLocation, audience: controlledAudience, onAudienceChange, autoDetect = true, onAutoDetectChange, onShowUpload, hasActiveRun, activity }: PromptInputProps) {
+  const { t } = useWorkspacePreferences();
   const [prompt, setPrompt] = useState("");
+  const [submitted, setSubmitted] = useState("");
+  const [history, setHistory] = useState(readHistory);
+  const [historyIndex, setHistoryIndex] = useState(-1);
+  const originalDraft = useRef("");
   const [localAudience, setAudience] = useState<PromptAudience>("research");
   const audience = controlledAudience ?? localAudience;
-  const mobile = useMediaQuery("(max-width: 620px)");
-  const [stepOpen, setStepOpen] = useState(true);
+  const composer = useRef<HTMLTextAreaElement>(null);
   const active = AUDIENCES[audience];
+  const showQuickStart = !submitted && !hasActiveRun && Boolean(onShowUpload);
+
+  function fill(value: string) {
+    setHistoryIndex(-1);
+    setPrompt(value);
+    composer.current?.focus();
+  }
+
+  function recall(index: number) {
+    if (index >= history.length || index < -1) return;
+    if (historyIndex < 0) originalDraft.current = prompt;
+    setHistoryIndex(index);
+    setPrompt(index < 0 ? originalDraft.current : history[index]);
+    requestAnimationFrame(() => composer.current?.setSelectionRange(0, 0));
+  }
+
+  function remember(value: string) {
+    setSubmitted(value);
+    const next = [value, ...history];
+    setHistory(next);
+    setHistoryIndex(-1);
+    try {
+      sessionStorage.setItem(historyKey, JSON.stringify(next));
+    } catch {
+      // The current tab can still recall prompts when browser storage is unavailable.
+    }
+  }
 
   function analyze() {
     const value = prompt.trim();
-    if (value && !pending) onSubmit(value);
+    if (value && !pending) {
+      remember(value);
+      onSubmit(value);
+    }
   }
 
   function submit(event: FormEvent) {
@@ -70,17 +115,14 @@ export function PromptInput({ pending, onSubmit, onCancel, onUseLocation, audien
   }
 
   return (
-    <form className="prompt-input" onSubmit={submit}>
-      <details className="mobile-step-disclosure" open={!mobile || stepOpen} onToggle={(event) => {
-        if (mobile) setStepOpen(event.currentTarget.open);
-      }}>
-      <summary><span className="step-heading step-heading--summary"><span className="form-step">Step 1</span><span>Describe the cooling-access question</span></span><InfoLabel label="Describe the cooling-access question">State the US city or county, candidate-facility question, travel threshold, and policy priorities. Unsupported real-time or parcel questions return a suggested official alternative.</InfoLabel></summary>
-      <div className="mobile-step-body">
-      <div className="prompt-label">
-        <label className="step-heading" htmlFor="prompt"><span className="form-step">Step 1</span><span>Describe the cooling-access question</span></label>
-        <InfoLabel label="Describe the cooling-access question">State the US city or county, candidate-facility question, travel threshold, and policy priorities. Unsupported real-time or parcel questions return a suggested official alternative.</InfoLabel>
-      </div>
-      <div className="prompt-audience-tabs" role="tablist" aria-label="Choose how you want to use OASIS">
+    <form className="prompt-input workbench-chat" onSubmit={submit}>
+      <div className="workbench-chat__scroll">
+      {showQuickStart && <div className="workbench-welcome">
+        <h1>{t("Cooling-center siting workbench")}</h1>
+        <p>{t("Ask about a US city or county, review a site plan, or bring your own candidate locations.")}</p>
+      </div>}
+      {submitted && <div className="workbench-user-message"><small>{t("You")}</small><p>{submitted}</p></div>}
+      <div className="prompt-audience-tabs" role="tablist" aria-label={t("Choose how you want to use OASIS")}>
         {(Object.keys(AUDIENCES) as PromptAudience[]).map((key) => (
           <button
             type="button"
@@ -92,46 +134,76 @@ export function PromptInput({ pending, onSubmit, onCancel, onUseLocation, audien
             key={key}
             onClick={() => { setAudience(key); onAudienceChange?.(key); }}
           >
-            {AUDIENCES[key].label}
+            {t(AUDIENCES[key].label)}
           </button>
         ))}
       </div>
       {onAutoDetectChange && <div className="workflow-detection"><label><input type="checkbox" checked={autoDetect} disabled={pending}
-        onChange={(event) => onAutoDetectChange(event.target.checked)} />Auto-detect task type</label>
-        {!autoDetect && <small>Manual choice: Analyze request uses this tab.</small>}</div>}
+        onChange={(event) => onAutoDetectChange(event.target.checked)} />{t("Auto-detect task type")}</label>
+        {!autoDetect && <small>{t("Manual choice: Analyze request uses this tab.")}</small>}</div>}
       <div className="prompt-audience-panel" role="tabpanel" id={`prompt-panel-${audience}`} aria-labelledby={`prompt-tab-${audience}`}>
-        <strong className="prompt-audience-for">{active.audience}</strong>
-        <p>{active.description}</p>
+        {showQuickStart && audience === "research" && <div className="workbench-quick-start">
+          <h3>{t("Quick-start prompts")}</h3>
+          <button type="button" onClick={() => fill(AUDIENCES.research.examples[0].prompt)}>{t("Site 10 cooling centers in Phoenix")} <WorkspaceIcon name="arrow" /></button>
+          <button type="button" onClick={() => fill("Select cooling facilities in Phoenix, Arizona within a 15-minute walk. Prioritize residents aged 65 and older in South Phoenix.")}>{t("Prioritize residents aged 65+ in South Phoenix")} <WorkspaceIcon name="arrow" /></button>
+          <button className="workbench-upload-button" type="button" onClick={onShowUpload}>{t("Use my own data")} <WorkspaceIcon name="upload" /></button>
+          <button type="button" onClick={() => composer.current?.focus()}>{t("Write a prompt")} <WorkspaceIcon name="edit" /></button>
+        </div>}
+        <details key={audience} className="workbench-disclosure prompt-library" open={!onShowUpload || audience === "personal" ? true : undefined}>
+        <summary>{t("More examples")}</summary>
+        <p>{t(active.description)}</p>
         <div className="prompt-examples" aria-label={`${active.label} example requests`}>
           {active.examples.map((example) => <button type="button" key={example.label} onClick={() => {
-            setPrompt(example.prompt);
-            if (example.action === "current_location") onUseLocation?.();
-          }}>{example.label}</button>)}
+            fill(example.prompt);
+            if (example.action === "current_location") {
+              remember(example.prompt);
+              onUseLocation?.();
+            }
+          }}>{t(example.label)}</button>)}
         </div>
-        {active.note && <p className="prompt-audience-note">{active.note}</p>}
+        </details>
+        {active.note && <p className="prompt-audience-note">{t(active.note)}</p>}
+      </div>
+      {activity}
       </div>
       <div className="prompt-input__row">
         <textarea
+          ref={composer}
           id="prompt"
-          aria-label="Describe the cooling-access question"
+          aria-label={t("Describe the cooling-access question")}
+          aria-describedby={history.length ? "prompt-history-help" : undefined}
           value={prompt}
-          onChange={(event) => setPrompt(event.target.value)}
+          onChange={(event) => { setPrompt(event.target.value); setHistoryIndex(-1); }}
           rows={2}
           onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
+            if (event.nativeEvent.isComposing) return;
+            const input = event.currentTarget;
+            const unmodified = !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey;
+            const atFirstLine = !input.value.slice(0, input.selectionStart).includes("\n");
+            if (history.length && unmodified && input.selectionStart === input.selectionEnd) {
+              if (event.key === "ArrowUp" && (historyIndex >= 0 || atFirstLine)) {
+                event.preventDefault();
+                recall(historyIndex + 1);
+              }
+              if (event.key === "ArrowDown" && historyIndex >= 0) {
+                event.preventDefault();
+                recall(historyIndex - 1);
+              }
+            }
+            if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
               event.preventDefault();
               analyze();
             }
           }}
-          placeholder={active.placeholder}
+          placeholder={t(active.placeholder)}
         />
+        {history.length > 0 && <span id="prompt-history-help" className="workbench-visually-hidden">{t("Press ↑ on the first line to recall earlier prompts. Press ↓ to return.")}</span>}
+        {onShowUpload && audience === "research" && <button className="workbench-icon-button composer-upload" type="button" onClick={onShowUpload} aria-label={t("Upload candidate CSV")} title={t("Upload candidate CSV")}><WorkspaceIcon name="upload" /></button>}
         <button type="submit" disabled={pending || !prompt.trim()}>
-          {pending ? <LoadingText>Analyzing</LoadingText> : "Analyze request"}
+          {pending ? <LoadingText>{t("Analyzing")}</LoadingText> : <>{t("Analyze request")} <WorkspaceIcon name="send" /></>}
         </button>
-        {pending && <button type="button" className="button--danger" onClick={onCancel}>Cancel</button>}
+        {pending && <button type="button" className="button--danger" onClick={onCancel}>{t("Cancel")}</button>}
       </div>
-      </div>
-      </details>
     </form>
   );
 }

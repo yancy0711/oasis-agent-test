@@ -5,7 +5,9 @@ import { apiError } from "./errors";
 import type {
   ParseResponse,
   DataSourceStatus,
+  DemandUpload,
   OfficialResources,
+  RegionalCensus,
   PlaceConfirmResponse,
   PlaceResolveResponse,
   RouteOriginCandidate,
@@ -13,6 +15,7 @@ import type {
   RunAccepted,
   RunRevisionRequest,
   RunSnapshot,
+  StudyInputLayers,
   TaskSpec,
   UiConfigResponse,
   UploadResponse,
@@ -45,6 +48,30 @@ export async function getDataSourceStatus(): Promise<DataSourceStatus> {
 export async function getOfficialResources(placeName: string): Promise<OfficialResources> {
   const { data, error } = await client.GET("/v1/official-resources", { params: { query: { place_name: placeName } } });
   return valueOrThrow(data, error, "Could not check official cooling resources.");
+}
+
+export async function getRegionalCensus(place: string, signal: AbortSignal): Promise<RegionalCensus> {
+  const response = await fetch(`/api/v1/regional-data?place_name=${encodeURIComponent(place)}`, { signal });
+  if (!response.ok) throw apiError(await readErrorBody(response), "Could not check regional census data.");
+  return response.json() as Promise<RegionalCensus>;
+}
+
+export async function getStudyBoundary(place: string, signal: AbortSignal): Promise<import("geojson").FeatureCollection> {
+  const response = await fetch(`/api/v1/regional-data/download?layer=boundary&place_name=${encodeURIComponent(place)}`, { signal });
+  if (!response.ok) throw apiError(await readErrorBody(response), "Could not load the study boundary.");
+  return response.json();
+}
+
+export async function getStudyInputLayers(runId: string, signal: AbortSignal): Promise<StudyInputLayers> {
+  const response = await fetch(`/api/v1/runs/${encodeURIComponent(runId)}/input-layers`, { signal });
+  if (!response.ok) return {};
+  return response.json();
+}
+
+export async function uploadDemand(form: FormData): Promise<DemandUpload> {
+  const response = await fetch("/api/v1/uploads/demand", { method: "POST", body: form });
+  if (!response.ok) throw apiError(await readErrorBody(response), "Could not upload demand data.");
+  return response.json() as Promise<DemandUpload>;
 }
 
 export interface StreetViewResult {
@@ -137,7 +164,8 @@ export async function confirmPlace(
   const { data, error } = await client.POST("/v1/places/confirm", {
     body: { resolution_id: resolutionId, candidate_id: candidateId },
   });
-  return valueOrThrow(data, error, "Could not confirm the study area.");
+  const confirmed = valueOrThrow(data, error, "Could not confirm the study area.");
+  return { ...confirmed, boundary: confirmed.boundary as PlaceConfirmResponse["boundary"] };
 }
 
 export interface CoordinateOriginResult {
@@ -175,9 +203,11 @@ export async function searchRouteOrigin(query: string): Promise<CoordinateOrigin
   return response.json() as Promise<CoordinateOriginResult>;
 }
 
-export async function uploadCandidates(file: File): Promise<UploadResponse> {
+export async function uploadCandidates(file: File, sourceCrs = "4326"): Promise<UploadResponse> {
   const form = new FormData();
   form.set("file", file);
+  if (sourceCrs === "gcj02") form.set("coordinate_system", "gcj02");
+  else if (sourceCrs !== "4326") form.set("epsg", sourceCrs);
   const response = await fetch("/api/v1/uploads", { method: "POST", body: form });
   if (!response.ok) {
     const detail = await readErrorBody(response);

@@ -19,5 +19,5 @@ export function useConfirmPlace() {
 }
 
 export function useUploadCandidates() {
-  return useMutation({ mutationFn: uploadCandidates });
+  return useMutation({ mutationFn: ({ file, sourceCrs }: { file: File; sourceCrs: string }) => uploadCandidates(file, sourceCrs) });
 }

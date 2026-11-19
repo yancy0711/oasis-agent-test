@@ -19,6 +19,7 @@ services:
       - "8000:8000"
     volumes:
       - ./data/cache:/app/data/cache
+      - ./data/thermal:/app/data/thermal:ro
       - ./outputs_run:/app/outputs_run
       - ./tmp/uploads:/app/tmp/uploads
     healthcheck:

@@ -83,7 +83,7 @@ export function ResidentWorkspace({ request, cancelVersion, onBusy, onPreference
     catch (reason) {
       if (active.current === operation && !operation.controller.signal.aborted) {
         if (operation.searchId) pendingIds.current.add(operation.searchId);
-        setError(reason instanceof Error ? reason.message : "The request failed. Try again or enter a US address.");
+        setError(reason instanceof Error ? reason.message : "The request failed. Try again or enter an address.");
         setStatus("Search stopped. Your inputs are kept.");
       }
     } finally {
@@ -97,28 +97,26 @@ export function ResidentWorkspace({ request, cancelVersion, onBusy, onPreference
 
   const stageOrigin = useCallback((next: Origin) => {
     setOrigin(next); setConfirmed(false); setChoices([]); resetResults();
-    setStatus(next.country_code === "us" ? "Confirm this starting point before searching nearby places."
-      : next.country_code ? `Your location is ${next.label}, outside the supported US area. Please enter a US address.`
-        : "The country could not be verified. Enter a more specific US address.");
+    setStatus("Confirm this starting point before searching nearby places.");
   }, [resetResults]);
 
   const locate = useCallback(async (signal: AbortSignal) => {
     setConfirmed(false); setOrigin(null); setChoices([]); resetResults();
     setStatus("Waiting for browser location permission...");
-    if (!navigator.geolocation) throw new Error("Location is unavailable in this browser. Enter a US address.");
+    if (!navigator.geolocation) throw new Error("Location is unavailable in this browser. Enter an address.");
     const position = await new Promise<GeolocationPosition>((resolve, reject) => {
       const aborted = () => reject(new DOMException("Cancelled", "AbortError"));
       signal.addEventListener("abort", aborted, { once: true });
       navigator.geolocation.getCurrentPosition(
         (value) => { signal.removeEventListener("abort", aborted); resolve(value); },
         (reason) => { signal.removeEventListener("abort", aborted); reject(new Error(reason.code === 1
-          ? "Location permission was denied. Enter a US address or allow location access and retry."
-          : "Could not determine your location. Enter a US address or retry.")); },
+          ? "Location permission was denied. Enter an address or allow location access and retry."
+          : "Could not determine your location. Enter an address or retry.")); },
         { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 },
       );
     });
     signal.throwIfAborted();
-    setStatus("Checking the country of your browser location...");
+    setStatus("Locating your starting point...");
     const next = await trackedPost<Origin>("origin", { longitude: position.coords.longitude, latitude: position.coords.latitude }, signal);
     signal.throwIfAborted(); stageOrigin(next);
   }, [resetResults, stageOrigin, trackedPost]);
@@ -129,7 +127,7 @@ export function ResidentWorkspace({ request, cancelVersion, onBusy, onPreference
     const data = await trackedPost<{ candidates: Origin[]; message: string }>("origins", { query }, signal);
     signal.throwIfAborted();
     if (data.candidates.length === 1) stageOrigin(data.candidates[0]);
-    else { setChoices(data.candidates); setStatus(data.candidates.length ? data.message : "No matching address found. Enter a more specific US address."); }
+    else { setChoices(data.candidates); setStatus(data.candidates.length ? data.message : "No matching address found. Enter a more specific address."); }
   }, [resetResults, stageOrigin, trackedPost]);
 
   const search = useCallback(async (point: Origin, prefs: Preferences, signal: AbortSignal) => {
@@ -167,7 +165,7 @@ export function ResidentWorkspace({ request, cancelVersion, onBusy, onPreference
     if (next.origin_query && (!origin || next.origin_query !== preferences.origin_query)) {
       setAddress(next.origin_query); await resolveAddress(next.origin_query, signal);
     } else if (next.use_current_location && !next.origin_query) { await locate(signal); }
-    else if (origin && confirmed && origin.country_code === "us") await search(origin, next, signal);
+    else if (origin && confirmed) await search(origin, next, signal);
     else if (next.origin_query) { setAddress(next.origin_query); await resolveAddress(next.origin_query, signal); }
     else await locate(signal);
   }, [preferences, origin, confirmed, locate, resolveAddress, search, resetResults]);
@@ -188,7 +186,6 @@ export function ResidentWorkspace({ request, cancelVersion, onBusy, onPreference
 
   function confirmOrigin(point: Origin) {
     stageOrigin(point);
-    if (point.country_code !== "us") return;
     setConfirmed(true);
     if (!preferences.needs_clarification && validFilters) void perform((signal) => search(point, preferences, signal));
   }
@@ -211,27 +208,24 @@ export function ResidentWorkspace({ request, cancelVersion, onBusy, onPreference
 
   const included = preferences.categories ?? [];
   const excluded = preferences.excluded_categories ?? [];
-  const outside = !!origin?.country_code && origin.country_code !== "us";
   const retryIncomplete = result && !result.complete
     && result.checked_count < Math.min(result.discovered_count, result.candidate_limit ?? 50);
   const searchBlocker = busy ? "Please wait for the current request, or cancel it."
-    : outside ? "Enter a US address or choose a point in the United States."
     : !origin || !confirmed ? "Choose and confirm a starting point beside the map."
     : !validFilters ? "Choose at least one category, a travel time of 1-120 minutes and a radius of 1-30 km."
     : preferences.needs_clarification ? preferences.clarification || "Clarify your request in the prompt above." : "";
   return <section className="panel resident-workspace" aria-label="Resident nearby places">
-    <div className="section-heading"><div><p className="eyebrow">For residents</p><h2>Find nearby places</h2></div>
-      <span className="status">Search and navigate</span></div>
-    <p>Find reachable places to cool down.</p>
+    <h2 className="resident-heading">Find nearby places</h2>
     <form className="inline-form resident-origin-controls" onSubmit={(event) => { event.preventDefault(); if (address.trim()) void perform((signal) => resolveAddress(address.trim(), signal)); }}>
-      <label htmlFor="resident-address">US address or landmark</label>
-      <input id="resident-address" value={address} onChange={(event) => { cancel(); setAddress(event.target.value); setConfirmed(false); resetResults(); }} placeholder="Riverside City Hall, California" />
+      <label htmlFor="resident-address">Address or landmark</label>
+      <input id="resident-address" value={address} onChange={(event) => { cancel(); setAddress(event.target.value); setConfirmed(false); resetResults(); }} placeholder="Address, landmark, or coordinates" />
       <button disabled={busy || address.trim().length < 2}>Find address</button>
       <button type="button" disabled={busy} onClick={() => { setPicking(false); void perform(locate); }}>Use my location</button>
     </form>
     {choices.length > 0 && <div className="candidate-list">{choices.map((point, index) => <button className="candidate-card" key={index} disabled={busy} onClick={() => confirmOrigin(point)}>
-      <strong>{point.label}</strong><span>{point.country_code === "us" ? "Confirm and search from here" : "Show this location (outside US)"}</span>
+      <strong>{point.label}</strong><span>Confirm and search from here</span>
     </button>)}</div>}
+    <details className="resident-filter-options"><summary>Search filters</summary>
     <div className="form-grid">
       <label className="field">Travel mode<select aria-label="Resident travel mode" value={preferences.mode} onChange={(event) => updatePreferences({ mode: event.target.value as Preferences["mode"] })}>
         <option value="walking">Walking</option><option value="cycling">Cycling</option><option value="driving">Driving</option>
@@ -253,6 +247,7 @@ export function ResidentWorkspace({ request, cancelVersion, onBusy, onPreference
     {excluded.length > 0 && <p>Excluded: {excluded.map((key) => CATEGORIES[key].label).join(", ")}</p>}
     {!!preferences.preferred_categories?.length && <p>Preferred: {preferences.preferred_categories.map((key) => CATEGORIES[key].label).join(", ")}</p>}
     {preferences.needs_clarification && <button disabled={busy} onClick={() => updatePreferences({ needs_clarification: false, clarification: "" })}>Use the displayed supported filters</button>}
+    </details>
     <div className="resident-explorer" style={{ "--resident-sidebar": `${sidebarWidth}%` } as CSSProperties}>
       <ResidentCandidates emptyMessage={busy ? "Matching places will appear here." : confirmed ? (error ? "Search failed. Your starting point is confirmed; retry beside the map." : "Your starting point is confirmed. Update results to apply your filters.") : "Choose and confirm a starting point to find places here."} result={result} selectedId={selectedId} fastestId={recommendations.fastest?.summary.destination_id ?? null} preferred={preferences.preferred_categories ?? []} onSelect={navigate} onNavigate={navigate} />
       <div className="resident-resizer" role="separator" tabIndex={0} aria-label="Resize place list" aria-orientation="vertical"
@@ -271,12 +266,12 @@ export function ResidentWorkspace({ request, cancelVersion, onBusy, onPreference
         }}
         onPointerUp={(event) => event.currentTarget.releasePointerCapture(event.pointerId)} />
       <div className="resident-map-column">
-    {origin && <div className={outside ? "resident-location-warning" : "notice"} role={outside ? "alert" : "status"}>
-      <strong>{outside ? "Outside supported area" : confirmed ? "Confirmed starting point" : "Confirm your starting point"}</strong>
-      <p>{origin.label} ({origin.latitude.toFixed(5)}, {origin.longitude.toFixed(5)})</p>
-      {outside ? <p>This location is outside the United States. Please enter a US address above.</p>
-        : origin.country_code === "us" && !confirmed && <button disabled={busy} onClick={() => confirmOrigin(origin)}>Confirm location and search</button>}
-    </div>}
+      {origin && <div className="resident-origin-card" role="status">
+        <span title={`${origin.label} (${origin.latitude.toFixed(5)}, ${origin.longitude.toFixed(5)})`}>
+          <strong>{confirmed ? "Confirmed starting point" : "Confirm your starting point"}</strong> {origin.label}
+        </span>
+        {!confirmed && <button disabled={busy} onClick={() => confirmOrigin(origin)}>Confirm location and search</button>}
+      </div>}
       <div className="button-row resident-search-actions">
         {confirmed && !busy && (!result || retryIncomplete) && <button aria-describedby="resident-search-help" disabled={!!searchBlocker || picking}
           onClick={() => origin && void perform((signal) => search(origin, preferences, signal))}>{error ? "Retry search" : result ? "Retry incomplete search" : "Update results"}</button>}

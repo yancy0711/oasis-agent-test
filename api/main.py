@@ -1,9 +1,12 @@
 """FastAPI routes for the OASIS parsing, HITL, run, and artifact services."""
 from __future__ import annotations
 import os
+from typing import Literal
 import httpx
-from fastapi import APIRouter, FastAPI, File, HTTPException, Request, UploadFile, status
-from fastapi.responses import FileResponse
+import requests
+from fastapi import APIRouter, FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from starlette.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from api.schemas import (ParseRequest, ParseResponse, PlaceConfirmRequest,
                          PlaceConfirmResponse, PlaceRequest, PlaceResolveResponse,
@@ -36,7 +39,12 @@ def create_app(service: OasisService | None = None) -> FastAPI:
     @router.get("/config", response_model=UiConfigResponse)
     def ui_config() -> dict:
         """Return presentation defaults and the browser-visible basemap key."""
+        from oasis.core.data.thermal import utci_paths
+        from oasis.core.data.era5_download import cds_configured
+
         cfg = app.state.service.cfg
+        local_utci = bool(utci_paths(cfg))
+        auto_utci = cds_configured()
         return {"optimization": cfg.get("optimization", {}),
                 "accessibility": {key: value for key, value in cfg.get("accessibility", {}).items()
                                   if key not in {"ors_base_url"}},
@@ -49,7 +57,10 @@ def create_app(service: OasisService | None = None) -> FastAPI:
                     "default_mode": cfg.get("execution", {}).get("default_mode", "auto"),
                 },
                 "value_profiles": app.state.service.profiles,
-                "carto_basemap_api_key": os.getenv("CARTO_BASEMAP_API_KEY", "").strip()}
+                "carto_basemap_api_key": os.getenv("CARTO_BASEMAP_API_KEY", "").strip(),
+                "sf_utci_configured": local_utci,
+                "utci_configured": local_utci or auto_utci,
+                "utci_auto_download": auto_utci}
 
     @router.get("/data-sources/status", response_model=DataSourceStatusResponse)
     def data_source_status(refresh: bool = False) -> dict:
@@ -141,10 +152,49 @@ def create_app(service: OasisService | None = None) -> FastAPI:
         except Exception as exc: raise HTTPException(422, str(exc)) from exc
 
     @router.post("/uploads", response_model=UploadResponse)
-    async def upload_candidates(file: UploadFile = File(...)) -> dict:
+    async def upload_candidates(file: UploadFile = File(...),
+                                coordinate_system: Literal["epsg", "gcj02"] = Form("epsg"),
+                                epsg: int = Form(4326, gt=0)) -> dict:
         """Upload one candidate CSV into backend-managed storage."""
-        try: return app.state.service.upload_candidates(file.filename or "candidates.csv", await file.read())
+        try:
+            return await run_in_threadpool(app.state.service.upload_candidates, file.filename or "candidates.csv",
+                                           await file.read(), coordinate_system, epsg)
         except ValueError as exc: raise HTTPException(422, str(exc)) from exc
+
+    @router.get("/regional-data")
+    def regional_data(place_name: str) -> dict:
+        try:
+            return app.state.service.regional_data(place_name)
+        except (requests.RequestException, OSError, ValueError) as exc:
+            raise HTTPException(422, f"Could not load regional census data. {exc}") from exc
+
+    @router.get("/regional-data/download")
+    def download_regional_data(place_name: str, layer: Literal["demand", "boundary"] = "demand") -> Response:
+        try:
+            body = app.state.service.regional_demand_geojson(place_name, layer)
+        except (requests.RequestException, OSError, ValueError) as exc:
+            raise HTTPException(422, "Check the regional population layer in Data or upload demand polygons.") from exc
+        return Response(body, media_type="application/geo+json",
+                        headers={"Content-Disposition": f'attachment; filename="regional-{layer}.geojson"'})
+
+    @router.post("/uploads/demand")
+    async def upload_demand(
+        file: UploadFile = File(...), place_name: str = Form(..., max_length=250),
+        id_field: str = Form(...), population_field: str = Form(...),
+        older_field: str = Form(""), epsg: int = Form(4326, gt=0),
+        year: int | None = Form(None, ge=1900, le=2100),
+        coordinate_system: Literal["epsg", "gcj02"] = Form("epsg"),
+    ) -> dict:
+        content = await file.read(20 * 1024 * 1024 + 1)
+        if len(content) > 20 * 1024 * 1024:
+            raise HTTPException(413, "Demand GeoJSON must be 20 MiB or smaller.")
+        try:
+            return await run_in_threadpool(
+                app.state.service.upload_demand, file.filename or "", content, place_name,
+                {"id": id_field, "population": population_field, "older": older_field}, epsg, year, coordinate_system,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
 
     @router.post("/runs", response_model=RunAccepted, response_model_exclude_none=True,
                  status_code=status.HTTP_202_ACCEPTED)
@@ -213,6 +263,17 @@ def create_app(service: OasisService | None = None) -> FastAPI:
             raise HTTPException(409, "Route request cancelled.") from exc
         except (RuntimeError, httpx.HTTPError) as exc:
             raise HTTPException(503, str(exc)) from exc
+
+    @router.get("/runs/{run_id}/input-layers")
+    def run_input_layers(run_id: str, request: Request) -> Response:
+        try:
+            etag, payload = app.state.service.input_layers(run_id, request.headers.get("if-none-match"))
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        headers = {"ETag": etag, "Cache-Control": "private, no-cache"}
+        if payload is None:
+            return Response(status_code=304, headers=headers)
+        return JSONResponse(payload, headers=headers)
 
     @router.get("/runs/{run_id}/artifacts/{name}")
     def get_artifact(run_id: str, name: str) -> FileResponse:

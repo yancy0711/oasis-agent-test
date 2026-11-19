@@ -1,6 +1,8 @@
 import type { MobilityMode, PlaceConfirmResponse } from "../api/models";
 
 export type ConfirmedPlace = PlaceConfirmResponse;
+export type UploadedPoint = [longitude: number, latitude: number, name: string];
+export type StudyLayer = "boundary" | "demand" | "heat" | "candidate" | "uploaded";
 
 export interface AppSessionState {
   audience: "research" | "personal";
@@ -8,6 +10,9 @@ export interface AppSessionState {
   taskVersion: number;
   confirmedPlace: ConfirmedPlace | null;
   candidateUploadId: string | null;
+  candidateUploadName: string | null;
+  uploadedPoints: UploadedPoint[];
+  studyLayerVisibility: Record<StudyLayer, boolean>;
   llmSessionId: string | null;
   llmSessionLabel: string | null;
   completedRunIds: string[];
@@ -21,7 +26,8 @@ export interface AppSessionActions {
   setAudience: (audience: "research" | "personal") => void;
   setActiveRunId: (runId: string | null) => void;
   setConfirmedPlace: (place: ConfirmedPlace | null) => void;
-  setCandidateUploadId: (uploadId: string | null) => void;
+  setCandidateUploadId: (uploadId: string | null, points?: UploadedPoint[], filename?: string) => void;
+  setStudyLayerVisibility: (layer: StudyLayer, visible: boolean) => void;
   setLlmSession: (sessionId: string | null, label: string | null) => void;
   registerCompletedRun: (runId: string) => void;
   setComparisonRunIds: (runIds: string[]) => void;

@@ -1,34 +1,49 @@
+import { useWorkspacePreferences } from "../../app/WorkspacePreferences";
 import { useCallback, useEffect, useRef, useState, type FormEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { createPortal } from "react-dom";
 import type { Feature, FeatureCollection, Point } from "geojson";
 import maplibregl, { type GeoJSONSource, type Map as MapLibreMap } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { useBasemapStyle } from "./useBasemapStyle";
+import { uploadedCandidateLayer, useUploadedCandidates } from "./useUploadedCandidates";
 import { LoadingText } from "../../components/LoadingText";
 import { planPlaceRoute, planPointRoute, type PlannedRoute } from "../../api/client";
 import { HEAT_COLORS, MAP_LAYER_IDS, MAP_SOURCE_ID, PARETO_SOURCE_ID, ROUTE_SOURCE_ID, paretoPreviewLayer, plannedRouteLayers, resultLayers } from "./mapConfig";
 import { popupContent } from "./mapPopup";
 import type { ParetoPoint } from "./ParetoView";
 import { useAppStore } from "../../store/appStore";
-import { useMediaQuery } from "../../hooks/useMediaQuery";
 
+type HeatMetric = "landsat_lst" | "utci";
+interface ThermalLayer {
+  label: string; unit: string; source: string; source_url: string;
+  start_date: string; end_date: string; resolution: string; aggregation: string;
+  field: string; value_range: [number, number]; source_cells?: number;
+}
 interface MapMetadata {
   renderer: "maplibre";
   indicator: string;
   indicator_label: string;
   value_range: [number, number] | null;
   bounds: [[number, number], [number, number]];
+  thermal_layers?: Partial<Record<HeatMetric, ThermalLayer>>;
+  run_heat_metric?: HeatMetric;
+  siting_heat_weight?: number | null;
+  candidate_source?: "osm" | "csv";
 }
 interface MapDataset extends FeatureCollection { metadata: MapMetadata; }
-interface MapViewProps { initialRouteMode?: RouteMode; url?: string; runId: string; paretoPreview?: ParetoPoint | null; onClearParetoPreview?: () => void; showRoutePlanner?: boolean; focusTractId?: string | null; routeOriginQuery?: string | null; routeOriginCoordinate?: { longitude: number; latitude: number } | null; }
-type LayerState = { tracts: boolean; boundary: boolean; route: boolean; sites: boolean };
+interface MapViewProps { initialRouteMode?: RouteMode; url?: string; runId: string; paretoPreview?: ParetoPoint | null; onClearParetoPreview?: () => void; showRoutePlanner?: boolean; initialRouteCollapsed?: boolean; focusTractId?: string | null; siteSlot?: HTMLDivElement | null; routeOriginQuery?: string | null; routeOriginCoordinate?: { longitude: number; latitude: number } | null; }
 type RouteMode = "walking" | "cycling" | "driving";
 type PanelPosition = { x: number; y: number };
 
 const EMPTY_ROUTE: FeatureCollection = { type: "FeatureCollection", features: [] };
-const DEFAULT_ROUTE_POSITION: PanelPosition = { x: 10, y: 58 };
+const DEFAULT_ROUTE_POSITION: PanelPosition = { x: 10, y: 52 };
 
 function indicatorLabel(label: string): string {
   return /^Heat exposure\s*\(/i.test(label) ? "Heat exposure (°C)" : label;
+}
+
+function siteKey(feature: Pick<Feature, "geometry" | "properties">) {
+  return `site:${feature.properties?.candidate_id ?? (feature.geometry.type === "Point" ? feature.geometry.coordinates.join(",") : "")}`;
 }
 
 function RouteAudit({ summary }: { summary: Record<string, unknown> }) {
@@ -41,7 +56,8 @@ function RouteAudit({ summary }: { summary: Record<string, unknown> }) {
   return <section className="route-audit"><h4>Active route heat audit</h4><div><span>Network travel</span><strong>{duration.toFixed(1)} min</strong></div><div><span>Route mean LST</span><strong>{heat == null ? "Unavailable" : `${heat.toFixed(1)} °C`}</strong></div><div><span>LST × travel-time index</span><strong>{dose == null ? "Unavailable" : `${dose.toFixed(0)} °C·min`}</strong></div><p>{calculation ? `${calculation}. ` : ""}This is a comparative route index, not a temperature reading or physiological heat dose. It does not alter ORS routing or facility optimization.</p></section>;
 }
 
-export function MapView({ initialRouteMode = "walking", url, runId, paretoPreview, onClearParetoPreview, showRoutePlanner = true, focusTractId = null, routeOriginQuery = null, routeOriginCoordinate = null }: MapViewProps) {
+export function MapView({ initialRouteMode = "walking", url, runId, paretoPreview, onClearParetoPreview, showRoutePlanner = true, initialRouteCollapsed, focusTractId = null, siteSlot, routeOriginQuery = null, routeOriginCoordinate = null }: MapViewProps) {
+  const { t } = useWorkspacePreferences();
   const baseMapStyle = useBasemapStyle();
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
@@ -50,15 +66,29 @@ export function MapView({ initialRouteMode = "walking", url, runId, paretoPrevie
   const dragRef = useRef<{ pointerId: number; offsetX: number; offsetY: number } | null>(null);
   const routeManuallyMovedRef = useRef(false);
   const planAtRef = useRef<((longitude: number, latitude: number) => void) | null>(null);
+  const selectSiteRef = useRef<((site: Feature<Point>) => void) | null>(null);
   const routeRequestRef = useRef<AbortController | null>(null);
   const autoRouteRef = useRef<string | null>(null);
   const outsideReturnTimerRef = useRef<number | null>(null);
   const planningEnabledRef = useRef(false);
   const routeModeRef = useRef<RouteMode>(initialRouteMode);
-  const mobile = useMediaQuery("(max-width: 620px)");
   const [data, setData] = useState<MapDataset | null>(null);
+  const [heatMetric, setHeatMetric] = useState<HeatMetric | null>(null);
+  const thermalLayers = data?.metadata.thermal_layers;
+  const runHeatMetric = data?.metadata.run_heat_metric ?? "landsat_lst";
+  const visibleHeat = (heatMetric && thermalLayers?.[heatMetric] && heatMetric)
+    || (thermalLayers?.[runHeatMetric] && runHeatMetric) || (thermalLayers?.utci ? "utci" : "landsat_lst");
+  const thermalLayer = thermalLayers?.[visibleHeat];
+  const sitingHeatWeight = data?.metadata.siting_heat_weight;
+  const isRunHeat = visibleHeat === runHeatMetric;
+  const heatRole = !isRunHeat ? "View only"
+    : sitingHeatWeight == null ? "Run heat input"
+      : sitingHeatWeight > 0 ? "Used in siting weights" : "Zero siting heat weight";
+  const range = thermalLayer?.value_range ?? data?.metadata.value_range;
   const [error, setError] = useState<string | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
+  const [selectedSite, setSelectedSite] = useState<string | null>(null);
+  const [sitesOpen, setSitesOpen] = useState(false);
   const [mapReady, setMapReady] = useState(false);
   const [bearing, setBearing] = useState(0);
   const [planningEnabled, setPlanningEnabled] = useState(false);
@@ -67,9 +97,15 @@ export function MapView({ initialRouteMode = "walking", url, runId, paretoPrevie
   const [routeBusy, setRouteBusy] = useState(false);
   const [routeAudit, setRouteAudit] = useState<Record<string, unknown> | null>(null);
   const [originQuery, setOriginQuery] = useState("");
-  const [routeCollapsed, setRouteCollapsed] = useState(mobile);
+  const [routeCollapsed, setRouteCollapsed] = useState(initialRouteCollapsed ?? false);
   const [routePosition, setRoutePosition] = useState<PanelPosition>(DEFAULT_ROUTE_POSITION);
-  const [layers, setLayers] = useState<LayerState>({ tracts: true, boundary: true, route: true, sites: true });
+  const [layers, setLayers] = useState({ route: true, sites: true });
+  const [layersOpen, setLayersOpen] = useState(true);
+  const visibility = useAppStore((state) => state.studyLayerVisibility);
+  const setVisible = useAppStore((state) => state.setStudyLayerVisibility);
+  const hasCandidates = Boolean(data?.features.some((feature) => feature.properties?.layer_kind === "candidate"));
+  const candidateKey = data?.metadata.candidate_source === "csv" ? "uploaded" : "candidate";
+  const uploaded = useUploadedCandidates(mapRef, mapReady, !planningEnabled, Boolean(siteSlot) && !(candidateKey === "uploaded" && hasCandidates));
 
   useEffect(() => { planningEnabledRef.current = planningEnabled; if (mapRef.current) mapRef.current.getCanvas().style.cursor = planningEnabled ? "crosshair" : ""; }, [planningEnabled]);
   useEffect(() => { routeModeRef.current = routeMode; }, [routeMode]);
@@ -77,25 +113,39 @@ export function MapView({ initialRouteMode = "walking", url, runId, paretoPrevie
     const clampPanel = () => {
       const panel = routeControlRef.current;
       const container = containerRef.current;
-      if (!panel || !container) return;
+      const layersPanel = layersControlRef.current;
+      if (!panel || !container || !layersPanel) return;
       const bounds = container.getBoundingClientRect();
       const panelRect = panel.getBoundingClientRect();
-      setRoutePosition((current) => ({
-        x: mobile && !routeManuallyMovedRef.current
-          ? Math.max(6, (bounds.width - panelRect.width) / 2)
-          : Math.max(6, Math.min(current.x, bounds.width - panelRect.width - 6)),
-        y: Math.max(6, Math.min(current.y, bounds.height - panelRect.height - 6)),
-      }));
+      const layerRect = layersPanel.getBoundingClientRect();
+      const beside = layerRect.right - bounds.left + 8;
+      const below = layerRect.bottom - bounds.top + 8;
+      setRoutePosition((current) => {
+        const maxX = Math.max(6, bounds.width - panelRect.width - 6);
+        const next = {
+          x: Math.max(6, Math.min(current.x, maxX)),
+          y: Math.max(6, Math.min(current.y, bounds.height - 52)),
+        };
+        const overlaps = next.x < beside && next.x + panelRect.width > layerRect.left - bounds.left
+          && next.y < below && next.y + panelRect.height > layerRect.top - bounds.top;
+        if (!routeManuallyMovedRef.current || overlaps) {
+          next.x = DEFAULT_ROUTE_POSITION.x;
+          next.y = below;
+        }
+        return current.x === next.x && current.y === next.y ? current : next;
+      });
     };
     clampPanel();
     const observer = new ResizeObserver(clampPanel);
     if (routeControlRef.current) observer.observe(routeControlRef.current);
+    if (layersControlRef.current) observer.observe(layersControlRef.current);
+    if (containerRef.current) observer.observe(containerRef.current);
     window.addEventListener("resize", clampPanel);
     return () => {
       observer.disconnect();
       window.removeEventListener("resize", clampPanel);
     };
-  }, [mapReady, mobile, routeCollapsed]);
+  }, [mapReady, routeCollapsed, layersOpen]);
 
   const routeResultStatus = (result: PlannedRoute) => {
     const summary = result.summary;
@@ -252,7 +302,7 @@ export function MapView({ initialRouteMode = "walking", url, runId, paretoPrevie
       map.addSource(MAP_SOURCE_ID, { type: "geojson", data });
       map.addSource(ROUTE_SOURCE_ID, { type: "geojson", data: EMPTY_ROUTE });
       map.addSource(PARETO_SOURCE_ID, { type: "geojson", data: EMPTY_ROUTE });
-      resultLayers(data.metadata.value_range).forEach((layer) => map.addLayer(layer));
+      resultLayers(data.metadata.value_range).forEach((layer) => map.addLayer(layer, layer.id === MAP_LAYER_IDS.demand ? MAP_LAYER_IDS.tracts : undefined));
       plannedRouteLayers().forEach((layer) => map.addLayer(layer));
       map.addLayer(paretoPreviewLayer);
       map.fitBounds(data.metadata.bounds, { padding: 30, duration: 0, maxZoom: 13 });
@@ -267,16 +317,27 @@ export function MapView({ initialRouteMode = "walking", url, runId, paretoPrevie
       };
 
       let pinnedFeature: string | null = null;
-      const showPopup = (event: Pick<maplibregl.MapMouseEvent, "lngLat"> & { features?: maplibregl.MapGeoJSONFeature[] }, closeButton = false, key: string | null = null) => {
-      const feature = event.features?.[0]; if (!feature) return;
-      popup?.remove();
-      pinnedFeature = key;
+      const showPopup = (event: Pick<maplibregl.MapMouseEvent, "lngLat"> & { features?: Pick<Feature, "geometry" | "properties">[] }, closeButton = false, key: string | null = null) => {
+        const feature = event.features?.[0]; if (!feature) return;
+        popup?.remove();
+        pinnedFeature = key;
+        if (siteSlot && key?.startsWith("site:")) {
+          setSelectedSite(key);
+          setSitesOpen(true);
+        }
         if (closeButton) map.easeTo({ center: event.lngLat, duration: 350 });
         const point = feature.geometry.type === "Point" ? feature.geometry.coordinates : [event.lngLat.lng, event.lngLat.lat];
         const coordinates: [number, number] = [Number(point[0]), Number(point[1])];
-        const nextPopup = new maplibregl.Popup({ closeButton, closeOnClick: false, offset: 10 }).setLngLat(event.lngLat).setDOMContent(popupContent(feature.properties, coordinates, closeButton)).addTo(map);
+        const nextPopup = new maplibregl.Popup({ closeButton, closeOnClick: false, offset: 10, className: closeButton ? "" : "map-hover-popup" }).setLngLat(event.lngLat).setDOMContent(popupContent(feature.properties ?? {}, coordinates, closeButton)).addTo(map);
         popup = nextPopup;
-        nextPopup.on("close", () => { if (popup === nextPopup) { popup = null; pinnedFeature = null; } });
+        nextPopup.on("close", () => {
+          if (popup === nextPopup) { popup = null; pinnedFeature = null; setSelectedSite(null); }
+        });
+      };
+      selectSiteRef.current = (feature) => {
+        const [longitude, latitude] = feature.geometry.coordinates;
+        if (pinnedFeature === siteKey(feature)) popup?.remove();
+        else showPopup({ lngLat: new maplibregl.LngLat(longitude, latitude), features: [feature] }, true, siteKey(feature));
       };
       if (focusTractId) {
         const target = data.features.find((feature) =>
@@ -295,40 +356,49 @@ export function MapView({ initialRouteMode = "walking", url, runId, paretoPrevie
             map.fitBounds(bounds, { padding: 90, duration: 500, maxZoom: 14 });
             const center = bounds.getCenter();
             showPopup(
-              { lngLat: center, features: [target as unknown as maplibregl.MapGeoJSONFeature] },
+              { lngLat: center, features: [target] },
               true, `tract:${focusTractId}`,
             );
           }
         }
       }
-      map.on("mousemove", MAP_LAYER_IDS.tracts, (event) => { if (!pinnedFeature && !planningEnabledRef.current) showPopup(event); });
-      map.on("mouseleave", MAP_LAYER_IDS.tracts, () => { if (!pinnedFeature) { popup?.remove(); popup = null; } });
-      const interactiveLayers = [MAP_LAYER_IDS.tracts, MAP_LAYER_IDS.sites, MAP_LAYER_IDS.paretoSites, MAP_LAYER_IDS.route];
+      const interactiveLayers = [MAP_LAYER_IDS.tracts, MAP_LAYER_IDS.demand, MAP_LAYER_IDS.boundary, MAP_LAYER_IDS.candidates, MAP_LAYER_IDS.sites, MAP_LAYER_IDS.paretoSites, MAP_LAYER_IDS.route];
+      map.on("mousemove", (event) => {
+        if (pinnedFeature || planningEnabledRef.current) return;
+        const features = map.queryRenderedFeatures(event.point, { layers: interactiveLayers });
+        const onUpload = map.getLayer(uploadedCandidateLayer)
+          && map.queryRenderedFeatures(event.point, { layers: [uploadedCandidateLayer] }).length;
+        const feature = onUpload ? features.find((item) => item.layer.id === MAP_LAYER_IDS.sites) : features[0];
+        if (feature) showPopup({ ...event, features: [feature] });
+        else popup?.remove();
+      });
+      map.getCanvas().addEventListener("mouseleave", () => { if (!pinnedFeature) popup?.remove(); });
       map.on("click", (event) => {
         if (planningEnabledRef.current) {
           popup?.remove(); pinnedFeature = null;
           planAtRef.current?.(event.lngLat.lng, event.lngLat.lat);
           return;
         }
-        if (pinnedFeature) {
+        const features = map.queryRenderedFeatures(event.point, { layers: interactiveLayers });
+        const site = features.find((item) => item.layer.id === MAP_LAYER_IDS.sites);
+        if (!site && map.getLayer(uploadedCandidateLayer) && map.queryRenderedFeatures(event.point, { layers: [uploadedCandidateLayer] }).length) {
+          popup?.remove();
+          return;
+        }
+        if (pinnedFeature && (!siteSlot || !site || siteKey(site) === pinnedFeature)) {
           pinnedFeature = null; popup?.remove(); popup = null;
           return;
         }
-        const features = map.queryRenderedFeatures(event.point, { layers: interactiveLayers });
-        const feature = features.find((item) => item.layer.id === MAP_LAYER_IDS.sites)
+        const feature = site
           ?? features.find((item) => item.layer.id === MAP_LAYER_IDS.paretoSites)
-          ?? features.find((item) => item.layer.id === MAP_LAYER_IDS.route)
-          ?? features.find((item) => item.layer.id === MAP_LAYER_IDS.tracts);
+          ?? features[0];
         if (!feature) return;
         const properties = feature.properties ?? {};
-        const prefix = feature.layer.id === MAP_LAYER_IDS.tracts ? "tract"
-          : feature.layer.id === MAP_LAYER_IDS.route ? "route"
-            : feature.layer.id === MAP_LAYER_IDS.paretoSites ? "preview" : "site";
-        const id = prefix === "tract" ? properties.GEOID ?? feature.id
-          : prefix === "route" ? properties.destination_id : properties.candidate_id;
-        showPopup({ ...event, features: [feature] }, true, `${prefix}:${String(id ?? "unknown")}`);
+        const prefix = feature.layer.id === MAP_LAYER_IDS.sites ? "site" : String(properties.layer_kind ?? feature.layer.id);
+        const id = properties.GEOID ?? properties.destination_id ?? properties.candidate_id ?? feature.id;
+        showPopup({ ...event, features: [feature] }, true, prefix === "site" ? siteKey(feature) : `${prefix}:${String(id ?? "unknown")}`);
       });
-      [MAP_LAYER_IDS.tracts, MAP_LAYER_IDS.sites, MAP_LAYER_IDS.paretoSites, MAP_LAYER_IDS.route].forEach((id) => {
+      interactiveLayers.forEach((id) => {
         map.on("mouseenter", id, () => { if (!planningEnabledRef.current) map.getCanvas().style.cursor = "pointer"; });
         map.on("mouseleave", id, () => { map.getCanvas().style.cursor = planningEnabledRef.current ? "crosshair" : ""; });
       });
@@ -338,11 +408,11 @@ export function MapView({ initialRouteMode = "walking", url, runId, paretoPrevie
         window.clearTimeout(outsideReturnTimerRef.current);
         outsideReturnTimerRef.current = null;
       }
-      mapSizeObserver.disconnect(); planAtRef.current = null; popup?.remove();
+      mapSizeObserver.disconnect(); planAtRef.current = null; selectSiteRef.current = null; popup?.remove();
       map.off("rotate", updateBearing); map.remove(); mapRef.current = null;
       setMapReady(false); setBearing(0);
     };
-  }, [data, focusTractId, runId, requestRoute, baseMapStyle]);
+  }, [data, focusTractId, runId, requestRoute, baseMapStyle, siteSlot]);
 
   useEffect(() => {
     const source = mapRef.current?.getSource(PARETO_SOURCE_ID) as GeoJSONSource | undefined;
@@ -355,12 +425,23 @@ export function MapView({ initialRouteMode = "walking", url, runId, paretoPrevie
 
   useEffect(() => {
     const map = mapRef.current; if (!mapReady || !map) return;
-    const visibility = (visible: boolean) => visible ? "visible" : "none";
-    [MAP_LAYER_IDS.tracts, MAP_LAYER_IDS.tractOutline].forEach((id) => map.setLayoutProperty(id, "visibility", visibility(layers.tracts)));
-    map.setLayoutProperty(MAP_LAYER_IDS.boundary, "visibility", visibility(layers.boundary));
-    map.setLayoutProperty(MAP_LAYER_IDS.sites, "visibility", visibility(layers.sites));
-    [MAP_LAYER_IDS.route, MAP_LAYER_IDS.routeOrigin].forEach((id) => map.setLayoutProperty(id, "visibility", visibility(layers.route)));
-  }, [layers, mapReady]);
+    const show = (id: string, visible: boolean) => map.setLayoutProperty(id, "visibility", visible ? "visible" : "none");
+    show(MAP_LAYER_IDS.tracts, visibility.heat);
+    show(MAP_LAYER_IDS.demand, visibility.demand);
+    show(MAP_LAYER_IDS.tractOutline, visibility.demand);
+    show(MAP_LAYER_IDS.boundary, visibility.boundary);
+    show(MAP_LAYER_IDS.candidates, visibility[candidateKey]);
+    show(MAP_LAYER_IDS.sites, layers.sites);
+    [MAP_LAYER_IDS.route, MAP_LAYER_IDS.routeOrigin].forEach((id) => show(id, layers.route));
+  }, [candidateKey, layers, mapReady, visibility]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!mapReady || !map || !range) return;
+    const [tracts] = resultLayers(range, thermalLayer?.field);
+    map.setPaintProperty(MAP_LAYER_IDS.tracts, "fill-color", tracts.paint?.["fill-color"]);
+    map.setPaintProperty(MAP_LAYER_IDS.tracts, "fill-opacity", tracts.paint?.["fill-opacity"]);
+  }, [mapReady, range, thermalLayer]);
 
   const toggleMapPlanning = () => {
     const next = !planningEnabledRef.current;
@@ -432,10 +513,14 @@ export function MapView({ initialRouteMode = "walking", url, runId, paretoPrevie
     routeManuallyMovedRef.current = true;
     const bounds = container.getBoundingClientRect();
     const panelRect = panel.getBoundingClientRect();
-    setRoutePosition({
+    const next = {
       x: Math.max(6, Math.min(event.clientX - bounds.left - drag.offsetX, bounds.width - panelRect.width - 6)),
-      y: Math.max(6, Math.min(event.clientY - bounds.top - drag.offsetY, bounds.height - panelRect.height - 6)),
-    });
+      y: Math.max(6, Math.min(event.clientY - bounds.top - drag.offsetY, bounds.height - 52)),
+    };
+    const layerRect = layersControlRef.current?.getBoundingClientRect();
+    if (layerRect && next.x < layerRect.right - bounds.left + 8 && next.x + panelRect.width > layerRect.left - bounds.left
+      && next.y < layerRect.bottom - bounds.top + 8 && next.y + panelRect.height > layerRect.top - bounds.top) return;
+    setRoutePosition(next);
   };
 
   const stopPanelDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -445,61 +530,55 @@ export function MapView({ initialRouteMode = "walking", url, runId, paretoPrevie
     }
   };
 
-  const handleLayersToggle = () => {
-    window.requestAnimationFrame(() => {
-      const layersPanel = layersControlRef.current;
-      const routePanel = routeControlRef.current;
-      const container = containerRef.current;
-      if (routeManuallyMovedRef.current) return;
-      if (!layersPanel?.open) {
-        if (mobile && routePanel && container) {
-          const bounds = container.getBoundingClientRect();
-          const routeRect = routePanel.getBoundingClientRect();
-          setRoutePosition({
-            x: Math.max(6, (bounds.width - routeRect.width) / 2),
-            y: DEFAULT_ROUTE_POSITION.y,
-          });
-        } else {
-          setRoutePosition(DEFAULT_ROUTE_POSITION);
-        }
-        return;
-      }
-      if (!routePanel || !container) return;
-      const layersRect = layersPanel.getBoundingClientRect();
-      const routeRect = routePanel.getBoundingClientRect();
-      const overlaps = layersRect.left < routeRect.right && layersRect.right > routeRect.left
-        && layersRect.top < routeRect.bottom && layersRect.bottom > routeRect.top;
-      if (!overlaps) return;
-      const bounds = container.getBoundingClientRect();
-      setRoutePosition((current) => ({
-        ...current,
-        y: Math.max(6, Math.min(bounds.height - routeRect.height - 6, current.y + layersRect.bottom - routeRect.top + 8)),
-      }));
-    });
-  };
-
   if (!url) return <p className="empty-tab">A map is produced after a successful spatial analysis.</p>;
   if (error) return <div className="error error--block" role="alert"><p>{error}</p><button type="button" className="button--secondary" onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry map</button></div>;
-  const range = data?.metadata.value_range;
-  const displayIndicator = data ? indicatorLabel(data.metadata.indicator_label) : "";
+  const sites = siteSlot ? data?.features.filter((feature): feature is Feature<Point> => feature.geometry.type === "Point" && feature.properties?.layer_kind === "selected_site") : undefined;
+  const displayIndicator = thermalLayer ? `${thermalLayer.label} (${thermalLayer.unit})` : data ? indicatorLabel(data.metadata.indicator_label) : "";
   const routeWarning = !routeBusy && /outside the (?:current study area|analyzed boundary)|not found|denied|could not|failed|timed out|not available|invalid/i.test(routeStatus);
-  return <div className="map-view">
+  return <>
+    {siteSlot && thermalLayer && thermalLayers && <section className="map-thermal-bar" aria-label="Study-area heat layer">
+      <label><span>{t("Heat layer")}</span>
+        <select aria-label={t("Heat layer")} value={visibleHeat} onChange={(event) => setHeatMetric(event.target.value as HeatMetric)}>
+          <option value="landsat_lst" disabled={!thermalLayers.landsat_lst}>{t("Landsat LST (°C)")}</option>
+          <option value="utci" disabled={!thermalLayers.utci}>{t("ERA5-HEAT UTCI (°C)")}</option>
+        </select>
+      </label>
+      <span role="status" className={`status ${isRunHeat && sitingHeatWeight !== 0 ? "status--success" : ""}`}>{t(heatRole)}</span>
+      <details>
+        <summary>{t("Source & dates")}</summary>
+        <p><a href={thermalLayer.source_url} target="_blank" rel="noreferrer">{thermalLayer.source}</a></p>
+        <p>{thermalLayer.start_date} to {thermalLayer.end_date} · {thermalLayer.resolution}</p>
+        <p>{thermalLayer.aggregation}</p>
+        {thermalLayer.source_cells != null && <p>Native grid cells represented: {thermalLayer.source_cells}</p>}
+        {thermalLayer.value_range[0] === thermalLayer.value_range[1] && <p>This layer has the same value in every displayed tract.</p>}
+        {isRunHeat && sitingHeatWeight != null && <p>Siting heat coefficient {(sitingHeatWeight * 100).toFixed(1)}%.</p>}
+        {!isRunHeat && <p>{t("Changing this layer keeps the current sites.")}</p>}
+      </details>
+    </section>}
+    <div className="map-view">
+    {siteSlot && Boolean(sites?.length) && createPortal(<details className="workbench-disclosure workbench-sites" open={sitesOpen} onToggle={(event) => setSitesOpen(event.currentTarget.open)}>
+      <summary>Selected sites ({sites?.length})</summary>
+      <ul>{sites?.map((site, index) => <li key={siteKey(site)}><button type="button" aria-pressed={selectedSite === siteKey(site)} disabled={!mapReady} onClick={() => {
+        if (!layers.sites) setLayers((current) => ({ ...current, sites: true }));
+        selectSiteRef.current?.(site);
+      }}>{String(site.properties?.name || `Site ${index + 1}`)}</button></li>)}</ul>
+    </details>, siteSlot)}
     <div ref={containerRef} className="map-canvas" aria-label="Interactive analysis map" />
     {!mapReady && <p className="map-loading" role="status"><LoadingText>Loading interactive map</LoadingText></p>}
     {data && <>
-      {showRoutePlanner && <div ref={routeControlRef} className={`map-route-control${routeCollapsed ? " is-collapsed" : ""}`} style={{ transform: `translate(${routePosition.x}px, ${routePosition.y}px)` }}>
+      {showRoutePlanner && <div ref={routeControlRef} className={`map-route-control${routeCollapsed ? " is-collapsed" : ""}`} style={{ transform: `translate(${routePosition.x}px, ${routePosition.y}px)`, maxHeight: `calc(100% - ${routePosition.y + 6}px)` }}>
         <div className="map-route-control__handle" onPointerDown={startPanelDrag} onPointerMove={movePanel} onPointerUp={stopPanelDrag} onPointerCancel={stopPanelDrag}>
-          <strong>Point route planner</strong><span aria-hidden="true">Drag</span>
+          <strong>{t("Point route planner")}</strong><span aria-hidden="true">Drag</span>
           <button type="button" className="map-control-toggle" aria-expanded={!routeCollapsed} aria-label={routeCollapsed ? "Expand route planner" : "Collapse route planner"} onPointerDown={(event) => event.stopPropagation()} onClick={() => setRouteCollapsed((value) => !value)}>{routeCollapsed ? "+" : "−"}</button>
         </div>
         {!routeCollapsed && <div className="map-route-control__body">
         <p className="map-route-hint">Click a point on the map or enter an address inside the study area.</p>
         <p className="map-route-scope"><b>Route choice:</b> fastest ORS route · <b>Environment:</b> post-route audit · heat-aware routing is not enabled</p>
         <select value={routeMode} onChange={(event) => setRouteMode(event.target.value as RouteMode)} aria-label="Route mode">
-          <option value="walking">Walking</option><option value="cycling">Cycling</option><option value="driving">Driving</option>
+          <option value="walking">{t("Walking")}</option><option value="cycling">{t("Cycling")}</option><option value="driving">{t("Driving")}</option>
         </select>
         <div><button type="button" disabled={!mapReady || routeBusy} onClick={toggleMapPlanning}>{planningEnabled ? "Cancel map selection" : "Plan from map point"}</button>
-        <button type="button" className="button--secondary" disabled={!mapReady || routeBusy} onClick={useLocation}>Use my location</button></div>
+        <button type="button" className="button--secondary" disabled={!mapReady || routeBusy} onClick={useLocation}>{t("Use my location")}</button></div>
         <form className="map-route-address" onSubmit={planFromPlace}>
           <input value={originQuery} onChange={(event) => setOriginQuery(event.target.value)} placeholder="Address inside study area" aria-label="Route origin address" />
           <button type="submit" className="button--secondary" disabled={!mapReady || routeBusy || !originQuery.trim()}>Plan</button>
@@ -508,17 +587,26 @@ export function MapView({ initialRouteMode = "walking", url, runId, paretoPrevie
         <small className={`map-route-status${routeWarning ? " is-warning" : ""}`} role={routeWarning ? "alert" : "status"} aria-live="polite"><LoadingText active={routeBusy}>{routeBusy ? "Planning route" : routeStatus}</LoadingText></small>
         {routeAudit && <RouteAudit summary={routeAudit} />}
         <details className="map-route-method"><summary>How this route is calculated</summary>
-          <p>The origin is your map click, browser coordinate, or a Nominatim-geocoded US address inside the displayed study area. The nearest selected facilities are shortlisted by straight-line distance, then OpenRouteService network travel time chooses the fastest one and supplies its route geometry. This small route request remains available when the full study-area ORS matrix is too large. Route LST, NDVI, NDBI, and albedo are current tract-level, length-weighted overlays, not street-level optimization inputs.</p>
+          <p>The route starts at your map point, browser location, or an address inside the study area. OpenRouteService returns the fastest network route from a shortlist of nearby selected sites. The heat audit uses length-weighted demand-zone overlays.</p>
         </details>
         </div>}
       </div>}
       <div className="map-north-arrow" title="Points to geographic north; use the map compass to reset north-up." aria-label="Geographic north indicator"><div className="map-north-arrow__bearing" style={{ transform: `rotate(${-bearing}deg)` }}><span>N</span><i /></div></div>
-      <details ref={layersControlRef} className="map-layers" onToggle={handleLayersToggle}><summary>Layers</summary><div>
-        {(["tracts", "boundary", "route", "sites"] as const).map((name) => <label key={name}><input type="checkbox" checked={layers[name]} onChange={() => setLayers((current) => ({ ...current, [name]: !current[name] }))} />
-          {name === "tracts" ? displayIndicator : name === "sites" ? "Selected candidate facilities" : name === "route" ? "Planned route" : "Study boundary"}</label>)}
+      <details ref={layersControlRef} className="map-layers" open={layersOpen} onToggle={(event) => setLayersOpen(event.currentTarget.open)}><summary>{t("Layers")}</summary><div>
+        <label><input type="checkbox" checked={visibility.boundary} onChange={(event) => setVisible("boundary", event.target.checked)} />{t("Study boundary")}</label>
+        <label><input type="checkbox" checked={visibility.demand} onChange={(event) => setVisible("demand", event.target.checked)} />{t("Demand zones")}</label>
+        {range && <label><input type="checkbox" checked={visibility.heat} onChange={(event) => setVisible("heat", event.target.checked)} />{data.metadata.indicator === "heat_exposure" ? t("Heat layer") : displayIndicator}</label>}
+        {hasCandidates && <label><input type="checkbox" checked={visibility[candidateKey]} onChange={(event) => setVisible(candidateKey, event.target.checked)} />{t(candidateKey === "uploaded" ? "Uploaded candidates" : "Candidate facilities")}</label>}
+        <label><input type="checkbox" checked={layers.sites} onChange={(event) => setLayers((current) => ({ ...current, sites: event.target.checked }))} />{t("Selected candidate facilities")}</label>
+        {showRoutePlanner && <label><input type="checkbox" checked={layers.route} onChange={(event) => setLayers((current) => ({ ...current, route: event.target.checked }))} />{t("Planned route")}</label>}
+        {siteSlot && uploaded.count > 0 && <>
+          <label><input type="checkbox" checked={uploaded.visible} onChange={(event) => uploaded.setVisible(event.target.checked)} />{t("Uploaded candidates")} ({uploaded.count})</label>
+          <button type="button" className="button--secondary" onClick={uploaded.zoom}>{t("Zoom to uploaded points")}</button>
+        </>}
       </div></details>
       {paretoPreview && <div className="map-pareto-preview" role="status"><span><strong>Pareto preview</strong> α = {paretoPreview.alpha.toFixed(1)} · gold markers · current result unchanged</span><button type="button" className="button--secondary" onClick={onClearParetoPreview}>Clear</button></div>}
-      {range && <div className="map-legend"><strong>{displayIndicator}</strong><span className="map-legend__ramp" style={{ background: `linear-gradient(90deg, ${HEAT_COLORS.join(",")})` }} /><span><small>{range[0].toFixed(1)}</small><small>{range[1].toFixed(1)}</small></span></div>}
+      {range && visibility.heat && <div className="map-legend"><strong>{displayIndicator}</strong><span className="map-legend__ramp" style={{ background: `linear-gradient(90deg, ${HEAT_COLORS.join(",")})` }} /><span><small>{range[0].toFixed(1)}</small><small>{range[1].toFixed(1)}</small></span></div>}
     </>}
-  </div>;
+    </div>
+  </>;
 }

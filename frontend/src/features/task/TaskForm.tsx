@@ -1,5 +1,6 @@
+import { useWorkspacePreferences } from "../../app/WorkspacePreferences";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Controller, useForm, type Control } from "react-hook-form";
 import type { RoutingMode, TaskSpec } from "../../api/models";
 import { InfoLabel } from "../../components/InfoLabel";
@@ -16,8 +17,8 @@ export interface ValueProfile { name: string; label: string; weights: Weights }
 
 interface TaskFormProps {
   task: TaskSpec; mode: RoutingMode; ready: boolean; pending: boolean; uploadPending: boolean;
-  uploadedName: string | null; profiles: ValueProfile[];
-  onModeChange: (mode: RoutingMode) => void; onUpload: (file: File) => void;
+  uploadedName: string | null; candidateUploadId?: string | null; profiles: ValueProfile[];
+  onModeChange: (mode: RoutingMode) => void; onUpload: (file: File) => void; onRemoveUpload?: () => void;
   onResolveAmbiguity?: (index: number, candidate: string) => void;
   onSubmit: (values: TaskFormValues) => void;
 }
@@ -69,7 +70,8 @@ const AMENITY_OPTIONS = [
 ] as const;
 const DEFAULT_AMENITIES = AMENITY_OPTIONS.map((option) => option.value);
 
-export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedName, profiles, onModeChange, onUpload, onResolveAmbiguity, onSubmit }: TaskFormProps) {
+export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedName, candidateUploadId, profiles, onModeChange, onUpload, onRemoveUpload, onResolveAmbiguity, onSubmit }: TaskFormProps) {
+  const { t } = useWorkspacePreferences();
   const { register, handleSubmit, reset, watch, control, setValue, formState: { errors } } = useForm<TaskFormValues>({
     resolver: zodResolver(taskFormSchema), defaultValues: toTaskFormValues(task),
   });
@@ -78,7 +80,15 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
   const routeFocused = Boolean(task.route_origin);
   const [stepOpen, setStepOpen] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(!mobile);
+  const previousUpload = useRef(candidateUploadId);
   useEffect(() => reset(toTaskFormValues(task)), [task, reset]);
+  useEffect(() => {
+    if (candidateUploadId) setValue("candidate_source", "csv", { shouldValidate: true });
+    else if (previousUpload.current && watch("candidate_source") === "csv") {
+      setValue("candidate_source", "osm", { shouldValidate: true });
+    }
+    previousUpload.current = candidateUploadId;
+  }, [candidateUploadId, task, setValue, watch]);
   useEffect(() => {
     setStepOpen(true);
     setSettingsOpen(!mobile);
@@ -126,7 +136,7 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
 
   return <form className="panel" onSubmit={handleSubmit(onSubmit)}>
     <details className="mobile-step-disclosure task-step-disclosure" open={stepOpen} onToggle={(event) => setStepOpen(event.currentTarget.open)}>
-    <summary><div className="section-heading"><div><p className="step-heading"><span className="form-step">Step 3</span><span>Task settings</span></p><h2>Review the executable task</h2></div><span className="status">{task.analysis_goal.replaceAll("_", " ")}</span></div></summary>
+    <summary><div className="section-heading"><div><p className="step-heading"><span className="form-step">Step 3</span><span>{t("Task settings")}</span></p><h2>{t("Review the executable task")}</h2></div><span className="status">{task.analysis_goal.replaceAll("_", " ")}</span></div></summary>
     <div className="mobile-step-body">
 
     {(task.recommended_value_profile || task.recommended_mobility_scenario || task.recommended_sensitivity_thresholds?.length) ? <div className="recommendation-panel">
@@ -139,27 +149,27 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
     {(task.result_queries?.length ?? 0) > 0 && <div className="route-request-notice"><strong>Requested result questions</strong>{task.result_queries?.map((query, index) => <span key={`${query.metric}-${index}`}>{query.limit} {query.scope === "vulnerable" ? "vulnerable " : ""}tract(s) by {query.metric.replaceAll("_", " ")} ({query.direction})</span>)}<small>These answers are read-only outputs and do not change the facility budget.</small></div>}
     {(task.ambiguities?.length ?? 0) > 0 && <div className="preference-panel"><strong>Confirm the model interpretation</strong>{task.ambiguities?.map((item, index) => { const candidates = item.candidates ?? []; return <div className="ambiguity-choice" key={`${item.field}-${index}`}><p>{item.question}</p>{candidates.length > 0 ? <div className="button-row">{candidates.map((candidate) => <button type="button" key={candidate} onClick={() => onResolveAmbiguity?.(index, candidate)}>{candidate.replaceAll("_", " ")}</button>)}</div> : <small>Edit the corresponding field below, then run the confirmed task.</small>}</div>; })}</div>}
 
-    {routeFocused && <div className="route-essential-settings"><label className="field"><InfoLabel label="Travel mode">Used by the point route planner after candidate facilities have been prepared.</InfoLabel><select aria-label="Mobility" {...register("mobility_scenario")}><option value="walking">Walking</option><option value="cycling">Cycling</option><option value="driving">Driving</option></select></label><p>Supporting defaults: {facilityCount} candidate facilities, {threshold} minute planning threshold, and all supported facility types.</p></div>}
+    {routeFocused && <div className="route-essential-settings"><label className="field"><InfoLabel label="Travel mode">Used by the point route planner after candidate facilities have been prepared.</InfoLabel><select aria-label={t("Mobility")} {...register("mobility_scenario")}><option value="walking">{t("Walking")}</option><option value="cycling">{t("Cycling")}</option><option value="driving">{t("Driving")}</option></select></label><p>Supporting defaults: {facilityCount} candidate facilities, {threshold} minute planning threshold, and all supported facility types.</p></div>}
 
     <details className="task-settings-disclosure" open={settingsOpen} onToggle={(event) => setSettingsOpen(event.currentTarget.open)}>
-      <summary><span>{routeFocused ? "Customize supporting analysis" : "Analysis settings"}</span><small>{heatOnly ? "Heat diagnostic" : `${fixedBudget ? `${facilityCount} facilities` : "Facilities to calculate"} - ${fixedTime ? `${threshold} min` : "Time to calculate"} - ${mobility.replaceAll("_", " ")}`}</small></summary>
+      <summary><span>{t(routeFocused ? "Customize supporting analysis" : "Analysis settings")}</span><small>{heatOnly ? "Heat diagnostic" : `${fixedBudget ? `${facilityCount} facilities` : "Facilities to calculate"} - ${fixedTime ? `${threshold} min` : "Time to calculate"} - ${mobility.replaceAll("_", " ")}`}</small></summary>
       <div className="task-settings-body">
     {!heatOnly && <>
       <div className="form-grid">
-        <div className="field"><span>Facilities</span>{coverageControls ? <CoverageNumber label="Facilities" value={facilityCount} calculated={!fixedBudget} integer onChange={(value) => changeCoverageInput("n_facilities", value)} /> : <input aria-label="Facilities" type="number" {...register("n_facilities", { valueAsNumber: true })} />}{errors.n_facilities && <small className="error">{errors.n_facilities.message}</small>}</div>
-        <div className="field"><span>Threshold (minutes)</span>{coverageControls ? <CoverageNumber label="Threshold (minutes)" value={threshold} calculated={!fixedTime} onChange={(value) => changeCoverageInput("threshold_minutes", value)} /> : <input aria-label="Threshold (minutes)" type="number" step="any" {...register("threshold_minutes", { valueAsNumber: true })} />}{errors.threshold_minutes && <small className="error">{errors.threshold_minutes.message}</small>}</div>
+        <div className="field"><span>{t("Facilities")}</span>{coverageControls ? <CoverageNumber label="Facilities" value={facilityCount} calculated={!fixedBudget} integer onChange={(value) => changeCoverageInput("n_facilities", value)} /> : <input aria-label={t("Facilities")} type="number" {...register("n_facilities", { valueAsNumber: true })} />}{errors.n_facilities && <small className="error">{errors.n_facilities.message}</small>}</div>
+        <div className="field"><span>{t("Threshold (minutes)")}</span>{coverageControls ? <CoverageNumber label="Threshold (minutes)" value={threshold} calculated={!fixedTime} onChange={(value) => changeCoverageInput("threshold_minutes", value)} /> : <input aria-label={t("Threshold (minutes)")} type="number" step="any" {...register("threshold_minutes", { valueAsNumber: true })} />}{errors.threshold_minutes && <small className="error">{errors.threshold_minutes.message}</small>}</div>
         {errors.diagnostic_fixed_inputs && <small className="error">{errors.diagnostic_fixed_inputs.message}</small>}
         <label className="field"><InfoLabel label="Facility capacity">Limits how many people each selected candidate facility can be assigned. Leave disabled when reliable capacity data are unavailable.</InfoLabel><span className="check-row"><input type="checkbox" {...register("facility_capacity_enabled")} />Apply capacity</span>{hasCapacity && <input aria-label="People per facility" type="number" min="1" step="1" {...register("facility_capacity", { valueAsNumber: true })} />}</label>
         <label className="field"><InfoLabel label="Efficiency–equality trade-off">When enabled, selects the final recommendation from the computed efficiency–Gini frontier. α = 0 emphasizes average gradual access; α = 1 emphasizes equal access. This cannot be combined with a hard coverage target.</InfoLabel><span className="check-row"><input type="checkbox" {...register("equity_alpha_enabled")} />Select final solution by α</span>{hasEquityAlpha && <><input aria-label="Equity alpha" type="range" min="0" max="1" step="0.1" {...register("equity_alpha", { valueAsNumber: true })} /><small>α = {watch("equity_alpha").toFixed(1)} · 0 means efficiency, 1 means equality</small>{errors.equity_alpha && <small className="error">{errors.equity_alpha.message}</small>}</>}</label>
-        {!routeFocused && <label className="field"><InfoLabel label="Mobility">Chooses the travel mode used to calculate access times between demand and candidate facilities.</InfoLabel><select aria-label="Mobility" {...register("mobility_scenario")}><option value="walking">Walking</option><option value="cycling">Cycling</option><option value="driving">Driving</option><option value="walk_drive_equity">Walk/drive equity</option></select><small>{watch("mobility_scenario") === "walk_drive_equity" ? "Evaluates access across walking and driving populations." : "Used for travel-time routing."}</small></label>}
+        {!routeFocused && <label className="field"><InfoLabel label="Mobility">Chooses the travel mode used to calculate access times between demand and candidate facilities.</InfoLabel><select aria-label={t("Mobility")} {...register("mobility_scenario")}><option value="walking">{t("Walking")}</option><option value="cycling">{t("Cycling")}</option><option value="driving">{t("Driving")}</option><option value="walk_drive_equity">Walk/drive equity</option></select><small>{watch("mobility_scenario") === "walk_drive_equity" ? "Evaluates access across walking and driving populations." : "Used for travel-time routing."}</small></label>}
         <label className="field"><InfoLabel label="Execution">Controls routing fidelity. Fixed-budget hypothetical planning is approximate only and uses Quick without ORS refinement.</InfoLabel><select aria-label="Execution" disabled={hypotheticalBudget} value={hypotheticalBudget ? "quick" : mode} onChange={(event) => onModeChange(event.target.value as RoutingMode)}><option value="auto">Auto preview + precise</option><option value="quick">Quick approximate</option><option value="precise">Precise network</option></select></label>
-        <label className="field"><InfoLabel label="Candidate source">Chooses whether possible facility locations come from OpenStreetMap or an uploaded CSV.</InfoLabel><select aria-label="Candidate source" {...register("candidate_source")}><option value="osm">OpenStreetMap</option><option value="csv">Uploaded CSV</option></select></label>
+        <label className="field"><InfoLabel label="Candidate source">Chooses whether possible facility locations come from OpenStreetMap or an uploaded CSV.</InfoLabel><select aria-label={t("Candidate source")} {...register("candidate_source")}><option value="osm">OpenStreetMap</option><option value="csv">{t("Uploaded CSV")}</option></select></label>
         <label className="field"><InfoLabel label="Coverage group">Chooses whether coverage requirements apply to every tract or only the configured composite vulnerability priority tracts.</InfoLabel><select aria-label="Coverage group" {...register("coverage_group")}><option value="all">All tracts</option><option value="vulnerable">Vulnerability priority tracts</option></select></label>
         {source === "osm" && <Controller control={control} name="candidate_amenities" render={({ field }) => {
           const labels = AMENITY_OPTIONS.filter((option) => field.value.includes(option.value)).map((option) => option.label);
           return <div className="field field--wide"><InfoLabel label="OpenStreetMap candidate facility types">Choose which facility types may become candidate facilities. This list contains every type currently supported by the OASIS OpenStreetMap query; individual facilities are discovered inside the study area when the run starts.</InfoLabel><CheckboxDropdown ariaLabel="OpenStreetMap candidate facility types" options={AMENITY_OPTIONS} selected={field.value} onChange={field.onChange} summary={`${field.value.length} of ${AMENITY_OPTIONS.length} types selected`} detail={labels.length ? labels.join(", ") : "Select at least one type"} actions={<><button type="button" className="button--secondary" onClick={() => field.onChange(AMENITY_OPTIONS.map((option) => option.value))}>Select all</button><button type="button" className="button--secondary" onClick={() => field.onChange(DEFAULT_AMENITIES)}>Restore defaults</button></>} />{errors.candidate_amenities && <small className="error">{errors.candidate_amenities.message}</small>}</div>;
         }} />}
-        {source === "csv" && <CandidateUpload pending={uploadPending} uploadedName={uploadedName} onUpload={onUpload} />}
+        {source === "csv" && <CandidateUpload pending={uploadPending} uploadedName={uploadedName} onUpload={onUpload} onRemove={onRemoveUpload} />}
       </div>
       <label className="check-row"><input type="checkbox" {...register("coverage_target_enabled")} /><InfoLabel label="Require a coverage target">Adds a minimum share of the selected population group that the solution must cover within the travel-time threshold.</InfoLabel></label>
       {hasTarget && <label className="field compact-field"><span>Coverage target (0–1)</span><input type="number" min="0" max="1" step="any" {...register("coverage_target", { valueAsNumber: true })} /></label>}
@@ -182,6 +192,6 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
     </div>
     </details>
 
-    <div className="form-actions"><span>{ready ? "The confirmed task is ready to run." : "Confirm a study area before running."}</span><button type="submit" disabled={!ready || pending || (source === "csv" && !uploadedName)}>{pending ? <LoadingText>Starting</LoadingText> : "Run confirmed agent"}</button></div>
+    <div className="form-actions"><span className={ready ? "workbench-confirmed" : ""}>{t(ready ? "Ready for confirmation and execution." : "Confirm a study area before running.")}</span><button type="submit" disabled={!ready || pending || (source === "csv" && !uploadedName)}>{pending ? <LoadingText>{t("Starting")}</LoadingText> : t("Run confirmed agent")}</button></div>
   </form>;
 }

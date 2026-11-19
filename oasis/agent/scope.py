@@ -114,12 +114,12 @@ def classify_request(prompt: str) -> ScopeDecision:
     if len(text.split()) < 2 and len(text) < 8:
         return ScopeDecision(
             "needs_clarification", "The request is too short to identify a planning question.",
-            "State a US city or county and the cooling-access question you want to evaluate.",
+            "State a study area and the cooling-access question you want to evaluate.",
         )
     if re.fullmatch(r"(?:please\s+)?(?:help me|help me improve cooling access|improve cooling access|plan cooling access)[.!?\s]*", text, re.I):
         return ScopeDecision(
             "needs_clarification", "The request does not yet identify a study area or a specific planning question.",
-            "Add a US city or county and say whether you want candidate selection, heat review, reachability, or an equity comparison.",
+            "Add a study area and say whether you want candidate selection, heat review, reachability, or an equity comparison.",
         )
     for pattern, reason, alternative, policy in _OUT_OF_SCOPE:
         match = re.search(pattern, text, re.I)

@@ -1,3 +1,4 @@
+import { useWorkspacePreferences } from "../../app/WorkspacePreferences";
 /* The exported Markdown normalizer is intentionally unit-tested alongside this view. */
 /* eslint-disable react-refresh/only-export-components */
 import { useQuery } from "@tanstack/react-query";
@@ -62,6 +63,7 @@ $$`,
 }
 
 export function ReportView({ runId, url, narrative, recoveryText }: ReportViewProps) {
+  const { t } = useWorkspacePreferences();
   const report = useQuery({ queryKey: runKeys.report(runId, "report"), queryFn: async () => { const response = await fetch(url!); if (!response.ok) throw new Error(`Report returned ${response.status}.`); return response.text(); }, enabled: Boolean(url) });
   if (!url) {
     if (narrative) return <article className="report-view"><h3>Decision summary</h3><ReactMarkdown {...markdownPlugins}>{narrative.decision_summary}</ReactMarkdown><h3>Self-reflection</h3><ReactMarkdown {...markdownPlugins}>{narrative.self_reflection}</ReactMarkdown></article>;
@@ -70,5 +72,5 @@ export function ReportView({ runId, url, narrative, recoveryText }: ReportViewPr
   }
   if (report.isLoading) return <p className="empty-tab"><LoadingText>Loading report</LoadingText></p>;
   if (report.isError) return <p className="error error--block">{report.error.message}</p>;
-  return <article className="report-view"><a className="download-link" href={url} download>Download Markdown</a><ReactMarkdown {...markdownPlugins}>{normalizeReportMarkdown(report.data ?? "")}</ReactMarkdown></article>;
+  return <article className="report-view"><a className="download-link" href={url} download>{t("Download Markdown")}</a><ReactMarkdown {...markdownPlugins}>{normalizeReportMarkdown(report.data ?? "")}</ReactMarkdown></article>;
 }

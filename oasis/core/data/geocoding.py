@@ -31,6 +31,10 @@ class AmbiguousPlaceError(ValueError):
         super().__init__(f"Ambiguous place '{place_name}'. Candidates: {names}")
 
 
+class OutsideUSBoundaryError(ValueError):
+    """The US boundary adapter found a place in another region."""
+
+
 def _compact(text: str) -> str:
     """Return a lowercase alphanumeric key for canonical matching."""
     return re.sub(r"[^a-z0-9]+", "", text.lower())
@@ -478,7 +482,7 @@ def select_place_candidate(place_name: str, expect_level: int | None = None) -> 
     rows = [row for row in all_rows if row.get("geojson", {}).get("type") in {"Polygon", "MultiPolygon"}]
     us_rows = [row for row in rows if row.get("address", {}).get("country_code") == "us"]
     if rows and not us_rows:
-        raise ValueError(
+        raise OutsideUSBoundaryError(
             f"'{place_name}' resolved outside the United States. "
             "OASIS currently supports US city and county study areas only."
         )
@@ -491,7 +495,7 @@ def select_place_candidate(place_name: str, expect_level: int | None = None) -> 
         if unrestricted and not any(
             row.get("address", {}).get("country_code") == "us" for row in unrestricted
         ):
-            raise ValueError(
+            raise OutsideUSBoundaryError(
                 f"'{place_name}' resolved outside the United States. "
                 "OASIS currently supports US city and county study areas only."
             )

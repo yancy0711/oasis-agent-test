@@ -290,6 +290,19 @@ def _site_solution_from_selection(
     )
 
 
+def applied_demand_coefficients(indicators: dict[str, np.ndarray], weights: ValueWeights) -> ValueWeights:
+    """Retain only available, varying inputs and normalize their requested coefficients."""
+    coefficients = weights.model_dump()
+    for name in coefficients.keys() - {"population_density"}:
+        values = np.asarray(indicators.get(name, []), dtype=float)
+        observed = values[np.isfinite(values)]
+        if not len(observed) or observed.min() == observed.max():
+            coefficients[name] = 0.0
+    if not any(coefficients.values()):
+        coefficients["population_density"] = 1.0
+    return ValueWeights(**coefficients).normalized()
+
+
 def build_demand_weights(indicators: dict[str, np.ndarray], population: np.ndarray,
                          weights: ValueWeights) -> np.ndarray:
     """weight_i = population_i * sum_k( w_k * minmax(indicator_ik) ).
@@ -301,7 +314,7 @@ def build_demand_weights(indicators: dict[str, np.ndarray], population: np.ndarr
     if np.isnan(population).any() or (population < 0).any():
         raise ValueError("population must be non-negative and contain no NaN")
 
-    w = weights.normalized().model_dump()
+    w = applied_demand_coefficients(indicators, weights).model_dump()
     # The legacy field name is retained in the public contract, but this
     # component is the unmodified headcount baseline. Multiplying population
     # by normalized density here would double-count density and is not a pure

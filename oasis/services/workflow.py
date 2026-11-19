@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 from pathlib import Path
@@ -15,22 +16,26 @@ import pandas as pd
 from oasis.agent.context import Context
 from oasis.contracts.domain import Provenance, TaskSpec, ToolError, ToolResult, ValueWeights
 from oasis.core.outputs.charts import heat_analysis_chart, pareto_chart
-from oasis.core.outputs.maps import (comparison_map, coverage_map, heat_exposure_map,
+from oasis.core.outputs.maps import (comparison_map, coverage_map, heat_exposure_map, input_layer,
                                      reachability_map, tract_indicator_map)
 from oasis.core.outputs.report import render_heat_report, render_report
-from oasis.core.cache import scoped_cache
+from oasis.core.cache import atomic_write_text, place_slug, scoped_cache
 from oasis.core.cancellation import RunCancelled
 from oasis.core.data.census import (derive_indicators, fetch_acs, fetch_block_group_population,
                                     fetch_county_geometry, fetch_tract_geometry)
 from oasis.core.data.geocoding import AmbiguousPlaceError, resolve_fips, resolve_place
 from oasis.core.data.heat import fetch_heat_exposure
+from oasis.core.data import regional
+from oasis.core.data.thermal import UTCI_AGGREGATION, UTCI_SOURCE, load_utci, thermal_layer, utci_paths
+from oasis.core.data.era5_download import cds_configured, regional_utci_files
+from oasis.core.data.candidate_csv import read_candidate_csv
 from oasis.core.data.environment import derive_environment_burden, fetch_environment_indices
 from oasis.core.data.population import population_raster_source
 from oasis.core.data.osm import fetch_candidates
 from oasis.core.data.overpass import OverpassUnavailable
 from oasis.core.data.opening_hours import filter_candidates_by_hours
 from oasis.core.optimization.mobility import compose_demand, scenario_modes
-from oasis.core.optimization.models import (build_demand_weights, minimum_coverage_threshold,
+from oasis.core.optimization.models import (applied_demand_coefficients, build_demand_weights, minimum_coverage_threshold,
                                        minimum_assignment_facilities, solve_lscp, solve_mclp)
 from oasis.core.optimization.recovery import minimum_assignment_threshold
 from oasis.core.optimization.pareto import coverage_pareto_sweep, non_dominated
@@ -72,6 +77,14 @@ def _guard(name: str):
 def _cfg(ctx: Context, section: str) -> dict:
     """Return one configuration section from the session context."""
     return ctx.get("config", {}).get(section, {})
+
+
+def _preview_input(ctx: Context, kind: str, frame: gpd.GeoDataFrame) -> None:
+    if directory := _cfg(ctx, "output").get("input_layers"):
+        try:
+            atomic_write_text(Path(directory) / f"{kind}.geojson", json.dumps(input_layer(frame, kind), ensure_ascii=False, allow_nan=False))
+        except (OSError, ValueError):
+            log.warning("Could not publish the %s map preview.", kind, exc_info=True)
 
 
 def _decision_inputs(demand: dict, travel: dict) -> tuple[np.ndarray, ...]:
@@ -266,11 +279,42 @@ def validate_constraints(ctx: Context) -> ToolResult:
                                           hint="Ask the user to change the global budget or regional minimum.", retryable=False))
     return ToolResult(ok=True, tool="validate_constraints", handle="constraint_validation", summary=summary)
 
-@registry.register("resolve_study_area", "Resolve a US place to a boundary and state/county FIPS.",
+@registry.register("resolve_study_area", "Resolve a confirmed study boundary and its regional data source.",
                    {"place_name": {"type": "string"}})
 @_guard("resolve_study_area")
 def resolve_study_area(ctx: Context, place_name: str, year: int | None = None) -> ToolResult:
     """Resolve a place boundary and its state/county FIPS identifiers."""
+    task = ctx.get("task", None)
+    upload_id = getattr(task, "demand_upload_id", None)
+    regional_name = regional.regional_place(place_name)
+    if upload_id or regional_name:
+        if upload_id:
+            meta, areas = regional.stored_demand(upload_id)
+            if meta["place_name"] != place_name:
+                raise ValueError("This demand upload belongs to a different study area.")
+            boundary, vintage = areas[["geometry"]].dissolve(), meta["year"]
+            source = f"Uploaded demand GeoJSON: {meta['filename']}"
+            input_crs = "GCJ-02 (approximate inverse)" if meta.get("coordinate_system") == "gcj02" else f"EPSG:{meta['epsg']}"
+            notes = f"Human-confirmed fields: {meta['fields']}; input {input_crs}"
+        else:
+            metadata, boundary, areas = regional.automatic_data(regional_name)
+            place_name, vintage = regional_name, metadata["year"]
+            source = metadata["source"]
+            notes = f"{metadata['source_url']}; {metadata['notes']}"
+        cache_scope = place_slug(f"{upload_id}-{place_name}" if upload_id else place_name)
+        provenance = Provenance(source=source, record_count=len(areas), crs="EPSG:4326",
+                                notes=f"Year: {vintage or 'not supplied'}; {notes}")
+        area_km2 = float(boundary.to_crs(boundary.estimate_utm_crs()).geometry.union_all().area / 1_000_000)
+        study = {"place_name": place_name, "input_place_name": place_name, "year": vintage,
+                 "boundary": boundary, "place_type": "uploaded" if upload_id else "district",
+                 "area_km2": area_km2, "cache_scope": cache_scope, "regional_demand": areas,
+                 "regional_provenance": provenance, "regional_timezone": regional.regional_timezone(place_name)}
+        ctx.put("study", study, provenance)
+        _preview_input(ctx, "boundary", boundary)
+        _preview_input(ctx, "tract", areas)
+        return ToolResult(ok=True, tool="resolve_study_area", handle="study", provenance=provenance,
+                          summary={"canonical_name": place_name, "place_type": study["place_type"],
+                                   "area_km2": area_km2, "year": vintage})
     year = int(year or _cfg(ctx, "data").get("census_vintage", 2022))
     expect_level = 6 if "county" in place_name.lower() else None
     boundary = resolve_place(place_name, expect_level)
@@ -293,25 +337,25 @@ def resolve_study_area(ctx: Context, place_name: str, year: int | None = None) -
     prov = Provenance(source="OpenStreetMap Nominatim + US Census Geocoder", record_count=len(boundary),
                       notes=f"type={place_type}; area_km2={study['area_km2']:.1f}; cache={cache_scope}")
     ctx.put("study", study, prov)
+    _preview_input(ctx, "boundary", boundary)
     return ToolResult(ok=True, tool="resolve_study_area", handle="study", provenance=prov,
                       summary={**fips, "county_fips_list": county_fips_list, "place_type": place_type, "admin_level": study["admin_level"],
                                "area_km2": study["area_km2"], "cache_scope": cache_scope,
                                "canonical_name": canonical_name, "year": year})
 
 
-@registry.register("prepare_demand", "Fetch and align ACS, TIGER, and Landsat tract demand data.")
-@_guard("prepare_demand")
-def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = "2022-06-01",
-                   end_date: str = "2022-08-31") -> ToolResult:
-    """Build aligned tract demand areas, points, indicators, and lineage."""
-    study = ctx.get(study_handle)
+def _utci_failure(detail: str) -> ToolResult:
+    return ToolResult(ok=False, tool="prepare_demand", summary={"utci_unavailable": True},
+                      error=ToolError(kind="not_found", message=f"Could not use UTCI for this run: {detail}",
+                                      retryable=False))
+
+
+def _us_demand_areas(ctx: Context, study: dict, data_cfg: dict):
+    """Assemble the US ACS and TIGER inputs for demand preparation."""
     state, year = study["state_fips"], study["year"]
     counties = study.get("county_fips_list", [study["county_fips"]])
     if not counties:
         raise ValueError("No counties resolved for the study area")
-    data_cfg = _cfg(ctx, "data")
-    ctx.check_cancelled()
-
     population_source = (
         population_raster_source(year, data_cfg["population_grid"])
         if "population_grid" in data_cfg else None
@@ -371,6 +415,40 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
             pd.concat(parts["block_groups"], ignore_index=True), geometry="geometry",
             crs=parts["block_groups"][0].crs,
         )
+    provenance = [Provenance(source=f"US Census ACS {year} 5-year", record_count=len(demographics), crs="none"),
+                  Provenance(source=f"US Census TIGER/Line {year}", record_count=len(tracts))]
+    return areas, population_source, population_areas, provenance
+
+
+@registry.register("prepare_demand", "Fetch and align population, tract boundaries, and confirmed heat exposure.")
+@_guard("prepare_demand")
+def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = "2022-06-01",
+                   end_date: str = "2022-08-31") -> ToolResult:
+    """Build aligned tract demand areas, points, indicators, and lineage."""
+    study = ctx.get(study_handle)
+    year = study["year"]
+    regional_demand = "regional_demand" in study
+    data_cfg = _cfg(ctx, "data")
+    task = ctx.get("task", None)
+    heat_metric = getattr(task, "heat_metric", "landsat_lst")
+    local_utci = utci_paths({"data": data_cfg})
+    can_download_utci = heat_metric == "utci" and cds_configured()
+    timezone = study.get("regional_timezone", data_cfg.get("utci_timezone", "UTC"))
+    if heat_metric == "utci" and not (local_utci or can_download_utci):
+        return _utci_failure("Configure Copernicus CDS access or set OASIS_UTCI_PATH to ERA5-HEAT NetCDF data.")
+    ctx.check_cancelled()
+
+    if regional_demand:
+        areas = study["regional_demand"].copy()
+        areas["GEOID"] = areas["GEOID"].astype("string")
+        areas["elderly_ratio"] = areas["elderly_population"].div(areas["total_population"].replace(0, np.nan))
+        areas["poverty_rate"] = np.nan
+        population_source = population_areas = None
+        provenance = [study["regional_provenance"]]
+        ctx.progress("Regional boundary and population ready", len(areas), len(areas))
+    else:
+        areas, population_source, population_areas, provenance = _us_demand_areas(ctx, study, data_cfg)
+    _preview_input(ctx, "tract", areas)
     heat_error = None
     try:
         with scoped_cache(study["cache_scope"]):
@@ -391,10 +469,12 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
     except RunCancelled:
         raise
     except Exception as exc:
-        if getattr(ctx.get("task", None), "analysis_goal", None) == "heat_review":
+        if heat_metric == "landsat_lst" and getattr(task, "analysis_goal", None) == "heat_review":
             raise RuntimeError(f"Landsat heat exposure acquisition failed: {exc}") from exc
         heat_error = f"{type(exc).__name__}: {exc}"
-        log.warning("Landsat heat unavailable; continuing with a neutral non-temperature indicator: %s", exc)
+        lst_fallback = ("unavailable as a comparison layer" if heat_metric == "utci"
+                        else "unavailable; omitted from heat diagnostics and siting weights")
+        log.warning("Landsat heat %s: %s", lst_fallback, exc)
         heat = pd.DataFrame({
             "GEOID": areas["GEOID"].astype("string"), "mean_lst": np.nan,
             "population_weighted_lst": np.nan, "exposure_gap": np.nan,
@@ -403,7 +483,7 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
         heat_prov = Provenance(
             source="Landsat 8/9 Collection 2 Level-2 via Microsoft Planetary Computer",
             tier="live", record_count=0, crs="none",
-            notes=f"unavailable; neutral heat indicator used for non-heat analysis; {heat_error}",
+            notes=f"{lst_fallback}; {heat_error}",
         )
     ctx.check_cancelled()
     areas = areas.merge(heat, on="GEOID", how="left", validate="one_to_one")
@@ -418,28 +498,70 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
         else "population_weighted_grid"
     )
     areas["heat_exposure_method"] = (
-        "unavailable_neutral" if heat_error else
-        np.where(weighted_ok, weighted_method, "tract_mean_fallback")
+        np.where(weighted_ok, weighted_method, np.where(areas["mean_lst"].notna(), "tract_mean_fallback", None))
     )
     missing_heat = int(areas["heat_exposure"].isna().sum())
-    heat_median = areas["heat_exposure"].median()
-    areas["heat_exposure"] = areas["heat_exposure"].fillna(
-        float(heat_median) if np.isfinite(heat_median) else 0.0
-    )
+    lst_available = missing_heat < len(areas)
     quality = ctx.get("quality", {})
     quality["heat"] = {"missing_tracts": missing_heat, "total_tracts": len(areas),
                        "population_weighted_tracts": int(weighted_ok.sum()),
                        "tract_mean_fallbacks": int((~weighted_ok).sum()),
                        "minimum_valid_population_share": minimum_share,
                        "population_grid": population_source,
-                       "status": "unavailable" if heat_error else "ready",
+                       "status": "ready" if lst_available else "unavailable",
                        "error": heat_error,
-                       "imputation": ("neutral constant; not interpretable as temperature" if heat_error
-                                      else "median" if missing_heat else "none")}
+                       "heat_metric": heat_metric, "imputation": "none"}
     ctx.put("quality", quality)
     metric_crs = pick_metric_crs(areas)
     areas["population_density"] = areas["total_population"].astype(float) / _land_area_km2(areas).replace(0, np.nan)
     areas = areas.loc[areas["total_population"].fillna(0).gt(0)].reset_index(drop=True)
+    thermal_layers = {}
+    utci_prov = None
+    if lst_available:
+        areas["lst_exposure_c"] = areas["heat_exposure"]
+        thermal_layers["landsat_lst"] = thermal_layer("landsat_lst", start_date, end_date)
+        _preview_input(ctx, "tract", areas)
+    if local_utci or can_download_utci:
+        try:
+            ctx.progress("ERA5-HEAT: preparing regional UTCI", 0, 1, unit="stages")
+            try:
+                values, cells = load_utci(local_utci, areas, start_date, end_date, timezone=timezone,
+                                          cancel_check=ctx.check_cancelled)
+            except (ValueError, OSError):
+                if not can_download_utci:
+                    raise
+                files = regional_utci_files(areas, start_date, end_date, timezone,
+                                            progress=ctx.progress, cancel_check=ctx.check_cancelled)
+                values, cells = load_utci(files, areas, start_date, end_date, timezone=timezone, cds_download=True,
+                                          cancel_check=ctx.check_cancelled)
+            areas["utci_c"] = values
+            _preview_input(ctx, "tract", areas)
+            metadata = thermal_layer("utci", start_date, end_date, timezone)
+            metadata["source_cells"] = cells
+            thermal_layers["utci"] = metadata
+            utci_prov = Provenance(
+                source=UTCI_SOURCE, tier="cache", record_count=cells, crs="EPSG:4326",
+                notes=f"{start_date} to {end_date}; {metadata['aggregation']} Role: "
+                      + ("run heat input." if heat_metric == "utci" else "map view only."),
+            )
+            ctx.progress("ERA5-HEAT: UTCI ready", 1, 1, unit="stages")
+        except RunCancelled:
+            raise
+        except Exception as exc:
+            if heat_metric == "utci":
+                return _utci_failure(str(exc))
+            log.warning("Optional UTCI map layer unavailable: %s", exc)
+            quality["heat"]["utci_view_unavailable"] = str(exc)
+    if heat_metric == "utci":
+        areas["heat_exposure"] = areas["utci_c"]
+        areas["heat_exposure_method"] = "era5_heat_utci"
+        quality["heat"] = {
+            "status": "ready", "heat_metric": "utci",
+            "missing_tracts": 0, "total_tracts": len(areas),
+            "population_weighted_tracts": 0, "tract_mean_fallbacks": 0,
+            "imputation": "none", "source_cells": cells, "lst_available": "landsat_lst" in thermal_layers,
+        }
+    quality["heat"]["thermal_layers"] = thermal_layers
     points, population = centroids(areas).reset_index(drop=True), areas["total_population"].to_numpy(float)
     if "no_vehicle_ratio" not in areas:
         areas["no_vehicle_ratio"] = np.nan
@@ -449,13 +571,18 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
         vehicle_median = 0.0
     areas["no_vehicle_ratio"] = areas["no_vehicle_ratio"].fillna(vehicle_median).clip(0, 1)
     quality["mobility"] = {
-        "source": "ACS B08201 household vehicle availability",
+        "source": ("Unavailable for this regional dataset" if regional_demand else "ACS B08201 household vehicle availability"),
         "missing_tracts": vehicle_missing,
         "total_tracts": len(areas),
-        "imputation": "median" if vehicle_missing else "none",
+        "imputation": "not used for single-mode routing" if regional_demand else ("median" if vehicle_missing else "none"),
         "interpretation": "tract-level household proxy, not individual travel behavior",
     }
     vulnerability_cfg = _cfg(ctx, "vulnerability") or DEFAULT_VULNERABILITY_CONFIG
+    if regional_demand:
+        quality["regional_data"] = {
+            "source": study["regional_provenance"].source, "year": year,
+            "missing": ["poverty_rate", "no_vehicle_ratio"] + (["elderly_ratio"] if areas["elderly_ratio"].isna().all() else []),
+        }
     custom_vulnerability_weights = None
     task_weights = getattr(ctx.get("task", None), "weights", None)
     if task_weights:
@@ -464,27 +591,41 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
             name: public_weights.get(name, 0.0)
             for name in vulnerability_cfg.get("indicators", {})
         }
+    observed = areas[[name for name in ("elderly_ratio", "poverty_rate", "heat_exposure") if name in areas]].copy()
     areas, vulnerability_score, priority_mask, vulnerability = analyze_vulnerability(
         areas, vulnerability_cfg, custom_vulnerability_weights,
         progress=lambda label, done, total: ctx.progress(label, done, total, unit="stages"),
     )
+    observed["vulnerability_score"] = vulnerability_score
+    relationships = _input_relationships(observed)
+    if relationships:
+        vulnerability["diagnostic_correlation"] = relationships
+    if heat_audit := next((item for item in vulnerability.get("missingness", []) if item["indicator"] == "heat_exposure"), None):
+        if heat_audit["fill_value"] is not None:
+            quality["heat"]["imputation"] = f"{heat_audit['strategy']} in the vulnerability model"
     quality["vulnerability"] = vulnerability
     ctx.put("quality", quality)
+    if thermal_layers:
+        areas.attrs["thermal_layers"] = thermal_layers
+        areas.attrs["run_heat_metric"] = heat_metric
     vulnerability_missing = ",".join(
         f"{item['indicator']}:{item['missing_count']}/{len(areas)}"
-        for item in vulnerability["missingness"]
+        for item in vulnerability.get("missingness", [])
     )
-    ctx.put("vulnerability_analysis", vulnerability, Provenance(
+    vulnerability_provenance = Provenance(
         source="Configured vulnerability preprocessing", tier="live",
         record_count=len(areas), crs=str(areas.crs or "none"),
-        notes=(f"normalization={vulnerability['normalization']}; "
-               f"active_scheme={vulnerability['active_scheme']}; "
-               f"priority={vulnerability['priority_definition']}; "
+        notes=(f"normalization={vulnerability.get('normalization')}; "
+               f"active_scheme={vulnerability.get('active_scheme')}; "
+               f"priority={vulnerability.get('priority_definition')}; "
+               f"indicators={','.join(vulnerability.get('indicator_directions', {}))}; "
                f"missing={vulnerability_missing}; "
                "directions and missing-value policies are explicit in config/settings.yaml"),
-    ))
+    ) if vulnerability["status"] == "ready" else None
+    ctx.put("vulnerability_analysis", vulnerability, vulnerability_provenance)
     indicators = {name: areas[name].to_numpy(float) for name in
-                  ["population_density", "elderly_ratio", "poverty_rate", "heat_exposure"]}
+                  ["population_density", "elderly_ratio", "poverty_rate", "heat_exposure"]
+                  if np.isfinite(areas[name].to_numpy(float)).any()}
     indicators["vulnerability_score"] = vulnerability_score
     elderly_population = areas.get(
         "elderly_population", areas["elderly_ratio"].fillna(0) * areas["total_population"]
@@ -507,10 +648,8 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
               "group_population": group_population,
               "equity_population": group_population["vulnerability_priority"],
               "priority_mask": priority_mask,
-              "vulnerable_mask": priority_mask, "indicators": indicators}
-    provenance = [Provenance(source=f"US Census ACS {year} 5-year", record_count=len(demographics), crs="none"),
-                  Provenance(source=f"US Census TIGER/Line {year}", record_count=len(tracts))]
-    if population_source:
+              "vulnerable_mask": priority_mask, "indicators": indicators, "observed_indicators": observed}
+    if population_source and weighted_ok.any():
         provenance.append(Provenance(
             source=(f"US Census ACS {year} 5-year block-group population + TIGER/Line {year}"
                     if population_source["provider"] == "census_block_group" else
@@ -524,16 +663,34 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
                 f"fallback_tracts={int((~weighted_ok).sum())}; source={population_source.get('url')}"
             ),
         ))
-    provenance.append(heat_prov)
+    if lst_available:
+        provenance.append(heat_prov)
+    if utci_prov:
+        provenance.append(utci_prov)
     ctx.put("demand", demand, provenance)
-    return ToolResult(ok=True, tool="prepare_demand", handle="demand", provenance=heat_prov,
+    return ToolResult(ok=True, tool="prepare_demand", handle="demand",
+                      provenance=utci_prov if heat_metric == "utci" else heat_prov if lst_available else None,
                       summary={"tracts": len(areas), "vulnerability_priority_tracts": int(priority_mask.sum()),
-                               "vulnerability_definition": vulnerability["priority_definition"],
+                               "heat_metric": heat_metric,
+                               "vulnerability_definition": vulnerability.get("priority_definition"),
                                "equity_group": "population_in_composite_vulnerability_priority_tracts",
                                "population_weighted_heat_tracts": int(weighted_ok.sum()),
                                "heat_missing_tracts": missing_heat, "heat_imputation": quality["heat"]["imputation"],
                                "vehicle_missing_tracts": vehicle_missing,
                                "mean_no_vehicle_household_ratio": float(areas["no_vehicle_ratio"].mean())})
+
+
+def _input_relationships(observed: pd.DataFrame) -> dict:
+    return analyze_feature_relationships(observed, {
+        "elderly_ratio": "vulnerability input",
+        "poverty_rate": "vulnerability input",
+        "heat_exposure": "measured thermal exposure",
+        "vulnerability_score": "derived composite score",
+        "mean_ndvi": "vegetation proxy",
+        "mean_ndbi": "built-up proxy",
+        "mean_albedo": "broadband albedo proxy",
+        "environment_burden": "composite environment burden",
+    })
 
 
 @registry.register(
@@ -570,81 +727,64 @@ def prepare_built_environment(
     except RunCancelled:
         raise
     except Exception as exc:
-        areas = demand["areas"].copy()
-        for name in ("mean_ndvi", "mean_ndbi", "mean_albedo"):
-            areas[name] = np.nan
-        areas["environment_components_available"] = 0
-        areas["environment_burden"] = 0.5
-        indicators = dict(demand["indicators"])
-        indicators["environment_burden"] = np.full(len(areas), 0.5)
-        demand = {**demand, "areas": areas, "indicators": indicators}
         summary = {
             "status": "unavailable",
             "reason": f"{type(exc).__name__}: {exc}",
-            "role": "neutral_constant_not_interpretable_as_environmental_difference",
-            "path_heat_exposure": "not_in_objective_without_real_route_geometry_for_each_demand_site_pair",
         }
-        provenance = Provenance(
-            source="Landsat 8/9 Collection 2 Level-2 surface reflectance",
-            tier="live", record_count=0, crs="none",
-            notes=f"NDVI, NDBI, and albedo unavailable; neutral burden used; {summary['reason']}",
-        )
-        ctx.put("demand", demand, provenance)
-        ctx.put("built_environment", summary, provenance)
+        ctx.put("built_environment", summary)
         quality = ctx.get("quality", {}); quality["built_environment"] = summary
         ctx.put("quality", quality)
-        return ToolResult(ok=True, tool="prepare_built_environment",
-                          handle="built_environment", provenance=provenance, summary=summary)
-    areas = demand["areas"].drop(
+        return ToolResult(ok=True, tool="prepare_built_environment", handle="built_environment", summary=summary)
+    original = demand["areas"]
+    areas = original.drop(
         columns=[name for name in ("mean_ndvi", "mean_ndbi", "mean_albedo", "environment_valid_pixel_count")
                  if name in demand["areas"]]
     ).merge(indices, on="GEOID", how="left", validate="one_to_one")
+    areas.attrs.update(original.attrs)
     burden = derive_environment_burden(areas)
     for name in burden:
         areas[name] = burden[name]
     indicators = dict(demand["indicators"])
-    indicators["environment_burden"] = areas["environment_burden"].to_numpy(float)
+    if areas["environment_burden"].notna().any():
+        indicators["environment_burden"] = areas["environment_burden"].to_numpy(float)
     demand = {**demand, "areas": areas, "indicators": indicators}
-    fields = ["mean_ndvi", "mean_ndbi", "mean_albedo"]
-    relationships = analyze_feature_relationships(areas, {
-        "elderly_ratio": "vulnerability input",
-        "poverty_rate": "vulnerability input",
-        "heat_exposure": "vulnerability input and temperature exposure",
-        "vulnerability_score": "derived composite score",
-        "mean_ndvi": "passive environment component: higher is protective",
-        "mean_ndbi": "passive environment component: higher increases burden",
-        "mean_albedo": "passive environment component: higher is protective",
-        "environment_burden": "user-weightable passive environment objective indicator",
-    })
+    fields = [name for name in ("mean_ndvi", "mean_ndbi", "mean_albedo") if areas[name].notna().any()]
+    observed = demand.get("observed_indicators", original)
+    relationships = _input_relationships(observed.assign(**{
+        name: areas[name] for name in (*fields, "environment_burden")
+    }))
+    components = [name for name in fields if areas[name].nunique() > 1]
+    formulas = {
+        "mean_ndvi": "(NIR - red) / (NIR + red)",
+        "mean_ndbi": "(SWIR1 - NIR) / (SWIR1 + NIR)",
+        "mean_albedo": "broadband albedo proxy from blue, red, NIR, SWIR1, and SWIR2",
+    }
     summary = {
-        "status": "ready", "role": "optimization_indicator_when_confirmed_weight_is_positive",
+        "status": "ready" if fields else "unavailable",
         "available_tracts": {name: int(areas[name].notna().sum()) for name in fields},
-        "formulas": {
-            "mean_ndvi": "(NIR - red) / (NIR + red)",
-            "mean_ndbi": "(SWIR1 - NIR) / (SWIR1 + NIR)",
-            "mean_albedo": "broadband albedo proxy from blue, red, NIR, SWIR1, and SWIR2",
-            "environment_burden": "mean(percentile(NDBI), 1-percentile(NDVI), 1-percentile(albedo))",
-        },
-        "environment_burden": {
-            "minimum": float(areas["environment_burden"].min()),
-            "maximum": float(areas["environment_burden"].max()),
-            "median": float(areas["environment_burden"].median()),
-            "all_components_tracts": int((areas["environment_components_available"] == 3).sum()),
-            "direction": "higher_is_more_burdened",
-        },
-        "path_heat_exposure": "not_in_objective_without_real_route_geometry_for_each_demand_site_pair",
+        "formulas": {name: formulas[name] for name in fields},
+        "burden_components": components,
+        "burden_imputed_zones": int(areas["environment_components_available"].eq(0).sum()) if components else 0,
         "feature_relationships": relationships,
     }
     vulnerability = dict(ctx.get("vulnerability_analysis", {}))
-    vulnerability["diagnostic_correlation"] = relationships
+    if relationships:
+        vulnerability["diagnostic_correlation"] = relationships
     ctx.put("vulnerability_analysis", vulnerability)
     quality = ctx.get("quality", {})
     quality["built_environment"] = summary
     ctx.put("quality", quality)
-    ctx.put("demand", demand, provenance)
+    measured_provenance = provenance if fields else None
+    if measured_provenance:
+        measured_provenance = provenance.model_copy(update={
+            "record_count": int(areas[fields].notna().any(axis=1).sum()),
+            "notes": f"{provenance.notes}; observed zones: {summary['available_tracts']}",
+        })
+    ctx.put("demand", demand, measured_provenance)
+    _preview_input(ctx, "tract", areas)
     ctx.put("built_environment", summary)
     return ToolResult(ok=True, tool="prepare_built_environment", handle="built_environment",
-                      provenance=provenance, summary=summary)
+                      provenance=measured_provenance, summary=summary)
 
 
 @registry.register("fetch_candidate_sites", "Fetch OSM candidate facilities inside the study boundary.",
@@ -701,6 +841,7 @@ def fetch_candidate_sites(ctx: Context, amenities: list[str], study_handle: str 
                f"OSM acquisition: {acquisition}"),
     )
     ctx.put("candidates", candidates, prov)
+    _preview_input(ctx, "candidate", candidates)
     ctx.progress("Candidate facilities: ready", 3, 3, unit="stages")
     return ToolResult(ok=True, tool="fetch_candidate_sites", handle="candidates", provenance=prov,
                       summary={"candidates": len(candidates), "amenities": amenities,
@@ -716,9 +857,7 @@ def load_candidate_sites(ctx: Context, candidate_file: str | None) -> ToolResult
     if not candidate_file: raise ValueError("A candidate CSV file is required")
     path = Path(candidate_file)
     if not path.is_file(): raise ValueError(f"Candidate CSV not found: {path.name}")
-    frame = pd.read_csv(path); columns = {name.lower(): name for name in frame.columns}
-    lat = columns.get("latitude", columns.get("lat")); lon = columns.get("longitude", columns.get("lon", columns.get("lng")))
-    if not lat or not lon: raise ValueError("Candidate CSV must contain latitude/longitude or lat/lon columns")
+    frame, lat, lon = read_candidate_csv(path)
     if "cand_id" not in frame: frame["cand_id"] = [f"csv_{index + 1}" for index in range(len(frame))]
     candidates = gpd.GeoDataFrame(frame, geometry=gpd.points_from_xy(frame[lon], frame[lat]), crs="EPSG:4326")
     boundary = ctx.get("study")["boundary"].geometry.union_all()
@@ -731,15 +870,18 @@ def load_candidate_sites(ctx: Context, candidate_file: str | None) -> ToolResult
     quality = ctx.get("quality", {})
     quality["public_access"] = access
     ctx.put("quality", quality)
+    input_crs = str(frame["source_crs"].iat[0])[:80] if "source_crs" in frame else "EPSG:4326"
     prov = Provenance(
         source=f"User candidate CSV: {path.name}",
         record_count=len(candidates),
+        crs="EPSG:4326",
         notes=(f"potential facilities: {potential}; retained: {len(candidates)}; "
                f"restricted access: {access['restricted_candidates']}; "
                f"fee required: {access['fee_required_candidates']}; "
-               f"hours unknown: {hours.get('unknown_candidates', 0)}"),
+               f"hours unknown: {hours.get('unknown_candidates', 0)}; uploaded input CRS: {input_crs}"),
     )
     ctx.put("candidates", candidates, prov)
+    _preview_input(ctx, "candidate", candidates)
     return ToolResult(ok=True, tool="load_candidate_sites", handle="candidates", provenance=prov,
                       summary={"candidates": len(candidates), "source": path.name,
                                "public_access": access, "operating_hours": hours})
@@ -760,8 +902,10 @@ def summarize_heat_exposure(ctx: Context, limit: int = 10) -> ToolResult:
     statistics = heat_analysis_chart(areas, chart_path)
     methods = areas.get("heat_exposure_method", pd.Series(dtype=str)).value_counts().to_dict()
     summary = {"top_tracts": hottest.to_dict("records"), "tracts_reviewed": len(areas),
+               "thermal": ctx.get("quality", {}).get("heat", {}),
                "statistics": statistics, "map": map_path, "analysis_chart": chart_path, "report": report_path}
     summary["evidence_basis"] = (
+        UTCI_AGGREGATION if task.heat_metric == "utci" else
         "Landsat 8/9 Collection 2 Level-2 land-surface temperature, population-weighted where "
         f"the configured population evidence was valid; recorded aggregation methods: {methods or 'not reported'}."
     )
@@ -1016,7 +1160,8 @@ def optimize_sites(ctx: Context, n_facilities: int = 10, threshold_minutes: floa
         completed_points=completed_points,
         facility_capacities=capacities,
     )
-    value_weights = weights if isinstance(weights, ValueWeights) else (ValueWeights(**weights) if weights else None)
+    requested_weights = weights if isinstance(weights, ValueWeights) else (ValueWeights(**weights) if weights else None)
+    value_weights = applied_demand_coefficients(indicators, requested_weights) if requested_weights else None
     selected_alpha = None
     if equity_alpha is not None:
         selected_point = min(points, key=lambda point: (abs(point.alpha - equity_alpha), point.alpha))
@@ -1041,6 +1186,7 @@ def optimize_sites(ctx: Context, n_facilities: int = 10, threshold_minutes: floa
     nearest = np.min(matrix, axis=1) if len(reachable) else np.array([])
     target_nearest = nearest[target_mask] if len(nearest) else np.array([])
     minimum_full_threshold = float(target_nearest.max()) if len(target_nearest) and np.isfinite(target_nearest).all() else None
+    applied_weights = getattr(solution, "weights_used", None)
     diagnostics = {"requested_facilities": n_facilities, "candidate_count": candidate_count,
                    "coverage_target": coverage_target, "coverage_group": coverage_group,
                    "coverage_model": "linear_gradual_assignment",
@@ -1052,6 +1198,12 @@ def optimize_sites(ctx: Context, n_facilities: int = 10, threshold_minutes: floa
                    "pareto_completed_points": len(points),
                    "pareto_requested_points": 11,
                    "pareto_complete": len(points) == 11,
+                   "applied_weights": {name: value for name, value in applied_weights.model_dump().items()
+                                       if value > 0} if applied_weights else {},
+                   "omitted_objective_indicators": [
+                       name for name, value in requested_weights.model_dump().items()
+                       if value > 0 and not getattr(value_weights, name)
+                   ] if requested_weights and selected_alpha is None else [],
                    "final_solution_basis": ("efficiency_gini_frontier" if selected_alpha is not None
                                             else "confirmed_value_profile" if value_weights else "population_efficiency"),
                    "max_tract_coverage_at_threshold": max_tract_coverage,
@@ -1374,6 +1526,7 @@ def _answer_result_query(ctx: Context, request, query_index: int) -> dict:
     }
     heat_methods = areas.get("heat_exposure_method", pd.Series(dtype=str)).value_counts().to_dict()
     heat_basis = (
+        UTCI_AGGREGATION if task.heat_metric == "utci" else
         "Landsat 8/9 Collection 2 Level-2 land-surface temperature, population-weighted where "
         f"the configured population evidence was valid; recorded aggregation methods: {heat_methods or 'not reported'}."
     )
@@ -1498,6 +1651,7 @@ def _answer_result_query(ctx: Context, request, query_index: int) -> dict:
         if metric == "coverage_gap" else
         vulnerability_formula
         if metric == "vulnerability" else
+        "E_i = mean_d(max_{h in d} UTCI_{c(i),h})" if task.heat_metric == "utci" else
         "E_i = sum_g(P_g LST_g) / sum_g(P_g)"
     )
     terms = {
@@ -1515,7 +1669,11 @@ def _answer_result_query(ctx: Context, request, query_index: int) -> dict:
             "I": "1 when no evaluated candidate is reachable inside the threshold",
         },
         "vulnerability": {"R": "within-study percentile normalization", "beta_k": "confirmed indicator weight"},
-        "heat_exposure": {"P_g": "population in sub-tract unit g", "LST_g": "Landsat land-surface temperature"},
+        "heat_exposure": (
+            {"c(i)": "native ERA5-HEAT cell assigned to the tract", "d": "day in the recorded aggregation time zone", "h": "hour"}
+            if task.heat_metric == "utci" else
+            {"P_g": "population in sub-tract unit g", "LST_g": "Landsat land-surface temperature"}
+        ),
     }[metric]
     source_fields = {
         "heat_exposure": ["demand.areas.heat_exposure", "demand.areas.heat_exposure_method"],
@@ -1647,6 +1805,7 @@ def run_sensitivity_analysis(
     value_weights = weights if isinstance(weights, ValueWeights) else (
         ValueWeights(**weights) if weights else None
     )
+    value_weights = applied_demand_coefficients(indicators, value_weights) if value_weights else None
     objective = (
         build_demand_weights(indicators, population, value_weights)
         if value_weights else population / max(population.sum(), 1)
@@ -1694,6 +1853,8 @@ def run_sensitivity_analysis(
         )
     summary = {
         "baseline": baseline,
+        "applied_weights": {name: value for name, value in value_weights.model_dump().items() if value > 0}
+        if value_weights else {},
         "experiments": results,
         "experiment_count": len(results),
         "coverage_group": coverage_group,
@@ -1751,7 +1912,7 @@ def compare_value_profiles(
     scenario_solutions = []
     for index, name in enumerate(names):
         ctx.progress("Value-profile comparison", index, len(names), unit="profiles")
-        weights = ValueWeights(**configured[name]["weights"])
+        weights = applied_demand_coefficients(indicators, ValueWeights(**configured[name]["weights"]))
         objective = build_demand_weights(indicators, population, weights)
         solution = solve_mclp(
             matrix, objective, population, vulnerable, n_facilities,
@@ -1763,6 +1924,7 @@ def compare_value_profiles(
         scenario_solutions.append(solution)
         scenarios.append({
             "profile": name, "profile_label": configured[name].get("label", name),
+            "applied_weights": {key: value for key, value in weights.model_dump().items() if value > 0},
             "selected_ids": solution.selected_ids,
             "covered_population_ratio": solution.covered_ratio,
             "vulnerable_covered_ratio": solution.vulnerable_covered_ratio,
@@ -1840,6 +2002,8 @@ def generate_outputs(ctx: Context, output_dir: str | None = None, indicator: str
                 "minimum_valid_population_share", .8
             ),
             "vulnerability": ctx.get("vulnerability_analysis", {}),
+            "thermal": ctx.get("quality", {}).get("heat", {}),
+            "omitted_objective_indicators": analysis.get("diagnostics", {}).get("omitted_objective_indicators", []),
         },
     ), encoding="utf-8")
     ctx.progress("Outputs: registering artifacts", 3, 4, unit="artifacts")

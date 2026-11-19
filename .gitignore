@@ -14,6 +14,7 @@ venv/
 .ipynb_checkpoints/
 
 # Frontend
+/node_modules/
 /frontend/node_modules/
 /frontend/dist/
 /frontend/playwright-report/
@@ -27,6 +28,7 @@ venv/
 
 # Runtime data
 /data/cache/*
+/data/thermal/
 !/data/cache/.gitkeep
 /outputs_run/
 /tmp/

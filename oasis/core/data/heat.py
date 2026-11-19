@@ -145,6 +145,8 @@ def _search_items(
     start_date: str,
     end_date: str,
     cloud_cover: float,
+    *,
+    optical: bool = False,
 ) -> tuple[list, str]:
     """Search or load cached Landsat STAC items."""
     import pystac
@@ -157,6 +159,8 @@ def _search_items(
         "cloud_cover_lt": cloud_cover,
         "platforms": ["landsat-8", "landsat-9"],
     }
+    if optical:
+        query["product"] = "surface_reflectance"
     path = cache_dir("heat") / f"stac_{hashlib.sha256(json.dumps(query, sort_keys=True).encode()).hexdigest()[:20]}.json"
     if path.exists():
         items = list(pystac.ItemCollection.from_dict(json.loads(path.read_text(encoding="utf-8"))))
@@ -170,13 +174,15 @@ def _search_items(
             "platform": {"in": query["platforms"]},
         },
     ).items())
-    items = [
-        item for item in items
-        if item.properties.get("landsat:correction") == "L2SP"
-        and {"lwir11", "qa_pixel"} <= set(item.assets)
-    ]
+    if optical:
+        required = set(OPTICAL_BANDS) | {"qa_pixel"}
+        items = [item for item in items if required <= item.assets.keys()]
+    else:
+        items = [item for item in items if item.properties.get("landsat:correction") == "L2SP"
+                 and {"lwir11", "qa_pixel"} <= item.assets.keys()]
     if not items:
-        raise ValueError("no Landsat 8/9 L2SP surface-temperature scenes matched the query")
+        product = "surface-reflectance" if optical else "L2SP surface-temperature"
+        raise ValueError(f"no Landsat 8/9 {product} scenes matched the query")
     items = _strip_asset_signatures(items)
     atomic_write_text(path, json.dumps(pystac.ItemCollection(items).to_dict()))
     return items, "live"
@@ -288,7 +294,7 @@ def _zonal_environment_indices(
     from rasterstats import zonal_stats
 
     result = pd.DataFrame({
-        "GEOID": tracts["GEOID"].astype("string").str.zfill(11).to_numpy()
+        "GEOID": tracts["GEOID"].astype("string").to_numpy()
     })
     projected = tracts.to_crs(metric_crs)
     for name in ("mean_ndvi", "mean_ndbi", "mean_albedo"):
@@ -324,7 +330,7 @@ def _zonal_mean(tracts: gpd.GeoDataFrame, composite, metric_crs: str) -> pd.Data
         stats=["mean"],
     )
     return pd.DataFrame({
-        "GEOID": tracts["GEOID"].astype("string").str.zfill(11).to_numpy(),
+        "GEOID": tracts["GEOID"].astype("string").to_numpy(),
         "mean_lst": [row["mean"] for row in stats],
     })
 
@@ -412,7 +418,7 @@ def _population_weighted_zonal(
     if totals.shape != (len(tracts),) or not np.isfinite(totals).all() or (totals < 0).any():
         raise ValueError("tract_population must be a finite non-negative vector aligned with tracts")
     rows = []
-    for index, geoid in enumerate(tracts["GEOID"].astype("string").str.zfill(11)):
+    for index, geoid in enumerate(tracts["GEOID"].astype("string")):
         cells = labels == index + 1
         temperatures = lst[cells]
         raw_population = population[cells]
@@ -479,7 +485,7 @@ def _population_weighted_from_polygons(
     )
     totals = np.asarray(tract_population, dtype=float)
     rows = []
-    for index, geoid in enumerate(tracts["GEOID"].astype("string").str.zfill(11)):
+    for index, geoid in enumerate(tracts["GEOID"].astype("string")):
         cells = labels == index + 1
         temperatures, raw_population = lst[cells], grid_population[cells]
         raw_total = float(raw_population.sum())
@@ -498,12 +504,15 @@ def _population_weighted_from_polygons(
     return pd.DataFrame(rows)
 
 
+DEFAULT_LST_RESOLUTION_M = 120
+
+
 def fetch_heat_exposure(
     tracts: gpd.GeoDataFrame,
     start_date: str,
     end_date: str,
     cloud_cover: float = 20,
-    resolution: float = 120,
+    resolution: float = DEFAULT_LST_RESOLUTION_M,
     *,
     population_source: dict[str, Any] | None = None,
     tract_population: np.ndarray | None = None,
@@ -550,6 +559,7 @@ def fetch_heat_exposure(
     cached_mean = None
     if path.exists():
         result = pd.read_csv(path, dtype={"GEOID": "string"})
+        ids_match = set(result["GEOID"]) == set(study["GEOID"].astype(str))
         weighted_cache_ok = (
             not population_source
             or (
@@ -557,7 +567,7 @@ def fetch_heat_exposure(
                 and result["population_weighted_lst"].notna().any()
             )
         )
-        if weighted_cache_ok:
+        if ids_match and weighted_cache_ok:
             weighted_note = (
                 f"population-weighted with {(population_source or {}).get('provider')} "
                 f"{(population_source or {}).get('year', '')} "
@@ -571,9 +581,9 @@ def fetch_heat_exposure(
                 tier="cache", record_count=len(result),
                 notes=f"{weighted_note}tract cache={path.name}",
             )
-        if "mean_lst" in result and result["mean_lst"].notna().any():
+        if ids_match and "mean_lst" in result and result["mean_lst"].notna().any():
             cached_mean = result
-        log.info("Ignoring mean-only heat cache because population weighting is requested: %s", path)
+        log.info("Rebuilding heat cache with current zone IDs and weighting: %s", path)
 
     try:
         if progress_callback:

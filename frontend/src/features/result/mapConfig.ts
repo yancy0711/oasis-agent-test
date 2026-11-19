@@ -5,9 +5,11 @@ export const ROUTE_SOURCE_ID = "oasis-planned-route";
 export const PARETO_SOURCE_ID = "oasis-pareto-preview";
 export const MAP_LAYER_IDS = {
   tracts: "oasis-tracts",
+  demand: "oasis-demand-zones",
   tractOutline: "oasis-tract-outlines",
   boundary: "oasis-boundary",
   sites: "oasis-selected-sites",
+  candidates: "oasis-candidate-facilities",
   route: "oasis-planned-route",
   routeOrigin: "oasis-route-origin",
   paretoSites: "oasis-pareto-sites",
@@ -32,9 +34,9 @@ export function createBaseMapStyle(apiKey: string): MapOptions["style"] {
   };
 }
 
-export const HEAT_COLORS = ["#fff7bc", "#fec44f", "#f03b20", "#8c2d04"] as const;
+export const HEAT_COLORS = ["#faeeda", "#fac775", "#ef9f27", "#ba7517", "#854f0b"] as const;
 
-export function resultLayers(range: [number, number] | null) {
+export function resultLayers(range: [number, number] | null, valueField = "indicator_value") {
   const min = range?.[0] ?? 0;
   const max = range?.[1] && range[1] > min ? range[1] : min + 1;
   const span = max - min;
@@ -42,10 +44,10 @@ export function resultLayers(range: [number, number] | null) {
     id: MAP_LAYER_IDS.tracts, type: "fill", source: MAP_SOURCE_ID,
     filter: ["==", ["get", "layer_kind"], "tract"],
     paint: {
-      "fill-color": ["interpolate", ["linear"], ["coalesce", ["get", "indicator_value"], min],
-        min, HEAT_COLORS[0], min + span * 0.4, HEAT_COLORS[1],
-        min + span * 0.72, HEAT_COLORS[2], max, HEAT_COLORS[3]],
-      "fill-opacity": ["case", ["==", ["get", "indicator_value"], null], 0, 0.72],
+      "fill-color": ["interpolate", ["linear"], ["coalesce", ["get", valueField], min],
+        min, HEAT_COLORS[0], min + span * 0.25, HEAT_COLORS[1], min + span * 0.5, HEAT_COLORS[2],
+        min + span * 0.75, HEAT_COLORS[3], max, HEAT_COLORS[4]],
+      "fill-opacity": ["case", ["==", ["get", valueField], null], 0, 0.72],
     },
   };
   const tractOutline: LineLayerSpecification = {
@@ -65,10 +67,20 @@ export function resultLayers(range: [number, number] | null) {
   const sites: CircleLayerSpecification = {
     id: MAP_LAYER_IDS.sites, type: "circle", source: MAP_SOURCE_ID,
     filter: ["==", ["get", "layer_kind"], "selected_site"],
-    paint: { "circle-radius": 8, "circle-color": ["case", ["==", ["get", "is_hypothetical"], true], "#853bd1", "#2455ff"],
+    paint: { "circle-radius": 8, "circle-color": ["case", ["==", ["get", "is_hypothetical"], true], "#853bd1", "#185fa5"],
       "circle-stroke-color": "#ffffff", "circle-stroke-width": 2.5 },
   };
-  return [tracts, tractOutline, boundary, sites];
+  const demand: FillLayerSpecification = {
+    id: MAP_LAYER_IDS.demand, type: "fill", source: MAP_SOURCE_ID, filter: tracts.filter,
+    paint: { "fill-color": "#268b87", "fill-opacity": 0.22 },
+  };
+  const candidates: CircleLayerSpecification = {
+    id: MAP_LAYER_IDS.candidates, type: "circle", source: MAP_SOURCE_ID,
+    filter: ["==", ["get", "layer_kind"], "candidate"],
+    paint: { "circle-radius": 5, "circle-color": "#7969b9", "circle-opacity": 0.75,
+      "circle-stroke-color": "#fff", "circle-stroke-width": 1.3 },
+  };
+  return [tracts, demand, tractOutline, boundary, candidates, sites] as const;
 }
 
 export function plannedRouteLayers() {

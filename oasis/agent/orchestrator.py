@@ -20,7 +20,7 @@ class MissingPlaceError(ValueError):
     def __init__(self, task_data: dict):
         """Store parsed non-place fields for interactive completion."""
         self.task_data = task_data
-        super().__init__("Could not parse a place from the request. Include a US city or county, e.g. 'Washington, District of Columbia, USA'.")
+        super().__init__("Could not parse a place from the request. Include a study area, such as Kowloon City, Hong Kong.")
 
 
 def load_prompt(name: str) -> str:
@@ -674,6 +674,7 @@ class Orchestrator:
         for adjustment in query_adjustments:
             _append_note(raw, adjustment)
         legacy_places = raw.pop("study_areas", None)
+        raw.pop("demand_upload_id", None)
         raw["place_names"] = _normalize_place_names(
             raw.get("place_names") or legacy_places, raw.get("place_name")
         )
@@ -1211,11 +1212,17 @@ class Orchestrator:
             )
             if not self.ctx.has("travel"): return "build_travel_matrix"
         if task.analysis_goal == "sensitivity_analysis":
+            if task.weights and task.weights.environment_burden > 0 and not self.ctx.has("built_environment"):
+                return "prepare_built_environment"
             return "run_sensitivity_analysis"
         if task.analysis_goal == "scenario_comparison":
             if not self.ctx.has("built_environment"): return "prepare_built_environment"
             return "compare_value_profiles"
         if task.analysis_goal != "facility_siting": return None
+        if (self.ctx.has("travel") and not self.ctx.has("analysis")
+                and task.weights and task.weights.environment_burden > 0
+                and not self.ctx.has("built_environment")):
+            return "prepare_built_environment"
         if task.coverage_target is not None and self.ctx.has("travel") and not self.ctx.has("analysis"):
             return "optimize_sites"
         if not self.ctx.has("analysis"): return None
@@ -1262,6 +1269,12 @@ class Orchestrator:
         diagnosis = error.message if error else (f"The agent reached its {limit}-action safety limit."
                                                  if safety_limited else "The requested analysis did not produce its required result.")
         if error and error.hint: diagnosis += f" {error.hint}"
+        if results and results[-1].summary.get("utci_unavailable"):
+            return RecoveryProposal(
+                diagnosis=diagnosis,
+                question="Retry ERA5-HEAT UTCI or run with Landsat land-surface temperature.",
+                suggested_changes={"heat_metric": "landsat_lst"},
+            )
         if error and error.kind == "timeout":
             return RecoveryProposal(
                 diagnosis=diagnosis,
@@ -1314,6 +1327,8 @@ class Orchestrator:
                 "population_weighted_access_gini": solution.population_weighted_access_gini,
                 "mean_travel_minutes": solution.mean_travel_minutes,
                 "solver_status": solution.solver_status,
+                "applied_weights": {key: value for key, value in solution.weights_used.model_dump().items() if value > 0}
+                if solution.weights_used else {},
             },
             "frontier": [{"alpha": p.alpha, "efficiency_metric": p.efficiency_metric,
                           "equity_metric": p.equity_metric,
@@ -1323,6 +1338,7 @@ class Orchestrator:
                 "operating_hours": quality.get("operating_hours"),
                 "public_access": quality.get("public_access"),
                 "heat": quality.get("heat"),
+                "built_environment": self.ctx.get("built_environment", {}),
             },
             "vulnerability_diagnostics": {
                 "active_scheme": vulnerability.get("active_scheme"),
@@ -1358,7 +1374,7 @@ class Orchestrator:
             "built_environment": self.ctx.get("built_environment", {}),
             "routing": self.ctx.get("travel", {}).get("routing_report", {}),
             "provenance": [item.model_dump(mode="json") for item in self.ctx.lineage],
-            "indicators_used": ["population_density", "elderly_ratio", "poverty_rate", "heat_exposure", "environment_burden", "vulnerability_score"],
+            "applied_weights": self.ctx.get("sensitivity_results", {}).get("applied_weights", {}),
         }
         self.ctx.record("explanation", "Requesting an evidence-grounded sensitivity interpretation.")
         narrative = ResultNarrative(**self.llm.structured(
@@ -1375,6 +1391,7 @@ class Orchestrator:
         """Generate a concise interpretation from deterministic heat statistics."""
         heat = self.ctx.get("heat_summary")
         evidence = {"task": task.model_dump(mode="json"), "statistics": heat["statistics"],
+                    "measurement_basis": heat.get("evidence_basis"),
                     "top_tracts": heat["top_tracts"], "quality": self.ctx.get("quality", {}),
                     "provenance": [item.model_dump(mode="json") for item in self.ctx.lineage]}
         self.ctx.record("explanation", "Requesting an evidence-grounded heat interpretation from the model.")
@@ -1535,6 +1552,8 @@ class Orchestrator:
         closure_attempted: set[str] = set()
         for index in range(1, max_steps + 1):
             self.ctx.check_cancelled()
+            if results and results[-1].summary.get("utci_unavailable"):
+                break
             if results and results[-1].summary.get("provider_unavailable"):
                 paused = True
                 recovery = self._failure_recovery(task, results, question="The OpenStreetMap service could not complete this lookup. Retry the same task later. A candidate CSV is optional, not required.")
@@ -1609,7 +1628,8 @@ class Orchestrator:
                                 suggested_changes=recovery.suggested_changes)
 
         if not ok and recovery is None:
-            self._complete_constraint_diagnostics(task, results, steps)
+            if not (results and results[-1].summary.get("utci_unavailable")):
+                self._complete_constraint_diagnostics(task, results, steps)
             recovery = self._failure_recovery(task, results, safety_limited=safety_limited)
             paused = True; message = recovery.diagnosis
             self.ctx.record("hitl", "The incomplete run produced a user-visible diagnostic.",
@@ -1636,9 +1656,12 @@ class Orchestrator:
             self.ctx.progress("Finalizing: packaging result", 1, 2, unit="stages")
         diagnostic_handles = ["constraint_validation", "minimum_facilities", "minimum_threshold", "coverage_alternative", "hypothetical_coverage",
                               "reachability_analysis", "scenario_comparison", "sensitivity_results",
-                              "vulnerability_analysis", "result_query_answers"]
+                              "vulnerability_analysis", "built_environment", "result_query_answers"]
         diagnostics = {name: json.loads(json.dumps(self.ctx.get(name), default=lambda value: value.model_dump(mode="json")))
                        for name in diagnostic_handles if self.ctx.has(name)}
+        thermal = self.ctx.get("quality", {}).get("heat", {})
+        if thermal:
+            diagnostics["thermal"] = thermal
         plan = AgentPlan(steps=steps, reasoning="Actions were selected from observations one step at a time.")
         failed = next((result.tool for result in reversed(results) if not result.ok), None)
         if ok:

@@ -69,3 +69,22 @@ it("retains ordinary result messages without recovery", () => {
   render(<TaskEditorProvider><ResultPanel snapshot={snapshot} /></TaskEditorProvider>);
   expect(screen.getByText("The approximate selection is available.")).toBeInTheDocument();
 });
+
+it("starts UTCI or Landsat recovery only after the corresponding click", () => {
+  retry.mutate.mockClear();
+  const task = { place_name: "Phoenix", n_facilities: 10, threshold_minutes: 15, heat_metric: "utci" };
+  const snapshot = {
+    run_id: "failed-utci", status: "awaiting_hitl", task,
+    result: {
+      task,
+      execution: { phase: "quick", status: "failed" },
+      recovery: { diagnosis: "Could not use UTCI for this run: Expected hourly UTCI on ERA5-HEAT latitude/longitude grid.", suggested_changes: {} },
+    },
+  } as unknown as RunSnapshot;
+  render(<TaskEditorProvider><ResultPanel snapshot={snapshot} /></TaskEditorProvider>);
+  expect(retry.mutate).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Retry UTCI" }));
+  expect(retry.mutate).toHaveBeenLastCalledWith({});
+  fireEvent.click(screen.getByRole("button", { name: "Run with Landsat LST" }));
+  expect(retry.mutate).toHaveBeenLastCalledWith({ task: { ...task, heat_metric: "landsat_lst" } });
+});

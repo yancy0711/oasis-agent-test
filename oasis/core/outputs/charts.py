@@ -83,7 +83,11 @@ def heat_analysis_chart(tracts: gpd.GeoDataFrame, out_path: str, permutations: i
     fig, axes = plt.subplots(1, 2, figsize=(10, 4.2))
     axes[0].hist(values, bins=min(12, max(4, int(np.sqrt(len(values))))), color="#EF9F27", edgecolor="white")
     axes[0].axvline(stats["mean_c"], color="#185FA5", linestyle="--", label=f"Mean {stats['mean_c']:.1f} C")
-    axes[0].set(title="Tract heat-exposure distribution", xlabel="Mean land-surface temperature (°C)", ylabel="Census tracts")
+    heat_label = (
+        "Mean daily maximum UTCI (°C)" if tracts.attrs.get("run_heat_metric") == "utci"
+        else "Land-surface temperature (°C)"
+    )
+    axes[0].set(title="Tract heat-exposure distribution", xlabel=heat_label, ylabel="Census tracts")
     axes[0].legend(frameon=False)
     finite = np.isfinite(lag)
     if stats["morans_i"] is None or not finite.any():

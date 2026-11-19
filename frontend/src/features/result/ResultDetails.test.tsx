@@ -80,7 +80,7 @@ describe("facility-siting analysis", () => {
     expect(screen.getByRole("heading", { name: "Vulnerability data quality and robustness" })).toBeInTheDocument();
     expect(screen.getByText("Feature correlation")).toBeInTheDocument();
     expect(screen.getByText("70.0%")).toBeInTheDocument();
-    expect(screen.getByText("Vulnerability, temperature, and built environment")).toBeInTheDocument();
+    expect(screen.getByText("Observed feature correlations")).toBeInTheDocument();
     fireEvent.click(screen.getByText("Missingness, collinearity, and weight-scheme details"));
     expect(screen.getByText("Weight sensitivity")).toBeInTheDocument();
   });

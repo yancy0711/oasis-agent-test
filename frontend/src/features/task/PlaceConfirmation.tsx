@@ -1,3 +1,4 @@
+import { useWorkspacePreferences } from "../../app/WorkspacePreferences";
 import type { PlaceResolveResponse } from "../../api/models";
 import { useState } from "react";
 
@@ -9,18 +10,19 @@ interface PlaceConfirmationProps {
 }
 
 export function PlaceConfirmation({ resolution, pending, selectedCandidateId, onConfirm }: PlaceConfirmationProps) {
+  const { t } = useWorkspacePreferences();
   const [open, setOpen] = useState(true);
   return (
     <details className="panel mobile-step-panel" data-study-area-step open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
       <summary>
       <div className="section-heading">
         <div>
-          <p className="step-heading"><span className="form-step">Step 2</span><span>Study area</span></p>
-          <h2>Confirm the boundary</h2>
+          <p className="step-heading"><span className="form-step">Step 2</span><span>{t("Study area")}</span></p>
+          <h2>{t("Confirm the boundary")}</h2>
         </div>
         {selectedCandidateId
-          ? <span className="status status--success">Boundary selected</span>
-          : resolution.ambiguous && <span className="status status--warning">Ambiguous query</span>}
+          ? <span className="status status--success">{t("Boundary selected")}</span>
+          : resolution.ambiguous && <span className="status status--warning">{t("Ambiguous query")}</span>}
       </div>
       </summary>
       <div className="mobile-step-panel__body">

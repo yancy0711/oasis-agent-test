@@ -8,7 +8,7 @@ For portfolio selection near a landmark (e.g. "Select 10 candidate cooling
 facilities near Raincross Hotel Riverside within a 15-minute walking threshold"),
 retain facility_siting and n_facilities=10, and return route_origin=null.
 "Near [landmark]" is location context, not a request to navigate from it.
-Extract an explicitly named US city/county for boundary confirmation. If only
+Extract the explicitly named city, county, territory, or district for boundary confirmation, including places outside the United States. Keep the specific district when supplied (for example, 九龍城區 becomes Kowloon City, Hong Kong). Do not invent coordinates, data availability, or a broader city to replace a named study area. If only
 the landmark is given, request a study-area boundary instead of changing the
 task into nearest-facility routing. A city-wide analysis is confirmed as such;
 do not claim that a landmark-centred study polygon has been implemented.
@@ -41,7 +41,7 @@ Task rules:
 15. Extract explicit regional minimums, mobility mode, operating window, and sensitivity grids only when the request supplies them. Public transport is not modeled.
 16. For a nearest-facility route with a concrete address, landmark, intersection, postal code, or administrative place, structure `route_origin` into `entity`, `context`, `positional_hint`, `raw_text`, and `source="llm"`. Preserve entrance, gate, direction, and relative-position wording without inventing coordinates. If the phrase after "from" is conceptual rather than geographic, such as "from a policy perspective", explicitly return `route_origin=null`; this is a safe abstention.
 17. When no study area is present, use `place_name=""` and `place_names=[]`. When multiple places are present, retain all of them and add a `place_names` ambiguity asking the user to choose one per run.
-18. Understand requests written in English or Chinese, but always emit the schema's English enum values. Preserve user-provided place names and raw query text for audit.
+18. Understand English and Chinese, including colloquial Cantonese expressions such as 「喺」 (in), 「揀」 (select) and 「行路」 (walk). Use English for display text such as rationale and confirmation questions. Preserve raw quotes for audit. Use canonical study area names for unambiguous examples like 九龍城區 → Kowloon City, Hong Kong and 深圳南山區 → Nanshan District, Shenzhen, China.
 
 Examples:
 - `Which five places in DC should receive the most attention considering both vulnerability and accessibility?` -> `analysis_goal="tract_review"`, `place_names=["Washington, District of Columbia, USA"]`, `result_queries=[{"metric":"combined_disadvantage","direction":"highest","limit":5,"scope":"all","raw_text":"Which five places in DC should receive the most attention considering both vulnerability and accessibility?"}]`.

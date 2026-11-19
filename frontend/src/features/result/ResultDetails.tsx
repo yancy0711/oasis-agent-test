@@ -65,11 +65,19 @@ export function AnalysisView({ result, onShowTract }: { result: RunResult; onSho
   const scenario = record(diagnostics.scenario_comparison);
   const validation = record(diagnostics.constraint_validation);
   const vulnerability = record(diagnostics.vulnerability_analysis);
+  const environment = record(diagnostics.built_environment);
+  const environmentCoverage = Object.entries(record(environment.available_tracts)).map(([indicator, observed_zones]) => ({
+    indicator, observed_zones,
+  }));
+  const excluded = rows(vulnerability.excluded_indicators);
   const vulnerabilityCorrelation = record(vulnerability.correlation);
   const vulnerabilityPca = record(vulnerability.pca);
   const vulnerabilitySensitivity = record(vulnerability.weight_sensitivity);
   const diagnosticCorrelation = record(vulnerability.diagnostic_correlation);
   const schemeDescriptions = record(vulnerability.scheme_descriptions);
+  const hasCorrelation = Object.keys(vulnerabilityCorrelation).length > 0;
+  const hasObservedCorrelation = Object.keys(diagnosticCorrelation).length > 0;
+  const hasPca = Object.keys(vulnerabilityPca).length > 0;
   const showValidation = informativeValidation(validation);
   const optimizationResult = (result.results ?? []).find((item) => item.tool === "optimize_sites");
   const routingResult = (result.results ?? []).find((item) => item.tool === "build_travel_matrix");
@@ -80,19 +88,24 @@ export function AnalysisView({ result, onShowTract }: { result: RunResult; onSho
   const missingTotal = rows(vulnerability.missingness).reduce((sum, item) => sum + Number(item.missing_count ?? 0), 0);
   const metricPercent = (value: unknown) => typeof value === "number" ? `${(value * 100).toFixed(1)}%` : "—";
   const heatUrl = publicApiUrl(result.artifacts?.heat_analysis);
-  const hasAny = experiments.length || topTracts.length || rankedTracts.length || Object.keys(facilities).length || Object.keys(threshold).length || Object.keys(extension).length || Object.keys(approximateThreshold).length || Object.keys(reachability).length || Object.keys(scenario).length || Object.keys(vulnerability).length || showValidation || Object.keys(optimization).length || Object.keys(routing).length || failures.length || heatUrl;
+  const hasAny = experiments.length || topTracts.length || rankedTracts.length || Object.keys(facilities).length || Object.keys(threshold).length || Object.keys(extension).length || Object.keys(approximateThreshold).length || Object.keys(reachability).length || Object.keys(scenario).length || Object.keys(vulnerability).length || Object.keys(environment).length || showValidation || Object.keys(optimization).length || Object.keys(routing).length || failures.length || heatUrl;
   if (!hasAny) return <p className="empty-tab">No additional diagnostics were produced for this run.</p>;
   return <div className="detail-stack">
     <section className="analysis-overview"><h3>Decision summary</h3><p className="muted">Current outcome first; open the diagnostic sections only when you need methodological detail.</p>
       {(topTracts.length > 0 || rankedTracts.length > 0 || Object.keys(extension).length > 0 || Object.keys(reachability).length > 0 || Object.keys(facilities).length > 0 || Object.keys(threshold).length > 0 || Object.keys(approximateThreshold).length > 0) && <p className="diagnostic-answer">{result.message}</p>}
       <div className="diagnostic-summary"><div><span>Population coverage</span><strong>{metricPercent(metrics.coverage)}</strong></div><div><span>Gradual access</span><strong>{metricPercent(metrics.gradual_coverage)}</strong></div><div><span>Access Gini</span><strong>{display(metrics.population_weighted_access_gini)}</strong></div><div><span>Missing values</span><strong>{Object.keys(vulnerability).length ? missingTotal : "not audited"}</strong></div></div>
     </section>
-    {Object.keys(vulnerability).length > 0 && <section className="vulnerability-analysis"><h3>Vulnerability data quality and robustness</h3><p className="muted">{display(vulnerability.priority_definition)} · active weighting: {display(vulnerability.active_scheme)} · normalization: {display(vulnerability.normalization)}. Indicator directions and missing-value policies come from the audited configuration.</p>
+    {Object.keys(environment).length > 0 && <section><h3>Built-environment data</h3>
+      {environmentCoverage.length > 0 ? <DataTable data={environmentCoverage} /> : <p className="muted">No environment measurements for this run. {environment.reason ? display(environment.reason) : ""}</p>}
+    </section>}
+    {excluded.length > 0 && <details className="analysis-disclosure"><summary>Indicators excluded from vulnerability</summary><DataTable data={excluded} /></details>}
+    {Object.keys(vulnerability).length > 0 && vulnerability.status !== "unavailable" && <section className="vulnerability-analysis"><h3>Vulnerability data quality and robustness</h3><p className="muted">{display(vulnerability.priority_definition)} · active weighting: {display(vulnerability.active_scheme)} · normalization: {display(vulnerability.normalization)}. Indicator directions and missing-value policies come from the audited configuration.</p>
       <div className="diagnostic-summary"><div><span>Tracts</span><strong>{display(vulnerability.tract_count)}</strong></div><div><span>Priority tracts</span><strong>{display(vulnerability.priority_tracts)}</strong></div><div><span>High-correlation pairs</span><strong>{rows(vulnerabilityCorrelation.high_pairs).length}</strong></div><div><span>Rank variation</span><strong>{display(vulnerabilitySensitivity.mean_rank_standard_deviation)}</strong></div></div>
-      <details className="analysis-disclosure"><summary>Correlation and PCA diagnostics</summary><h4>Feature correlation</h4><p className="muted">Spearman correlation after configured missing-value handling and vulnerability-direction alignment. Red is negative; green is positive.</p><CorrelationHeatmap data={vulnerabilityCorrelation} />
-        {Object.keys(diagnosticCorrelation).length > 0 && <><h4>Vulnerability, temperature, and built environment</h4><p className="muted">Pairwise-complete diagnostic correlations use available tract values without imputing optional NDVI, NDBI, or albedo. Heat exposure is the temperature variable. These relationships do not change the vulnerability score or optimization.</p><CorrelationHeatmap data={diagnosticCorrelation} />{rows(diagnosticCorrelation.strongest_pairs).length > 0 && <DataTable data={rows(diagnosticCorrelation.strongest_pairs)} />}</>}
-        <PcaSummary data={vulnerabilityPca} />
-      </details>
+      {(hasCorrelation || hasObservedCorrelation || hasPca) && <details className="analysis-disclosure"><summary>{hasPca ? "Correlation and PCA diagnostics" : "Correlation diagnostics"}</summary>
+        {hasCorrelation && <><h4>Feature correlation</h4><p className="muted">Spearman correlation after missing-value handling and vulnerability-direction alignment.</p><CorrelationHeatmap data={vulnerabilityCorrelation} /></>}
+        {hasObservedCorrelation && <><h4>Observed feature correlations</h4><p className="muted">Spearman correlations use zones with both values observed. Each pair can have a different sample size.</p><CorrelationHeatmap data={diagnosticCorrelation} />{rows(diagnosticCorrelation.strongest_pairs).length > 0 && <DataTable data={rows(diagnosticCorrelation.strongest_pairs)} />}</>}
+        {hasPca && <PcaSummary data={vulnerabilityPca} />}
+      </details>}
       <details className="analysis-disclosure"><summary>Missingness, collinearity, and weight-scheme details</summary><h4>Missing-value audit</h4><p className="muted">Median replaces a missing value with the study-area median and records the affected GEOID. No fill value is shown when nothing was missing.</p><DataTable data={rows(vulnerability.missingness)} /><h4>Variance inflation factors</h4><p className="muted">VIF near 1 indicates little linear redundancy; review is flagged at 5 or above.</p><DataTable data={rows(vulnerability.vif)} /><h4>Weight sensitivity</h4><p className="muted">Rank correlation near 1 means tract ordering is stable. Priority-tract Jaccard near 1 means the same tracts remain in the priority set.</p><DataTable data={rows(vulnerabilitySensitivity.comparisons)} /><h4>Weight schemes</h4><DataTable data={Object.entries(record(vulnerabilitySensitivity.schemes)).map(([scheme, weights]) => ({ scheme, meaning: schemeDescriptions[scheme], weights }))} /></details>
     </section>}
     {experiments.length > 0 && <section><h3>Sensitivity experiments</h3><p className="muted">{display(sensitivity.experiment_count ?? experiments.length)} deterministic solutions · {display(sensitivity.mobility_scenario)} · router {display(sensitivity.router)}</p><DataTable data={experiments} /></section>}

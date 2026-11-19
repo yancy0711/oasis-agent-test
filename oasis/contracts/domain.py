@@ -88,7 +88,8 @@ class Ambiguity(BaseModel):
 
 class TaskSpec(BaseModel):
     """Structured, human-confirmable task extracted from natural language."""
-    place_name: str = Field("", description="One human-confirmed geocodable US city or county")
+    place_name: str = Field("", description="One human-confirmed study area")
+    demand_upload_id: str | None = Field(None, pattern=r"^[0-9a-f]{32}$")
     place_names: list[str] = Field(
         default_factory=list, max_length=5,
         description="All city or county names extracted from the request; one must be confirmed per run",
@@ -98,6 +99,7 @@ class TaskSpec(BaseModel):
                            "minimum_threshold", "reachability_review", "scenario_comparison",
                            "sensitivity_analysis"] = "facility_siting"
     candidate_source: Literal["osm", "csv"] = "osm"
+    heat_metric: Literal["landsat_lst", "utci"] = "landsat_lst"
     candidate_file: str | None = None
     allow_hypothetical_sites: bool = Field(
         False, description="Explicit opt-in post-paper extension for fixed-budget siting or fixed-threshold minimum-facility planning. Adds tract-centroid hypothetical sites; uses approximate travel, not verified venues or network coverage.",

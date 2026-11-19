@@ -81,15 +81,17 @@ export function popupContent(
   const route = properties.layer_kind === "planned_route";
   const paretoSite = properties.layer_kind === "pareto_preview_site";
   const selectedSite = properties.layer_kind === "selected_site" || properties.layer_kind === "comparison_site";
+  const candidate = properties.layer_kind === "candidate";
   const heading = document.createElement("strong");
   heading.textContent = String(properties.name ?? (paretoSite ? "Pareto preview site" : route
     ? `Route to ${properties.destination_name ?? properties.destination_id ?? "selected candidate facility"}`
-    : `Census tract ${properties.GEOID ?? ""}`));
+    : properties.layer_kind === "boundary" ? "Study boundary"
+      : candidate ? "Candidate facility" : `Demand zone ${properties.GEOID ?? ""}`.trim()));
   root.append(heading);
   const rows = paretoSite ? [
     ["Candidate ID", properties.candidate_id], ["Preview alpha", properties.alpha],
     ["Status", "Temporary preview; the current recommendation is unchanged"],
-  ] : selectedSite ? [
+  ] : selectedSite || candidate ? [
     ["Status", properties.is_hypothetical ? "Hypothetical location; suitability and access unverified" : null],
     ["Comparison", properties.comparison_label], ["Candidate ID", properties.candidate_id],
     ["Facility type", properties.facility_type ?? "Unknown"], ["Mobility", properties.mobility],
@@ -112,6 +114,8 @@ export function popupContent(
   ] : [
     ["Population", properties.population], ["Age 65+", properties.elderly_pct == null ? null : `${properties.elderly_pct}%`],
     ["Poverty", properties.poverty_pct == null ? null : `${properties.poverty_pct}%`],
+    ["ERA5-HEAT UTCI", properties.utci_c == null ? null : temperature(properties.utci_c)],
+    ["Landsat LST", properties.lst_exposure_c == null ? null : temperature(properties.lst_exposure_c)],
     ["Population-weighted LST", properties.population_weighted_heat_c == null ? null : temperature(properties.population_weighted_heat_c)],
     ["Tract mean LST", properties.tract_mean_heat_c == null ? null : temperature(properties.tract_mean_heat_c)],
     ["Difference from tract mean", properties.heat_exposure_gap_c == null ? null : temperature(properties.heat_exposure_gap_c)],
@@ -124,7 +128,13 @@ export function popupContent(
     ["Reachability rank", properties.reachability_rank],
     ["Diagnostic marker", properties.is_hardest_reachability ? "Hardest tract in this review" : null],
   ];
-  rows.forEach(([label, value]) => { const row = popupRow(String(label), value); if (row) root.append(row); });
+  const hoverLabels = ["Population", "Age 65+", "ERA5-HEAT UTCI", "Landsat LST", "Facility type",
+    "Opening hours", "Duration", "Mode", "Preview alpha"];
+  for (const [label, value] of rows) {
+    if (!includeStreetView && !hoverLabels.includes(String(label))) continue;
+    const row = popupRow(String(label), value);
+    if (row) root.append(row);
+  }
   if (includeStreetView && (selectedSite || paretoSite) && coordinates) {
     appendStreetView(root, coordinates[0], coordinates[1]);
   }

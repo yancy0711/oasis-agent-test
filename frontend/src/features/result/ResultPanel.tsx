@@ -1,12 +1,14 @@
+import { useWorkspacePreferences } from "../../app/WorkspacePreferences";
 import type { RunSnapshot } from "../../api/models";
 import { agentMessage, isPreview, isTerminalRun, visibleResult } from "../run/run.selectors";
 import { MetricsView } from "./MetricsView";
 import { RecoveryPanel } from "./RecoveryPanel";
-import { ResultTabs } from "./ResultTabs";
+import { ResultTabs, type ResultLocations } from "./ResultTabs";
 import { ExecutionSummary } from "./ResultShared";
 import { useReviseRun } from "../run/run.mutations";
 
-export function ResultPanel({ snapshot }: { snapshot: RunSnapshot }) {
+export function ResultPanel({ snapshot, workspace, onEditTask }: { snapshot: RunSnapshot; workspace?: ResultLocations; onEditTask?: () => void }) {
+  const { t } = useWorkspacePreferences();
   const retry = useReviseRun(snapshot.run_id);
   const result = visibleResult(snapshot);
   const savedMessage = agentMessage(snapshot);
@@ -35,10 +37,18 @@ export function ResultPanel({ snapshot }: { snapshot: RunSnapshot }) {
       }
     }
   }
+  const decisionContext = result && <div className="run-context" aria-label="Current decision context">
+    <span><b>Place</b>{result.task.place_name}</span>
+    <span><b>{t("Facilities")}</b>{diagnostic && !fixedInputs.includes("n_facilities") ? typeof calculatedCount === "number" ? calculatedCount : "To calculate" : result.task.n_facilities}</span>
+    <span><b>Threshold</b>{diagnostic && !fixedInputs.includes("threshold_minutes") ? typeof calculatedTime === "number" ? `${Number(calculatedTime.toFixed(1))} min` : "To calculate" : `${result.task.threshold_minutes} min`}</span>
+    <span><b>{t("Mobility")}</b>{result.task.mobility_scenario}</span>
+    <span><b>{t("Heat input")}</b>{result.task.heat_metric === "utci" ? "ERA5-HEAT UTCI" : "Landsat LST"}</span>
+    <span><b>Equity setting</b>{result.task.equity_alpha == null ? "Not applied" : `α = ${result.task.equity_alpha}`}</span>
+  </div>;
   return (
     <section className="panel result-panel">
       <div className="section-heading">
-        <div><p className="eyebrow">Decision support</p><h2>Result</h2></div>
+        <div><h2>{t("Result")}</h2></div>
         {(isPreview(snapshot) || approximateFallback) && <span className="status status--warning">{approximateFallback ? "Approximate result" : "Approximate preview"}</span>}
       </div>
       {!result ? (
@@ -51,19 +61,17 @@ export function ResultPanel({ snapshot }: { snapshot: RunSnapshot }) {
         ) : <p className="muted">The result panel will update from the same run snapshot as progress and trace<span className="animated-ellipsis" aria-label="in progress" /></p>
       ) : (
         <>
-          <div className="run-context" aria-label="Current decision context">
-            <span><b>Place</b>{result.task.place_name}</span>
-            <span><b>Facilities</b>{diagnostic && !fixedInputs.includes("n_facilities") ? typeof calculatedCount === "number" ? calculatedCount : "To calculate" : result.task.n_facilities}</span>
-            <span><b>Threshold</b>{diagnostic && !fixedInputs.includes("threshold_minutes") ? typeof calculatedTime === "number" ? `${Number(calculatedTime.toFixed(1))} min` : "To calculate" : `${result.task.threshold_minutes} min`}</span>
-            <span><b>Mobility</b>{result.task.mobility_scenario}</span>
-            <span><b>Equity setting</b>{result.task.equity_alpha == null ? "Not applied" : `α = ${result.task.equity_alpha}`}</span>
-          </div>
+          {workspace && <ResultTabs runId={snapshot.run_id} result={result} workspace={workspace} />}
+          {!workspace && decisionContext}
           {message && !result.recovery && <p className="agent-message">{message}</p>}
           {refinement?.status === "unavailable" && <details className="execution-notice execution-notice--approximate"><summary>ORS refinement unavailable — showing the estimate</summary><p>{String(refinement.details ?? refinement.reason ?? "Network refinement could not be completed.")}</p>{refinement.next_steps ? <p>{String(refinement.next_steps)}</p> : null}</details>}
           {(!result.recovery || result.execution.router_used) && <ExecutionSummary result={result} />}
-          <RecoveryPanel result={result} onRetry={() => retry.mutate({})} retryPending={retry.isPending} retryError={retry.error?.message} />
-          <MetricsView result={result} />
-          <ResultTabs runId={snapshot.run_id} result={result} />
+          <RecoveryPanel result={result} onRetry={() => retry.mutate({})}
+            onRetryWithLandsat={() => retry.mutate({ task: { ...snapshot.task, heat_metric: "landsat_lst" } })}
+            retryPending={retry.isPending} retryError={retry.error?.message} onEditTask={onEditTask} />
+          <MetricsView result={result} dataQualitySlot={workspace?.data} />
+          {workspace && <details className="workbench-disclosure"><summary>{t("Run settings")}</summary>{decisionContext}</details>}
+          {!workspace && <ResultTabs runId={snapshot.run_id} result={result} />}
         </>
       )}
     </section>

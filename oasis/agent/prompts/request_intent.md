@@ -14,8 +14,8 @@ Location wording (near, at, a hotel, a landmark) is secondary context. It does
 not turn portfolio selection into navigation. "Select 10 candidate facilities
 near [landmark] within a 15-minute walking threshold" is select_facilities.
 "Show me 10 nearby places I can visit" is find_destination. If a research
-request names only a landmark, let the research parser request/confirm a US
-city/county boundary; do not convert the request into a trip from that point.
+request names only a landmark, let the research parser request/confirm a
+study boundary; do not convert the request into a trip from that point.
 
 - personal: find existing nearby places, nearest cooling destination, addresses,
   directions, personal walking/cycling/driving access, category preferences,

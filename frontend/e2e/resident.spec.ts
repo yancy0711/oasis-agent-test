@@ -35,13 +35,14 @@ async function mockApi(page: Page, location: Origin, parsed: Preferences = prefs
     if (path === "/api/v1/resident/origins") return json({ candidates: [us], message: "Confirm your starting point." });
     if (path === "/api/v1/resident/search") {
       if (failSearchOnce && searches++ === 0) return route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ detail: "OpenStreetMap place lookup failed. Select Retry search beside the map." }) });
-      return json(result);
+      return json(location.country_code === "hk" ? { ...result, origin: location, candidates: result.candidates.map((place) => ({ ...place, longitude: location.longitude + place.longitude - us.longitude, latitude: location.latitude + place.latitude - us.latitude })) } : result);
     }
     if (path.startsWith("/api/v1/resident/cancel/")) return json({ cancelled: true });
     if (path === "/api/v1/resident/routes") {
       const place = result.candidates.find((item) => item.id === body.candidate_id)!;
+      const origin = location.country_code === "hk" ? location : us;
       const response: ResidentRoute = { type: "FeatureCollection", features: [{ type: "Feature", properties: {},
-        geometry: { type: "LineString", coordinates: [[us.longitude, us.latitude], [place.longitude, place.latitude]] } }],
+        geometry: { type: "LineString", coordinates: [[origin.longitude, origin.latitude], [origin.longitude + place.longitude - us.longitude, origin.latitude + place.latitude - us.latitude]] } }],
         summary: { destination_id: place.id, destination_name: place.name, duration_minutes: place.duration_minutes,
           distance_km: 0.5, green_score: place.id === "way/1" ? 2 : 8, within_threshold: true, heat_status: "unavailable", message: "Heat estimates unavailable." } };
       return json(response);
@@ -65,8 +66,9 @@ test("pending search animates and category select-all keeps the confirmed origin
   });
   await page.goto("/");
   await page.getByRole("tab", { name: "Find a nearby facility" }).click();
-  await page.getByLabel("US address or landmark").fill("Riverside City Hall, California");
+  await page.getByLabel("Address or landmark").fill("Riverside City Hall, California");
   await page.getByRole("button", { name: "Find address", exact: true }).click();
+  await page.getByText("Search filters", { exact: true }).click();
   await page.getByRole("checkbox", { name: "Select all place categories" }).check();
   await page.getByRole("button", { name: "Confirm location and search" }).click();
   const status = page.locator('.resident-request-status > p[role="status"]');
@@ -78,11 +80,13 @@ test("pending search animates and category select-all keeps the confirmed origin
   await expect(page.getByRole("button", { name: "Select starting point on map" })).toBeEnabled();
   const tops: number[] = await page.evaluate('(async () => { const values = []; for (let i = 0; i < 14; i++) { values.push(document.querySelector(".resident-map").getBoundingClientRect().top); await new Promise(resolve => setTimeout(resolve, 100)); } return values; })()');
   expect(Math.max(...tops) - Math.min(...tops)).toBeLessThan(0.5);
-  const confirmed = await page.locator(".resident-map-column > .notice").boundingBox();
+  const confirmed = await page.locator(".resident-origin-card").boundingBox();
   const stop = await page.getByRole("button", { name: "Stop and reset" }).boundingBox();
   const statusBox = await status.boundingBox();
-  expect(stop!.y - (confirmed!.y + confirmed!.height)).toBeGreaterThanOrEqual(10);
+  expect(stop!.y - (confirmed!.y + confirmed!.height)).toBeGreaterThanOrEqual(4);
   expect(statusBox!.y).toBeGreaterThan(stop!.y + stop!.height);
+  const map = await page.locator(".resident-map").boundingBox();
+  expect(map!.height).toBeGreaterThan(page.viewportSize()!.height * 0.65);
   await expect.poll(() => submitted?.preferences.categories?.length).toBe(8);
   expect(submitted?.preferences.excluded_categories).toEqual([]);
   release();
@@ -91,7 +95,7 @@ test("pending search animates and category select-all keeps the confirmed origin
   await expect(status.locator(".animated-ellipsis")).toHaveCount(0);
 });
 
-test("missing resident origin locates, warns outside US, then accepts a US address without solver", async ({ page, context }) => {
+test("Hong Kong origin confirms and searches without solver", async ({ page, context }) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
   await context.grantPermissions(["geolocation"]);
   await context.setGeolocation({ longitude: abroad.longitude, latitude: abroad.latitude });
@@ -102,22 +106,17 @@ test("missing resident origin locates, warns outside US, then accepts a US addre
   await page.getByRole("tab", { name: "Find a nearby facility" }).click();
   await page.getByRole("textbox", { name: "Describe the cooling-access question", exact: true }).fill("Find the nearest cooling center. I want a shopping mall, not a park.");
   await page.getByRole("button", { name: "Analyze request" }).click();
-  await expect(page.getByText("Outside supported area", { exact: true })).toBeVisible();
-  await expect(page.locator(".resident-origin--outside")).toBeVisible();
-  await expect(page.getByRole("button", { name: "Update results", exact: true })).toHaveCount(0);
+  await expect(page.locator(".resident-origin-card")).toContainText("Hong Kong");
   expect(calls.some((call) => call.path === "/api/v1/resident/search")).toBe(false);
-  await page.screenshot({ path: "../tmp/resident-outside.png", fullPage: true });
-
-  await page.getByLabel("US address or landmark").fill("Riverside City Hall, California");
-  await page.getByRole("button", { name: "Find address", exact: true }).click();
   await page.getByRole("button", { name: "Confirm location and search" }).click();
   await expect(page.getByRole("button", { name: "Route to Test Mall", exact: true })).toBeVisible();
   await expect(page.getByText("Route to Test Mall", { exact: true })).toBeVisible();
+  await page.getByText("Search filters", { exact: true }).click();
   await expect(page.getByRole("checkbox", { name: "Shopping malls", exact: true })).toBeChecked();
   await expect(page.getByRole("checkbox", { name: "Parks", exact: true })).not.toBeChecked();
   await expect(page.getByRole("spinbutton", { name: "Facilities", exact: true })).toHaveCount(0);
   expect(calls.find((call) => call.path === "/api/v1/resident/search")?.body).toMatchObject({
-    longitude: us.longitude, latitude: us.latitude, preferences: { categories: ["mall"], excluded_categories: ["park"], threshold_minutes: 10 },
+    longitude: abroad.longitude, latitude: abroad.latitude, preferences: { categories: ["mall"], excluded_categories: ["park"], threshold_minutes: 10 },
   });
   await expect(page.locator(".resident-route-legend")).toContainText("Greener compared route: Second Mall");
   await expect(page.locator(".resident-route-legend")).toContainText("Fastest: Test Mall");
@@ -159,6 +158,7 @@ test("missing resident origin locates, warns outside US, then accepts a US addre
   await page.screenshot({ path: "../tmp/resident-mobile.png", fullPage: true });
   await expect.poll(() => page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")).toBe(true);
   await page.getByRole("tab", { name: "Research and planning" }).click();
+  await page.getByText("More examples", { exact: true }).click();
   await expect(page.getByRole("button", { name: "Candidate facility siting", exact: true })).toBeVisible();
   await expect(page.getByRole("region", { name: "Resident nearby places" })).toHaveCount(0);
   expect(calls.some((call) => call.path === "/api/v1/runs" || call.path === "/api/v1/parse")).toBe(false);
@@ -192,7 +192,7 @@ test("a nearby request on the research tab resolves its address, permits retry a
   await page.getByRole("textbox", { name: "Describe the cooling-access question", exact: true }).fill("I'm at riverside conventional centre. How can I find the nearest cooling facility? I prefer shopping malls.");
   await page.getByRole("button", { name: "Analyze request" }).click();
   await expect(page.getByRole("tab", { name: "Find a nearby facility" })).toHaveAttribute("aria-selected", "true");
-  await expect(page.getByLabel("US address or landmark")).toHaveValue("Riverside Convention Center");
+  await expect(page.getByLabel("Address or landmark")).toHaveValue("Riverside Convention Center");
   await page.getByRole("button", { name: "Confirm location and search" }).click();
   await expect(page.getByText("OpenStreetMap place lookup failed. Select Retry search beside the map.")).toBeVisible();
   const retry = page.getByRole("button", { name: "Retry search", exact: true });
@@ -234,6 +234,7 @@ test("switching to nearby search waits for the current research run to stop", as
     sessionStorage.setItem("oasis-session", JSON.stringify({ state: { activeRunId: "active-test" }, version: 0 }));
   });
   await page.route("**/api/v1/runs/active-test", (route) => route.fulfill({ json: { ...snapshot, status: stopped ? "cancelled" : "running" } }));
+  await page.route("**/api/v1/runs/active-test/input-layers", (route) => route.fulfill({ json: {} }));
   await page.route("**/api/v1/runs/active-test/cancel", async (route) => {
     cancellationRequested = true;
     await acknowledgement;

@@ -29,13 +29,14 @@ from oasis.contracts.domain import (AgentEvent, ExecutionProvenance, RoutingMode
 from oasis.core.cancellation import CancellationToken, RunCancelled
 from oasis.settings import PROJECT_ROOT, load_cfg
 from oasis.settings import load_profiles
-from oasis.core.outputs.report import render_diagnostic_report
-from oasis.core.data.geocoding import (AmbiguousPlaceError, cache_place_candidates,
+from oasis.core.outputs.report import render_diagnostic_report, thermal_methodology
+from oasis.core.data.geocoding import (AmbiguousPlaceError, OutsideUSBoundaryError, cache_place_candidates,
                                        canonical_place_name, route_origin_options, search_origin_candidates,
                                        reverse_origin_address, select_place_candidate)
 from oasis.core.data.source_status import inspect_data_sources
+from oasis.core.data import regional
 from oasis.core.data.official_resources import discover_official_resources
-from oasis.core.cache import scoped_cache
+from oasis.core.cache import atomic_write_text, scoped_cache
 from oasis.core.spatial.routes import plan_point_to_nearest_site
 from oasis.services.run_store import RunStore
 
@@ -480,11 +481,24 @@ class OasisService:
 
     def resolve_place(self, place_name: str) -> dict:
         """Resolve a place or return opaque candidates for explicit HITL."""
+        regional_name = regional.regional_place(place_name)
+        if regional_name:
+            resolution_id = uuid4().hex
+            kind = "district" if regional_name != "Hong Kong" else "territory"
+            prefix = "hk" if regional.hong_kong_place(regional_name) else "sz"
+            selected = {"candidate_id": f"{prefix}:{resolution_id}", "canonical_name": regional_name,
+                        "display_name": regional_name, "place_type": kind, "label": regional_name}
+            with self.lock:
+                self.resolutions[resolution_id] = {"query": place_name, "regional_candidate": selected}
+            return {"resolution_id": resolution_id, "query": place_name, "ambiguous": False,
+                    "candidates": [selected], "selected": selected}
         try:
             selected, rows = select_place_candidate(place_name)
             ambiguous = False
         except AmbiguousPlaceError as exc:
             rows, selected, ambiguous = exc.candidates[:5], None, True
+        except OutsideUSBoundaryError as exc:
+            raise ValueError(f"No automatic study boundary is available for '{place_name}'.") from exc
         resolution_id = uuid4().hex
         with self.lock: self.resolutions[resolution_id] = {"query": place_name, "rows": rows}
         candidates = [self._candidate(row, index) for index, row in enumerate(rows)]
@@ -496,12 +510,19 @@ class OasisService:
         """Confirm one retained candidate and write its canonical query cache."""
         with self.lock: resolution = self.resolutions.get(resolution_id)
         if resolution is None: raise KeyError("Unknown or expired place resolution")
+        if selected := resolution.get("regional_candidate"):
+            if selected["candidate_id"] != candidate_id:
+                raise KeyError("Unknown place candidate")
+            return {**selected, "query": resolution["query"]}
         rows = resolution["rows"]
         try: index = int(candidate_id.split(":", 1)[0]); selected = rows[index]
         except (ValueError, IndexError): raise KeyError("Unknown place candidate") from None
         canonical = canonical_place_name(selected); cache_place_candidates(resolution["query"], rows, selected)
         return {**self._candidate(selected, index), "query": resolution["query"],
-                "canonical_name": canonical}
+                "canonical_name": canonical,
+                "boundary": {"type": "FeatureCollection", "features": [
+                    {"type": "Feature", "geometry": selected["geojson"], "properties": {}}
+                ]} if selected.get("geojson") else None}
 
     def reverse_route_origin(self, longitude: float, latitude: float) -> dict:
         """Resolve one exact browser coordinate into supported parent boundaries."""
@@ -588,14 +609,71 @@ class OasisService:
             "candidates": candidates,
         }
 
-    def upload_candidates(self, filename: str, content: bytes) -> dict:
+    def upload_candidates(self, filename: str, content: bytes,
+                          coordinate_system: str = "epsg", epsg: int = 4326) -> dict:
         """Store one CSV under an opaque ID and never expose its backend path."""
         name = Path(filename).name
         if Path(name).suffix.lower() != ".csv": raise ValueError("Candidate upload must be a CSV")
+        from oasis.core.data.candidate_csv import normalized_candidate_csv, preview_candidate_csv
+
         upload_id = uuid4().hex; path = self.upload_root / f"{upload_id}_{name}"
+        size = len(content)
+        if coordinate_system != "epsg" or epsg != 4326:
+            try:
+                content = normalized_candidate_csv(content, coordinate_system, epsg)
+            except (TypeError, RuntimeError) as exc:
+                raise ValueError("Could not transform the candidate coordinates from the selected CRS.") from exc
         path.write_bytes(content)
         with self.lock: self.uploads[upload_id] = path
-        return {"upload_id": upload_id, "filename": name, "size": len(content)}
+        try:
+            points = preview_candidate_csv(path)
+        except (ValueError, OSError):
+            points = []
+        return {"upload_id": upload_id, "filename": name, "size": size, "preview_points": points}
+
+    def upload_demand(self, filename: str, content: bytes, place_name: str,
+                      fields: dict[str, str], epsg: int, year: int | None,
+                      coordinate_system: str = "epsg") -> dict:
+        place_name = place_name.strip()
+        if not place_name or Path(filename).suffix.lower() != ".geojson":
+            raise ValueError("A study area name and a .geojson file are required.")
+        place_name = regional.regional_place(place_name) or place_name
+        try:
+            areas = regional.parse_demand_upload(content, fields, epsg, coordinate_system)
+        except (TypeError, RuntimeError) as exc:
+            raise ValueError("Could not read the geometry or transform the selected CRS.") from exc
+        regional.validate_regional_upload(place_name, areas)
+        upload_id = uuid4().hex
+        metadata = {"filename": Path(filename).name, "place_name": place_name,
+                    "fields": fields, "epsg": epsg, "year": year, "coordinate_system": coordinate_system}
+        data = json.loads(areas.to_json(drop_id=True))
+        data["metadata"] = metadata
+        atomic_write_text(self.upload_root / f"{upload_id}_demand.geojson", json.dumps(data, ensure_ascii=False))
+        boundary = areas[["geometry"]].dissolve()
+        return {"upload_id": upload_id, **metadata, "units": len(areas),
+                "geometry": regional.demand_preview(areas), "boundary": regional.demand_preview(boundary)}
+
+    def regional_data(self, place_name: str) -> dict:
+        """Check the regional provider before the user commits to a run."""
+        name = regional.regional_place(place_name)
+        if not name:
+            raise ValueError("No automatic regional census adapter is registered for this place. Upload demand polygons.")
+        metadata, _, areas = regional.automatic_data(name)
+        return {"place_name": name, **metadata,
+                "units": len(areas), "older_units": int(areas["elderly_population"].notna().sum()),
+                "geometry": regional.demand_preview(areas)}
+
+    def regional_demand_geojson(self, place_name: str, layer: str = "demand") -> str:
+        name = regional.regional_place(place_name)
+        if not name:
+            raise ValueError("No automatic regional demand source is registered for this study area.")
+        if layer == "boundary":
+            metadata, areas = regional.automatic_boundary(name)
+        else:
+            metadata, _, areas = regional.automatic_data(name)
+        data = json.loads(areas.to_json(drop_id=True, to_wgs84=True))
+        data["metadata"] = {"place_name": name, **metadata}
+        return json.dumps(data, ensure_ascii=False)
 
     @staticmethod
     def _mode(value: str | None) -> RoutingMode:
@@ -607,6 +685,12 @@ class OasisService:
 
     def _internal_task(self, task: TaskSpec, candidate_upload_id: str | None) -> TaskSpec:
         """Bind an opaque upload to an internal path without persisting that path publicly."""
+        if task.demand_upload_id:
+            metadata, _ = regional.stored_demand(task.demand_upload_id, self.upload_root)
+            if metadata["place_name"] != task.place_name:
+                raise ValueError("The uploaded demand layer belongs to a different study area.")
+        if (task.demand_upload_id or regional.regional_place(task.place_name)) and task.mobility_scenario == "walk_drive_equity":
+            raise ValueError("Household vehicle availability is missing. Choose walking, cycling, or driving for this region.")
         data = {**task.model_dump(), "candidate_file": None}
         if candidate_upload_id:
             with self.lock:
@@ -883,7 +967,11 @@ class OasisService:
                 self._add_artifact(manifest, "map", map_path, root)
         if "report" not in manifest and (payload.get("recovery") or diagnostics):
             report = root / "feasibility_diagnostic.md"; report.parent.mkdir(parents=True, exist_ok=True)
-            report.write_text(render_diagnostic_report(payload.get("recovery"), diagnostics), encoding="utf-8")
+            content = render_diagnostic_report(payload.get("recovery"), diagnostics)
+            thermal = thermal_methodology(diagnostics.get("thermal", {}), (payload.get("task") or {}).get("heat_metric", "landsat_lst"))
+            if thermal:
+                content += "\n\n## Heat input and method\n\n" + thermal + "\n"
+            report.write_text(content, encoding="utf-8")
             manifest["report"] = report
         return manifest
 
@@ -901,12 +989,6 @@ class OasisService:
             "allow_fallback": not precise,
         }
         cfg["data"] = deepcopy(cfg.get("data", {}))
-        cfg["data"]["landsat_environment_indices"] = {
-            **cfg["data"].get("landsat_environment_indices", {}),
-            # Keep the approximate preview fast; the precise phase computes
-            # and caches diagnostic optical indices with visible progress.
-            "enabled": precise,
-        }
         cfg["optimization"] = deepcopy(cfg.get("optimization", {}))
         if not precise:
             # A preview must become useful quickly, especially for large metros.
@@ -986,6 +1068,7 @@ class OasisService:
         """Execute one auditable phase and return its terminal payload."""
         root = Path(self.cfg["output"]["dir"]) / "api_runs" / run_id / phase
         cfg = self._phase_config(phase, root)
+        cfg["output"]["input_layers"] = str(root.parent / "input_layers")
         with self.lock:
             control = self.controls[run_id]
             self.progress_clocks.pop(run_id, None)
@@ -1471,7 +1554,7 @@ class OasisService:
             )
 
     def plan_place_route(self, run_id: str, query: str, mode: str, *, check=lambda: None) -> dict:
-        """Geocode one US origin inside the displayed study area and plan its route."""
+        """Geocode an origin inside the displayed study area and plan its route."""
         check()
         import geopandas as gpd
         from shapely.geometry import Point, shape
@@ -1490,19 +1573,21 @@ class OasisService:
             if feature.get("properties", {}).get("layer_kind") == "boundary"
         ]
         if not tract_features:
-            raise ValueError("the displayed map contains no Census tract geometry")
+            raise ValueError("the displayed map contains no demand zone geometry")
         areas = gpd.GeoDataFrame.from_features(tract_features, crs="EPSG:4326")
         study_boundary = unary_union([shape(feature["geometry"]) for feature in boundary_features]) \
             if boundary_features else areas.geometry.union_all()
         place_name = snapshot["task"]["place_name"]
+        country = place_name.rsplit(",", 1)[-1].strip().casefold()
+        countrycodes = "us" if country in {"usa", "united states", "us"} else None
         with scoped_cache(place_name):
-            rows = search_origin_candidates(query, countrycodes="us", viewbox=study_boundary.bounds, check=check)
+            rows = search_origin_candidates(query, countrycodes=countrycodes, viewbox=study_boundary.bounds, check=check)
             if not rows:
-                rows = search_origin_candidates(f"{query}, {place_name}", countrycodes="us", check=check)
+                rows = search_origin_candidates(f"{query}, {place_name}", countrycodes=countrycodes, check=check)
             if not rows:
-                rows = search_origin_candidates(query, countrycodes="us", check=check)
+                rows = search_origin_candidates(query, countrycodes=countrycodes, check=check)
         if not rows:
-            raise ValueError(f"No matching address or landmark found for '{query}' in {place_name} or the US. Try a street address or select the point on the map.")
+            raise ValueError(f"No matching address or landmark found for '{query}'. Try a street address in {place_name} or select a point on the map.")
         matched = None
         for row in rows:
             try:
@@ -1556,3 +1641,23 @@ class OasisService:
         if not path.is_file():
             raise KeyError("Unknown artifact")
         return path
+
+    def input_layers(self, run_id: str, previous_etag: str | None = None) -> tuple[str, dict | None]:
+        self.store.get(run_id)
+        root = Path(self.cfg["output"]["dir"]) / "api_runs" / run_id / "input_layers"
+        layers = {}
+        revisions = []
+        for kind in ("boundary", "tract", "candidate"):
+            path = root / f"{kind}.geojson"
+            try:
+                info = path.stat()
+            except FileNotFoundError:
+                continue
+            layers[kind] = path
+            revisions.append(f"{kind}:{info.st_mtime_ns}:{info.st_size}")
+        digest = hashlib.sha256(";".join(revisions).encode()).hexdigest()
+        etag = f'"{digest}"'
+        payload = None if previous_etag == etag else {
+            kind: json.loads(path.read_text(encoding="utf-8")) for kind, path in layers.items()
+        }
+        return etag, payload

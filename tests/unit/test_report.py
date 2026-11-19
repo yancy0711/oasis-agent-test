@@ -15,7 +15,9 @@ def test_report_explains_active_and_diagnostic_only_equations():
     )
     report = render_report(task, solution, [], [], model_context={
         "population_weighting_threshold": .8,
-        "built_environment": {"status": "ready"},
+        "thermal": {"thermal_layers": {"landsat_lst": {}}},
+        "built_environment": {"status": "ready", "available_tracts": {"mean_ndvi": 100},
+                              "burden_components": ["mean_ndvi"], "burden_imputed_zones": 0},
         "vulnerability": {
             "active_scheme": "configured", "normalization": "percentile",
             "priority_definition": "top 25% of the active composite vulnerability score",
@@ -36,8 +38,9 @@ def test_report_explains_active_and_diagnostic_only_equations():
     assert r"\frac{\displaystyle\sum_{g \in i}" in report
     assert r"c_{ij} = \max" in report
     assert "Population-weighted access inequality" in report
-    assert "included in $w_i$ whenever that coefficient is positive" in report
-    assert "$w_i$" in report and "$c_{ij}$" in report
+    assert "Applied siting coefficient for environment burden: 0.000" in report
+    assert "NDBI" not in report and "Broadband albedo proxy" not in report
+    assert "w_i = P_i" in report and "$c_{ij}$" in report
     assert "Vulnerability preprocessing and robustness" in report
     assert "minimum rank correlation was 0.900" in report
     assert "poverty_rate had 1 missing tract" in report
@@ -46,3 +49,8 @@ def test_report_explains_active_and_diagnostic_only_equations():
     assert "Efficiency–Equity Trade-off" in report
     for corrupted_lead in ("\u00e2", "\u00ce", "\u00c2", "\ufffd"):
         assert corrupted_lead not in report
+
+    no_environment = render_report(task, solution.model_copy(update={"weights_used": None}), [], [],
+                                   model_context={"built_environment": {"status": "unavailable"}})
+    assert "4.5 Built-environment diagnostics" not in no_environment
+    assert "Population-weighted heat exposure" not in no_environment

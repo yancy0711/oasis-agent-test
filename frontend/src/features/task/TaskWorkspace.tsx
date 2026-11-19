@@ -1,16 +1,21 @@
+import { useWorkspacePreferences } from "../../app/WorkspacePreferences";
 import { useCallback, useRef, useState, type FormEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
-import type { PlaceResolveResponse, RouteOriginCandidate, RoutingMode, TaskSpec } from "../../api/models";
+import type { DemandUpload, PlaceResolveResponse, RouteOriginCandidate, RoutingMode, TaskSpec } from "../../api/models";
 import type { RequestDisposition } from "../../api/models";
-import { getConfig, reverseRouteOrigin, searchRouteOrigin } from "../../api/client";
+import { getConfig, getRegionalCensus, getStudyBoundary, getStudyInputLayers, reverseRouteOrigin, searchRouteOrigin } from "../../api/client";
 import { configKeys } from "../../api/queryKeys";
+import { Workbench, type WorkspaceTab } from "../../app/Workbench";
+import { WorkspaceIcon } from "../../app/WorkspaceIcon";
 import { useAppStore } from "../../store/appStore";
 import { useStartRun, useStopActiveRun } from "../run/run.mutations";
-import { isTerminalRun } from "../run/run.selectors";
+import { isTerminalRun, visibleResult } from "../run/run.selectors";
 import { useRunPolling } from "../run/useRunPolling";
 import { PlaceConfirmation } from "./PlaceConfirmation";
 import { PromptInput } from "./PromptInput";
 import { LlmSettings } from "./LlmSettings";
+import { CandidateUpload } from "./CandidateUpload";
+import { RegionalDataUpload, type DemandUploadHandle } from "./RegionalData";
 import { TaskForm, type ValueProfile } from "./TaskForm";
 import { taskFromDraft, toTaskSpec } from "./taskForm.mapper";
 import type { TaskFormValues } from "./taskForm.schema";
@@ -24,8 +29,14 @@ import {
 import { ResidentWorkspace, type ResidentRequest } from "../resident/ResidentWorkspace";
 import { residentPost, type Interpretation, type Preferences } from "../resident/residentApi";
 
+const regionalDataHelp = "Check the regional population layer in Data or upload demand polygons.";
+const placeKey = (place: string) => place.normalize("NFKC").toLowerCase().replace(/[\s,，]+/g, "");
+
 export function TaskWorkspace() {
+  const { t } = useWorkspacePreferences();
   const audience = useAppStore((state) => state.audience);
+  const [tab, setTab] = useState<WorkspaceTab>("Data");
+  const showResults = useCallback(() => setTab("Results"), []);
   const setAudience = useAppStore((state) => state.setAudience);
   const [residentRequest, setResidentRequest] = useState<ResidentRequest | null>(null);
   const [residentBusy, setResidentBusy] = useState(false);
@@ -47,13 +58,22 @@ export function TaskWorkspace() {
   const [selectedRouteOriginId, setSelectedRouteOriginId] = useState<string | null>(null);
   const [routeOriginCandidates, setRouteOriginCandidates] = useState<RouteOriginCandidate[]>([]);
   const [placeNameOptions, setPlaceNameOptions] = useState<string[]>([]);
-  const [uploadedName, setUploadedName] = useState<string | null>(null);
+  const [demandUpload, setDemandUpload] = useState<DemandUpload | null>(null);
+  const [candidateCrs, setCandidateCrs] = useState("4326");
+  const [candidateEpsg, setCandidateEpsg] = useState("");
+  const [candidateCrsError, setCandidateCrsError] = useState("");
+  const candidateSourceCrs = candidateCrs === "custom" ? candidateEpsg : candidateCrs;
+  const demandControl = useRef<DemandUploadHandle>(null);
   const [decision, setDecision] = useState<{ disposition: RequestDisposition; reason: string; alternative: string } | null>(null);
   const [draftLocked, setDraftLocked] = useState(false);
+  const [candidateChangedForRun, setCandidateChangedForRun] = useState<string | null>(null);
   const [routeStepOpen, setRouteStepOpen] = useState(true);
   const parseController = useRef<AbortController | null>(null);
   const confirmedPlace = useAppStore((state) => state.confirmedPlace);
   const candidateUploadId = useAppStore((state) => state.candidateUploadId);
+  const storedUploadName = useAppStore((state) => state.candidateUploadName);
+  const uploadedName = candidateUploadId ? storedUploadName ?? t("Candidate CSV") : null;
+  const uploadedPointCount = useAppStore((state) => state.uploadedPoints.length);
   const activeRunId = useAppStore((state) => state.activeRunId);
   const setConfirmedPlace = useAppStore((state) => state.setConfirmedPlace);
   const setCandidateUploadId = useAppStore((state) => state.setCandidateUploadId);
@@ -69,6 +89,37 @@ export function TaskWorkspace() {
     activeRunId && (!activeRunQuery.data || !isTerminalRun(activeRunQuery.data))
   );
   const configQuery = useQuery({ queryKey: configKeys.detail, queryFn: getConfig, staleTime: Infinity });
+  const selectedDemand = demandUpload?.upload_id === task?.demand_upload_id ? demandUpload : null;
+  const regionalPlace = confirmedPlace && /^(hk|sz):/.test(confirmedPlace.candidate_id) ? confirmedPlace.canonical_name : null;
+  const regionalQuery = useQuery({
+    queryKey: ["regional-census", regionalPlace],
+    queryFn: ({ signal }) => getRegionalCensus(regionalPlace!, signal),
+    enabled: Boolean(regionalPlace && !selectedDemand),
+    retry: false,
+    staleTime: Infinity,
+  });
+  const regionalData = selectedDemand ?? regionalQuery.data;
+  const boundaryQuery = useQuery({
+    queryKey: ["regional-boundary", regionalPlace],
+    queryFn: ({ signal }) => getStudyBoundary(regionalPlace!, signal),
+    enabled: Boolean(regionalPlace && !selectedDemand),
+    retry: false,
+    staleTime: Infinity,
+  });
+  const snapshot = activeRunQuery.data;
+  const resultMap = visibleResult(snapshot)?.artifacts?.map;
+  const matchingArea = Boolean(snapshot && (!task ||
+    (snapshot.task.place_name === task.place_name && (snapshot.task.demand_upload_id ?? null) === (task.demand_upload_id ?? null))));
+  const matchingRun = matchingArea && snapshot?.run_id !== candidateChangedForRun;
+  const finished = isTerminalRun(snapshot);
+  const liveInputs = useQuery({
+    queryKey: ["study-inputs", activeRunId, finished],
+    queryFn: ({ signal }) => getStudyInputLayers(activeRunId!, signal),
+    enabled: Boolean(activeRunId && matchingArea && !resultMap),
+    refetchInterval: finished ? false : 2400,
+    placeholderData: (previous, query) => query?.queryKey[1] === activeRunId ? previous : undefined,
+    retry: false,
+  });
 
   const profiles: ValueProfile[] = Object.entries(configQuery.data?.value_profiles ?? {}).flatMap(([name, raw]) => {
     if (!raw || typeof raw !== "object") return [];
@@ -82,7 +133,7 @@ export function TaskWorkspace() {
 
   const parseError = parseMutation.error instanceof DOMException && parseMutation.error.name === "AbortError"
     ? null : parseMutation.error;
-  const error = parseError ?? resolveMutation.error ?? confirmMutation.error
+  const error = parseError ?? confirmMutation.error
     ?? uploadMutation.error ?? startMutation.error;
 
   async function resolve(name: string, signal?: AbortSignal) {
@@ -91,21 +142,15 @@ export function TaskWorkspace() {
       if (signal?.aborted) return null;
       setResolution(value);
       return value;
-    } catch (reason) {
+    } catch {
       if (signal?.aborted) return null;
-      const message = reason instanceof Error ? reason.message : String(reason);
-      if (message.includes("outside the United States") || message.includes("supports US city and county")) {
-        resolveMutation.reset();
-        setTask(null);
-        setResolution(null);
-        setDecision({
-          disposition: "out_of_scope",
-          reason: message,
-          alternative: "Choose a city or county in the United States.",
-        });
-        return null;
-      }
-      throw reason;
+      setResolution(null);
+      setDecision({
+        disposition: "needs_clarification",
+        reason: `An automatic study boundary is unavailable for ${name}.`,
+        alternative: t(regionalDataHelp),
+      });
+      return null;
     }
   }
 
@@ -129,17 +174,34 @@ export function TaskWorkspace() {
       };
       setRouteOriginCandidates(parsed.route_origin_candidates ?? []);
       setPlaceNameOptions(parsed.place_name_options ?? []);
-      if (!parsed.task) { setDecision(parsedDecision); setTask(null); return; }
+      if (!parsed.task) {
+        setDecision(parsedDecision);
+        setTask(null);
+        setTab((current) => current === "Setup" ? "Data" : current);
+        return;
+      }
       const nextTask = taskFromDraft(parsed.task);
       setTask(nextTask);
-      if (nextTask.place_name && !(parsed.route_origin_candidates?.length) && !(parsed.place_name_options?.length)) {
+      setTab("Setup");
+      const needsLocationChoice = Boolean(parsed.route_origin_candidates?.length || parsed.place_name_options?.length);
+      if (demandUpload && !needsLocationChoice &&
+          (placeKey(nextTask.place_name) === placeKey(demandUpload.place_name) ||
+           (!nextTask.place_name && selectedDemand))) {
+        confirmDemand(demandUpload, false);
+        setDecision({ ...parsedDecision, disposition: "full_analysis",
+          reason: t("The confirmed upload supplies the study boundary and population."), alternative: "" });
+      } else if (nextTask.place_name && !needsLocationChoice) {
         setDecision({
           disposition: "needs_clarification",
-          reason: "Checking that the study area is a supported US city or county.",
+          reason: t("Checking the study boundary and available data sources."),
           alternative: "",
         });
         const resolved = await resolve(nextTask.place_name, controller.signal);
         if (controller.signal.aborted) return;
+        if (resolved?.selected && !resolved.ambiguous && demandUpload &&
+            placeKey(resolved.selected.canonical_name) === placeKey(demandUpload.place_name)) {
+          confirmDemand(demandUpload, false);
+        }
         if (resolved) setDecision(parsedDecision);
       } else setDecision(parsedDecision);
     } catch (reason) {
@@ -244,8 +306,36 @@ export function TaskWorkspace() {
       resolutionId: target.resolution_id,
       candidateId,
     });
+    if (demandUpload && placeKey(place.canonical_name) === placeKey(demandUpload.place_name)) {
+      confirmDemand(demandUpload, false);
+      return;
+    }
     setConfirmedPlace(place);
-    setTask((current) => current ? { ...current, place_name: place.canonical_name } : current);
+    setTask((current) => current ? {
+      ...current, place_name: place.canonical_name,
+      demand_upload_id: current.place_name === place.canonical_name ? current.demand_upload_id : null,
+    } : current);
+  }
+
+  function confirmDemand(data: DemandUpload, showData = true) {
+    setDemandUpload(data);
+    setResolution(null);
+    setPlaceNameOptions([]);
+    setConfirmedPlace({
+      candidate_id: `demand:${data.upload_id}`, canonical_name: data.place_name,
+      display_name: data.place_name, place_type: "uploaded", label: data.place_name, query: data.place_name,
+    });
+    setTask((current) => {
+      const draft = current ?? taskFromDraft({});
+      return { ...draft, place_name: data.place_name, place_names: [data.place_name], demand_upload_id: data.upload_id,
+        ambiguities: draft.ambiguities?.filter((item) => item.field !== "place_names") };
+    });
+    resolveMutation.reset();
+    if (showData) {
+      setIntentError("");
+      setDecision({ disposition: "full_analysis", reason: t("The confirmed upload supplies the study boundary and population."), alternative: "" });
+      setTab("Data");
+    }
   }
 
   async function confirm(candidateId: string) {
@@ -257,7 +347,7 @@ export function TaskWorkspace() {
     setConfirmedPlace(null);
     setResolution(null);
     setTask((current) => current ? {
-      ...current, place_name: placeName, place_names: [placeName], ambiguities: remainingAmbiguities,
+      ...current, place_name: placeName, place_names: [placeName], ambiguities: remainingAmbiguities, demand_upload_id: null,
     } : current);
     setPlaceNameOptions([]);
     setDecision({
@@ -359,6 +449,7 @@ export function TaskWorkspace() {
             notes: "Browser location supplied by the user.",
           }));
           setRouteOriginCandidates(result.candidates);
+          setTab("Setup");
           setDecision({
             disposition: "needs_clarification",
             reason: result.message,
@@ -411,14 +502,51 @@ export function TaskWorkspace() {
     }
   }
 
-  async function upload(file: File) {
-    const result = await uploadMutation.mutateAsync(file);
-    setUploadedName(result.filename);
-    setCandidateUploadId(result.upload_id);
+  async function upload(file: File, sourceCrs = "4326") {
+    if (sourceCrs !== "gcj02" && !/^[1-9]\d*$/.test(sourceCrs)) {
+      setCandidateCrsError(t("Enter a valid EPSG code for candidate coordinates."));
+      return;
+    }
+    setCandidateCrsError("");
+    try {
+      const result = await uploadMutation.mutateAsync({ file, sourceCrs });
+      setCandidateUploadId(result.upload_id, result.preview_points, result.filename);
+      if (result.preview_points?.length && snapshot?.task.candidate_source === "csv") setCandidateChangedForRun(snapshot.run_id);
+    } catch {
+      // The mutation exposes the upload failure in the assistant and the Data tab.
+    }
+  }
+
+  function removeCandidateUpload() {
+    setCandidateUploadId(null);
+    setCandidateChangedForRun(null);
+    setTask((current) => current?.candidate_source === "csv" ? { ...current, candidate_source: "osm" } : current);
+    uploadMutation.reset();
+    setCandidateCrsError("");
+  }
+
+  function removeDemandUpload() {
+    if (!selectedDemand) return;
+    setDemandUpload(null);
+    setConfirmedPlace(null);
+    setTask((current) => current ? { ...current, demand_upload_id: null } : current);
+    setDecision(null);
+    void resolve(selectedDemand.place_name).catch(() => undefined);
   }
 
   function run(values: TaskFormValues) {
     if (!task || !confirmedPlace || interpreting) return;
+    if (regionalPlace && !selectedDemand && !regionalQuery.data) {
+      setIntentError(t(regionalDataHelp));
+      setTab("Data");
+      return;
+    }
+    if (configQuery.data?.utci_configured === false) {
+      setIntentError(t("UTCI needs a data source. See Data for setup."));
+      setTab("Data");
+      return;
+    }
+    setIntentError("");
     useAppStore.getState().interruptTask();
     setDraftLocked(true);
     const executable = toTaskSpec(task, values, confirmedPlace.canonical_name);
@@ -492,33 +620,82 @@ export function TaskWorkspace() {
     });
   }
 
-  return (
-    <div className="task-workspace">
-      <section className="panel panel--hero">
-        <p className="eyebrow">Policy and research decision support</p>
-        <h1>OASIS: A bounded LLM agent for auditable, equity-aware cooling center siting</h1>
-        {configQuery.isError && <div className="error error--block" role="alert"><p>Cannot reach the application backend. {configQuery.error.message}</p><button type="button" className="button--secondary" disabled={configQuery.isFetching} onClick={() => void configQuery.refetch()}>Retry connection</button></div>}
-        <LlmSettings defaults={configQuery.data?.agent as Record<string, unknown> | undefined} />
-          <PromptInput audience={audience} autoDetect={autoDetect} onAutoDetectChange={setAutoDetect} pending={interpreting || (audience === "personal" ? residentBusy : parseMutation.isPending)}
+  return <Workbench activeTab={tab} onTabChange={setTab} onResult={showResults} place={task?.place_name} taskPending={interpreting || parseMutation.isPending}
+    connection={configQuery.isError ? "unavailable" : configQuery.isSuccess ? "connected" : "connecting"}
+    utciConfigured={configQuery.data?.utci_configured ?? configQuery.data?.sf_utci_configured}
+    inputLayers={{
+      boundary: (matchingArea ? liveInputs.data?.boundary : undefined) ?? selectedDemand?.boundary ?? confirmedPlace?.boundary ?? boundaryQuery.data,
+      tract: (matchingArea ? liveInputs.data?.tract : undefined) ?? regionalData?.geometry,
+      candidate: matchingRun ? liveInputs.data?.candidate : undefined,
+    }}
+    uploadedRun={matchingRun && snapshot?.task.candidate_source === "csv"}
+    previewDraft={Boolean(snapshot && !matchingRun)}
+    populationLayer={regionalData ? <div>
+      {selectedDemand ? <span>{selectedDemand.filename}</span> : regionalQuery.data && <>
+        <a href={regionalQuery.data.source_url} target="_blank" rel="noreferrer">{regionalQuery.data.source}</a>
+        <small>{regionalQuery.data.notes}</small>
+        <a href={`/api/v1/regional-data/download?place_name=${encodeURIComponent(regionalQuery.data.place_name)}`} download>{t("Download demand GeoJSON")}</a>
+        <br />
+        <a href={`/api/v1/regional-data/download?layer=boundary&place_name=${encodeURIComponent(regionalQuery.data.place_name)}`} download>{t("Download study boundary")}</a>
+      </>}
+      <small>{regionalData.units} {t("demand zones")}{regionalData.year ? ` · ${regionalData.year}` : ""}</small>
+      <small>{(selectedDemand ? selectedDemand.fields.older : regionalQuery.data?.older_units) ? t("Total population and age 65+") : t("Total population only")}</small>
+      <small>{t("Poverty and household vehicle availability are unavailable for this layer.")}</small>
+    </div> : regionalPlace ? <div>
+      <small>{t(regionalQuery.isFetching ? "Checking regional population and boundaries…" : regionalDataHelp)}</small>
+      <a href={`/api/v1/regional-data/download?layer=boundary&place_name=${encodeURIComponent(regionalPlace)}`} download>{t("Download study boundary")}</a>
+      {regionalQuery.error && <><small role="alert">{regionalQuery.error.message}</small>
+        <button type="button" className="button--secondary" onClick={() => void regionalQuery.refetch()}>{t("Retry data check")}</button></>}
+    </div> : undefined}
+    settings={<LlmSettings defaults={configQuery.data?.agent as Record<string, unknown> | undefined} />}
+    onUpload={(file) => void upload(file, candidateSourceCrs)}
+    onDemandDrop={(file) => demandControl.current?.openFile(file)}
+    uploadPending={uploadMutation.isPending}
+    upload={<section className="workbench-upload-card">
+      <h3><WorkspaceIcon name="upload" />{t("Use your own data")}</h3>
+      <CandidateUpload pending={uploadMutation.isPending} uploadedName={uploadedName} onUpload={(file) => void upload(file, candidateSourceCrs)} onRemove={removeCandidateUpload} />
+      <details className="workbench-disclosure candidate-coordinates">
+        <summary>{t("Candidate coordinates")} · {candidateSourceCrs === "4326" ? "WGS84" : candidateSourceCrs === "gcj02" ? "GCJ-02" : `EPSG:${candidateSourceCrs}`}</summary>
+        <select aria-label={t("Candidate coordinates")} value={candidateCrs} onChange={(event) => setCandidateCrs(event.target.value)} disabled={uploadMutation.isPending}>
+          <option value="4326">WGS84 (EPSG:4326)</option>
+          <option value="4490">CGCS2000 (EPSG:4490)</option>
+          <option value="2326">Hong Kong 1980 Grid (EPSG:2326)</option>
+          <option value="gcj02">{t("GCJ-02 (mainland China, approximate conversion)")}</option>
+          <option value="custom">{t("Other EPSG code")}</option>
+        </select>
+        {candidateCrs === "custom" && <label className="field"><span>{t("Input EPSG code")}</span>
+        <input type="number" min={1} value={candidateEpsg} onChange={(event) => setCandidateEpsg(event.target.value)} />
+        </label>}
+      </details>
+      {uploadMutation.isError && <p className="error" role="alert">{uploadMutation.error.message}</p>}
+      {candidateCrsError && <p className="error" role="alert">{candidateCrsError}</p>}
+      <RegionalDataUpload ref={demandControl} place={task?.place_name} active={selectedDemand}
+        onConfirm={confirmDemand} onRemove={removeDemandUpload} />
+    </section>}
+    chat={(runActivity, showUpload) =>
+        <PromptInput audience={audience} autoDetect={autoDetect} onAutoDetectChange={setAutoDetect} pending={interpreting || (audience === "personal" ? residentBusy : parseMutation.isPending)}
           onSubmit={(prompt) => void submitPrompt(prompt)}
           onAudienceChange={(next) => void changeAudience(next)}
           onCancel={() => { void interruptWork().catch((reason: unknown) => setIntentError(reason instanceof Error ? reason.message : "Could not stop the previous task.")); }}
-          onUseLocation={() => void handleUseLocation()} />
-        {intentMessage && <p role="status" className="notice">{intentMessage}</p>}
-        {intentError && <p role="alert" className="error">{intentError}</p>}
-        {audience === "research" && decision && <div className={`request-decision request-decision--${decision.disposition}`} role="status"><strong>{decision.disposition.replaceAll("_", " ")}</strong><span>{decision.reason}</span>{decision.alternative && <span>{decision.alternative}</span>}</div>}
-        {audience === "research" && error && <p className="error error--block">{error instanceof Error ? error.message : "The request failed."}</p>}
-      </section>
-
-      {audience === "personal" && <ResidentWorkspace request={residentRequest} cancelVersion={residentCancel} onBusy={setResidentBusy} onPreferencesChange={rememberPreferences} onCancelReady={rememberResidentStop} />}
-      {audience === "research" && <>
+          onUseLocation={() => void handleUseLocation()} onShowUpload={showUpload} hasActiveRun={Boolean(activeRunId)}
+          activity={<div className="workbench-chat__activity">
+            {configQuery.isError && <div className="error error--block" role="alert"><p>Cannot reach the application backend. {configQuery.error.message}</p><button type="button" className="button--secondary" disabled={configQuery.isFetching} onClick={() => void configQuery.refetch()}>Retry connection</button></div>}
+            {intentMessage && <p role="status" className="notice">{intentMessage}</p>}
+            {intentError && <p role="alert" className="error">{intentError}</p>}
+            {audience === "research" && decision && <div className={`request-decision request-decision--${decision.disposition}`} role="status"><strong>{decision.disposition.replaceAll("_", " ")}</strong><span>{decision.reason}</span>{decision.alternative && <span>{decision.alternative}</span>}</div>}
+            {audience === "research" && error && <p className="error error--block" role="alert">{error instanceof Error ? error.message : "The request failed."}</p>}
+            {runActivity}
+          </div>}
+        />}
+    resident={audience === "personal" ? <ResidentWorkspace request={residentRequest} cancelVersion={residentCancel} onBusy={setResidentBusy} onPreferencesChange={rememberPreferences} onCancelReady={rememberResidentStop} /> : null}
+    setup={task || resolution ? <div className="task-workspace">
       {task && routeOriginCandidates.length > 0 && (
         <details className="panel mobile-step-panel" data-study-area-step open={routeStepOpen} onToggle={(event) => setRouteStepOpen(event.currentTarget.open)}>
           <summary>
           <div className="section-heading">
             <div>
               <p className="step-heading"><span className="form-step">Step 2</span><span>Route origin</span></p>
-              <h2>Confirm the intended location</h2>
+              <h2>{t("Confirm the intended location")}</h2>
             </div>
             <span className={`status ${confirmedPlace ? "status--success" : "status--warning"}`}>
               {confirmedPlace ? "Origin selected" : "Confirmation required"}
@@ -550,10 +727,10 @@ export function TaskWorkspace() {
         <section className="panel" data-study-area-step>
           <div className="section-heading">
             <div>
-              <p className="step-heading"><span className="form-step">Step 2</span><span>Study area</span></p>
-              <h2>Choose one area for this run</h2>
+              <p className="step-heading"><span className="form-step">Step 2</span><span>{t("Study area")}</span></p>
+              <h2>{t("Choose one area for this run")}</h2>
             </div>
-            <span className="status status--warning">Confirmation required</span>
+            <span className="status status--warning">{t("Confirmation required")}</span>
           </div>
           <p className="muted">Each area needs its own boundary, data lineage, travel matrix, and result. Saved runs can be compared afterward.</p>
           <div className="candidate-list">
@@ -569,9 +746,9 @@ export function TaskWorkspace() {
 
       {task && !task.place_name && routeOriginCandidates.length === 0 && placeNameOptions.length === 0 && (
         <form className="panel inline-form" data-study-area-step onSubmit={submitManualPlace}>
-          <label htmlFor="manual-place">The request needs a US city or county</label>
+          <label htmlFor="manual-place">{t("Enter a study area")}</label>
           <input id="manual-place" value={manualPlace} onChange={(event) => setManualPlace(event.target.value)} />
-          <button type="submit" disabled={resolveMutation.isPending}>Resolve place</button>
+          <button type="submit" disabled={resolveMutation.isPending}>{t("Resolve place")}</button>
         </form>
       )}
 
@@ -583,6 +760,18 @@ export function TaskWorkspace() {
           onConfirm={(candidateId) => void confirm(candidateId)}
         />
       )}
+      {task?.place_name && !confirmedPlace && resolveMutation.isError && (
+        <div className="panel">
+          <p>{t("If an automatic study layer is unavailable, confirm your own boundary and population with a demand GeoJSON.")}</p>
+          <button type="button" className="button--secondary" onClick={() => setTab("Data")}>{t("Upload demand data")}</button>
+        </div>
+      )}
+      {regionalPlace && !selectedDemand && regionalQuery.isError && (
+        <div className="notice">
+          <p>{t(regionalDataHelp)}</p>
+          <button type="button" className="button--secondary" onClick={() => setTab("Data")}>{t("Upload demand data")}</button>
+        </div>
+      )}
 
       {task && (
         <TaskForm
@@ -592,14 +781,15 @@ export function TaskWorkspace() {
           pending={startMutation.isPending || interpreting}
           uploadPending={uploadMutation.isPending}
           uploadedName={uploadedName}
+          candidateUploadId={uploadedPointCount > 0 ? candidateUploadId : null}
           profiles={profiles}
           onResolveAmbiguity={resolveAmbiguity}
           onModeChange={setMode}
-          onUpload={(file) => void upload(file)}
+          onUpload={(file) => void upload(file, candidateSourceCrs)}
+          onRemoveUpload={removeCandidateUpload}
           onSubmit={run}
         />
       )}
-      </>}
-    </div>
-  );
+    </div> : null}
+  />;
 }

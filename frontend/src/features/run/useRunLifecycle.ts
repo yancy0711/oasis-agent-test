@@ -9,6 +9,8 @@ function mobilitySignature(snapshot: RunSnapshot): string {
     intervention: task.intervention,
     analysis_goal: task.analysis_goal,
     candidate_source: task.candidate_source,
+    ...(task.demand_upload_id ? { demand_upload_id: task.demand_upload_id } : {}),
+    ...(task.heat_metric === "utci" ? { heat_metric: "utci" } : {}),
     n_facilities: task.n_facilities,
     threshold_minutes: task.threshold_minutes,
     coverage_target: task.coverage_target,

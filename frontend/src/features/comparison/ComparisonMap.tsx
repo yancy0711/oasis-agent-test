@@ -3,6 +3,7 @@ import type { FeatureCollection } from "geojson";
 import maplibregl, { type CircleLayerSpecification, type FillLayerSpecification, type LineLayerSpecification, type Map as MapLibreMap } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { useBasemapStyle } from "../result/useBasemapStyle";
+import { useMapTheme } from "../result/useMapTheme";
 import { HEAT_COLORS } from "../result/mapConfig";
 import { popupContent } from "../result/mapPopup";
 
@@ -52,6 +53,8 @@ export function ComparisonMap({ url, baselineUrl, alternativeUrl, baselineLabel,
   const baseMapStyle = useBasemapStyle();
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
+  const [mapReady, setMapReady] = useState(false);
+  useMapTheme(mapRef, mapReady);
   const [datasets, setDatasets] = useState<ComparisonDataset[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -98,6 +101,7 @@ export function ComparisonMap({ url, baselineUrl, alternativeUrl, baselineLabel,
     let pinned = false;
 
     map.on("load", () => {
+      setMapReady(true);
       const range = base.metadata.value_range;
       const min = range?.[0] ?? 0;
       const max = range?.[1] && range[1] > min ? range[1] : min + 1;
@@ -134,7 +138,7 @@ export function ComparisonMap({ url, baselineUrl, alternativeUrl, baselineLabel,
         if (features[0]) showPopup({ ...event, features: [features[0]] }, true);
       });
     });
-    return () => { resizeObserver.disconnect(); popup?.remove(); map.remove(); mapRef.current = null; };
+    return () => { resizeObserver.disconnect(); popup?.remove(); map.remove(); mapRef.current = null; setMapReady(false); };
   }, [datasets, baselineLabel, alternativeLabel, baseMapStyle]);
 
   if (error) return <p className="error error--block">{error}</p>;

@@ -7,6 +7,65 @@ from typing import Any
 from oasis.contracts.domain import ParetoPoint, Provenance, ResultNarrative, SiteSolution, TaskSpec
 
 
+def thermal_methodology(thermal: dict, metric: str) -> str:
+    """Document the provider index and OASIS spatial/temporal processing."""
+    layer = (thermal.get("thermal_layers") or {}).get("utci")
+    if not layer:
+        return ""
+    role = (
+        "UTCI is the confirmed tract heat input. Its contribution to the site-selection objective "
+        "depends on the applied heat coefficient and the variation across tracts. "
+        "It can also affect vulnerability-priority classifications when the relevant scheme includes heat."
+        if metric == "utci" else
+        "UTCI is displayed for comparison only. The run retains its configured Landsat heat input."
+    )
+    return rf"""
+{role}
+
+**Universal Thermal Climate Index.** UTCI is the reference-environment air temperature
+that produces the same modeled physiological response as the outdoor conditions. The
+operational procedure uses a sixth-degree approximation to the thermophysiological model:
+
+$$
+\mathrm{{UTCI}}_{{c,h}} = T_a + P_6(T_a,\,v_{{10}},\,T_{{\mathrm{{mrt}}}}-T_a,\,p_a).
+$$
+
+$T_a$ is 2 m air temperature (°C), $v_{{10}}$ is 10 m wind speed (m/s),
+$T_{{\mathrm{{mrt}}}}$ is mean radiant temperature (°C), and $p_a$ is water-vapor
+pressure (kPa), given by $p_a = \mathrm{{RH}}\,e_s(T_a)/100$ when relative humidity
+$\mathrm{{RH}}$ is in percent and $e_s(T_a)$ is saturation vapor pressure.
+$P_6$ is the published UTCI offset polynomial. ERA5 provides 2 m air and dew-point
+temperatures, 10 m wind components, and surface shortwave and longwave radiation.
+Vapor pressure is derived from dew point, wind speed from the horizontal components,
+and mean radiant temperature from the radiation and solar geometry. ERA5-HEAT
+publishes the derived mean radiant temperature and hourly UTCI. OASIS reads the
+provider's hourly UTCI and converts Kelvin to Celsius by subtracting 273.15.
+
+**Tract assignment and temporal aggregation.** For each tract $i$, $c(i)$ is the nearest
+native grid center to a point inside the tract. Let $H_d$ be the hours of
+day $d$ in the aggregation time zone ({layer.get('timezone', 'America/Los_Angeles')}) and $D$ the
+set of days in the period. The tract heat input is
+
+$$
+M_{{c,d}} = \max_{{h \in H_d}}\;\mathrm{{UTCI}}_{{c,h}}, \qquad
+E_i = \frac{{1}}{{|D|}} \sum_{{d \in D}} M_{{c(i),d}}.
+$$
+
+Period: {layer['start_date']} to {layer['end_date']} inclusive. Native grid:
+{layer['resolution']}. Source cells represented: {layer.get('source_cells', 'not recorded')}.
+All expected hours and tract cells must be finite. Tracts assigned to the same cell
+share the same value. The native grid limits the interpretation to regional exposure.
+No street shade, microclimate, or individual heat response is inferred at tract or route level.
+A constant tract field supplies no spatial heat contrast after normalization. The UTCI
+hourly climatology and clear-sky Landsat overpass composite represent different
+physical quantities and observation times, even when their study dates match.
+
+Sources: [Bröde et al. (2012), operational UTCI procedure](https://doi.org/10.1007/s00484-011-0454-1);
+[Di Napoli et al. (2021), ERA5-HEAT methodology](https://doi.org/10.1002/gdj3.102);
+[Copernicus / ECMWF data](https://doi.org/10.24381/cds.553b7518).
+""".strip()
+
+
 def _method_section(
     task: TaskSpec,
     solution: SiteSolution,
@@ -14,20 +73,21 @@ def _method_section(
 ) -> str:
     weights = solution.weights_used.normalized().model_dump() if solution.weights_used else None
     if weights:
-        weight_text = ", ".join(f"{name}={value:.3f}" for name, value in weights.items())
+        terms = {
+            "population_density": r"\beta_{\mathrm{pop}}",
+            "elderly_ratio": r"\beta_{\mathrm{old}}z(\mathrm{old}_i)",
+            "poverty_rate": r"\beta_{\mathrm{pov}}z(\mathrm{poverty}_i)",
+            "heat_exposure": r"\beta_{\mathrm{heat}}z(E_i)",
+            "environment_burden": r"\beta_{\mathrm{env}}z(B_i)",
+        }
+        weight_text = ", ".join(f"{name}={value:.3f}" for name, value in weights.items() if value > 0)
+        formula = " + ".join(term for name, term in terms.items() if weights[name] > 0)
         demand_formula = (
-            "The requested value profile formed each tract's demand weight as:\n\n"
-            "$$\n"
-            r"w_i = P_i \left[\beta_{\mathrm{pop}}"
-            r" + \beta_{\mathrm{old}}z(\mathrm{old}_i)"
-            r" + \beta_{\mathrm{pov}}z(\mathrm{poverty}_i)"
-            r" + \beta_{\mathrm{heat}}z(E_i)"
-            r" + \beta_{\mathrm{env}}z(B_i)\right]"
-            "\n$$\n\n"
+            "The evaluated inputs formed each demand zone's weight as:\n\n"
+            f"$$\nw_i = P_i \\left[{formula}\\right]\n$$\n\n"
             f"Applied normalized coefficients: `{weight_text}`. Here `z(.)` is min-max "
-            "normalization over retained tracts. $B_i$ is the passive built-environment burden. The public `population_density` coefficient "
-            "is retained for compatibility but acts as the unmodified population baseline; "
-            "density is not multiplied twice."
+            "normalization over retained demand zones. The `population_density` coefficient "
+            "weights the population baseline."
         )
     else:
         demand_formula = (
@@ -37,6 +97,8 @@ def _method_section(
             "\n$$\n\n"
             "No demographic value-profile coefficient altered the selected solution."
         )
+    if omitted := context.get("omitted_objective_indicators"):
+        demand_formula += "\n\nRequested weights excluded for absent or spatially constant inputs: " + ", ".join(omitted) + "."
     capacity_active = bool(solution.facility_capacities)
     capacity_text = (
         "Capacity constraints were active using observed/user-confirmed people capacities."
@@ -45,7 +107,6 @@ def _method_section(
         "OSM footprint and floor-area fields remain relative diagnostics and were not converted into people."
     )
     environment = context.get("built_environment", {})
-    environment_status = environment.get("status", "not run")
     environment_weight = weights.get("environment_burden", 0.0) if weights else 0.0
     vulnerability = context.get("vulnerability", {})
     sensitivity = vulnerability.get("weight_sensitivity", {})
@@ -78,7 +139,8 @@ def _method_section(
             f"{item['indicators']} ($r_s={item['correlation']:.3f}$)"
             for item in within_pairs[:3]
         ) + "."
-        if within_pairs else " No vulnerability-input pair exceeded the configured correlation warning threshold."
+        if within_pairs else (" No vulnerability-input pair exceeded the configured correlation warning threshold."
+                             if vulnerability.get("correlation") else "")
     )
     vifs = [item for item in vulnerability.get("vif", []) if item.get("vif") is not None]
     vif_text = (
@@ -95,7 +157,7 @@ def _method_section(
     )
     diagnostic_pairs = vulnerability.get("diagnostic_correlation", {}).get("strongest_pairs", [])
     diagnostic_text = (
-        " The strongest pairwise-complete relationship across vulnerability, temperature, and built-environment diagnostics was "
+        " The strongest pairwise-complete relationship among observed diagnostic variables was "
         f"{diagnostic_pairs[0]['features']} ($r_s={diagnostic_pairs[0]['correlation']:.3f}$; "
         f"{diagnostic_pairs[0]['paired_tracts']} paired tracts). This is an association, not a causal effect."
         if diagnostic_pairs else ""
@@ -103,20 +165,19 @@ def _method_section(
     vulnerability_text = (
         f"The active `{vulnerability.get('active_scheme')}` scheme used "
         f"`{vulnerability.get('normalization')}` normalization and defined priority as "
-        f"{vulnerability.get('priority_definition')}. The run audited missingness, "
-        "indicator direction, Spearman correlation, VIF, PCA, and alternative weighting schemes. "
+        f"{vulnerability.get('priority_definition')}. "
         + (f"Across tested schemes, the minimum rank correlation was {minimum_rank:.3f} "
            f"and minimum priority-tract Jaccard overlap was {minimum_jaccard:.3f}. "
            if minimum_rank is not None and minimum_jaccard is not None else "")
         + missing_text + within_pair_text + vif_text + pca_text + diagnostic_text
-        + " PCA loadings are a covariance diagnostic, not evidence of causal or normative importance."
-        if vulnerability else
+        + (" PCA loadings describe covariance." if pca_ratios else "")
+        if vulnerability.get("status", "ready" if vulnerability else None) == "ready" else
         "No vulnerability preprocessing diagnostic was available for this run."
     )
-    return rf"""## 4. Model Equations and Variable Definitions
-
-### 4.1 Population-weighted heat exposure
-
+    if excluded := vulnerability.get("excluded_indicators"):
+        details = ", ".join(f"`{item['indicator']}` ({item['reason']})" for item in excluded)
+        vulnerability_text += f"\n\nExcluded from the composite and its diagnostics: {details}."
+    lst_method = rf"""### 4.1 Population-weighted heat exposure
 $$
 E_i =
 \frac{{\displaystyle\sum_{{g \in i}} P_g\,\mathrm{{LST}}_g}}
@@ -126,6 +187,43 @@ $$
 - $i$: Census tract; $g$: sub-tract population unit or calibrated grid cell.
 - $P_g$: population assigned to cell $g$; $\mathrm{{LST}}_g$: clear-pixel Landsat land-surface temperature.
 - Population weighting is accepted only when valid-LST cells contain at least {context.get('population_weighting_threshold', .8):.0%} of tract population; otherwise the explicitly labelled tract-mean fallback is used.
+"""
+    thermal = context.get("thermal", {})
+    heat_metric = thermal.get("heat_metric", task.heat_metric)
+    utci_method = thermal_methodology(thermal, heat_metric)
+    lst_available = "landsat_lst" in thermal.get("thermal_layers", {})
+    if heat_metric == "utci" and utci_method:
+        heat_method = "### 4.1 Outdoor thermal stress (UTCI)\n\n" + utci_method
+        if lst_available:
+            heat_method += "\nLandsat surface temperature is available as a separate map layer.\n"
+    else:
+        heat_method = lst_method if lst_available else ""
+        if utci_method:
+            heat_method += "\n### UTCI comparison layer\n\n" + utci_method
+
+    environment_method = ""
+    if measured := environment.get("available_tracts"):
+        labels = {"mean_ndvi": "NDVI", "mean_ndbi": "NDBI", "mean_albedo": "Broadband albedo proxy"}
+        equations = {
+            "mean_ndvi": r"$\mathrm{NDVI}=(\mathrm{NIR}-\mathrm{Red})/(\mathrm{NIR}+\mathrm{Red})$",
+            "mean_ndbi": r"$\mathrm{NDBI}=(\mathrm{SWIR1}-\mathrm{NIR})/(\mathrm{SWIR1}+\mathrm{NIR})$",
+            "mean_albedo": r"$0.356\,\mathrm{Blue}+0.130\,\mathrm{Red}+0.373\,\mathrm{NIR}+0.085\,\mathrm{SWIR1}+0.072\,\mathrm{SWIR2}-0.0018$",
+        }
+        lines = ["### 4.5 Built-environment diagnostics", "",
+                 *(f"- {labels[name]} in {count} demand zones. {equations[name]}." for name, count in measured.items())]
+        if components := environment.get("burden_components"):
+            terms = {"mean_ndvi": r"1-F(\mathrm{NDVI}_i)", "mean_ndbi": r"F(\mathrm{NDBI}_i)",
+                     "mean_albedo": r"1-F(\mathrm{Albedo}_i)"}
+            expression = ", ".join(terms[name] for name in components)
+            lines.extend(["", f"$$B_i = \\operatorname{{mean}}\\left[{expression}\\right]$$", "",
+                          "Each zone averages its available components using within-run percentile ranks $F$.",
+                          f"Median burden was assigned in {environment['burden_imputed_zones']} zones with no usable components."])
+        lines.extend(["", f"Applied siting coefficient for environment burden: {environment_weight:.3f}."])
+        environment_method = "\n".join(lines)
+
+    return rf"""## 4. Model Equations and Variable Definitions
+
+{heat_method}
 
 ### 4.2 Demand weights
 
@@ -171,27 +269,7 @@ $$
 - Lower $G_P$ is more equal. It is undefined when every access score is zero.
 - The displayed frontier evaluates the actual Gini. Gini-aware solutions use deterministic iterative reweighting around exact CBC assignment solves, so they are reproducible feasible solutions rather than proof of a globally optimal nonlinear-Gini frontier.
 
-### 4.5 Built-environment diagnostics
-
-$$
-\mathrm{{NDVI}} = \frac{{\mathrm{{NIR}}-\mathrm{{Red}}}}{{\mathrm{{NIR}}+\mathrm{{Red}}}},
-\qquad
-\mathrm{{NDBI}} = \frac{{\mathrm{{SWIR1}}-\mathrm{{NIR}}}}{{\mathrm{{SWIR1}}+\mathrm{{NIR}}}}
-$$
-
-$$
-\mathrm{{Albedo}}_{{\mathrm{{proxy}}}} =
-0.356\,\mathrm{{Blue}} + 0.130\,\mathrm{{Red}} + 0.373\,\mathrm{{NIR}}
-+ 0.085\,\mathrm{{SWIR1}} + 0.072\,\mathrm{{SWIR2}} - 0.0018
-$$
-
-The passive burden is calculated as:
-
-$$
-B_i = \operatorname{{mean}}\left[F(\mathrm{{NDBI}}_i),\ 1-F(\mathrm{{NDVI}}_i),\ 1-F(\mathrm{{Albedo}}_i)\right]
-$$
-
-where $F$ is the within-run percentile transform over available tracts. Built-environment status: `{environment_status}`; confirmed coefficient $\beta_{{\mathrm{{env}}}}={environment_weight:.3f}$. Thus $B_i$ is included in $w_i$ whenever that coefficient is positive. It does not directly alter $c_{{ij}}$ or the access Gini. On-demand route heat remains a post-route audit: it will enter optimization only when real route geometry is available for every demand-site pair, rather than using tract-centroid lines.
+{environment_method}
 
 ### 4.6 Vulnerability preprocessing and robustness
 
@@ -207,7 +285,8 @@ def render_report(
     model_context: dict[str, Any] | None = None,
 ) -> str:
     """Render the deterministic decision report from typed results."""
-    weights = solution.weights_used.model_dump() if solution.weights_used else "population efficiency"
+    weights = ({name: value for name, value in solution.weights_used.model_dump().items() if value > 0}
+               if solution.weights_used else "population efficiency")
     mobility = {
         "walking": "Walking", "cycling": "Cycling", "driving": "Driving",
         "walk_drive_equity": "Car-access equity: households without a car walk; others drive",
@@ -224,7 +303,10 @@ def render_report(
         f"- {item.source} ({item.tier} tier, {item.record_count} records, {item.crs}) {item.notes}"
         for item in lineage
     )
-    method = _method_section(task, solution, model_context or {})
+    model_context = model_context or {}
+    method = _method_section(task, solution, model_context)
+    vulnerability_coverage = ("not assessed" if model_context.get("vulnerability", {}).get("status") == "unavailable"
+                              else f"{solution.vulnerable_covered_ratio:.1%}")
     capacity = (
         f"{task.facility_capacity:.0f} people per facility"
         if task.facility_capacity is not None else
@@ -254,7 +336,7 @@ def render_report(
 
 - Selected candidate facilities: {', '.join(solution.selected_ids)}
 - Assigned population share: {solution.covered_ratio:.1%}
-- Composite-vulnerability priority population assigned share: {solution.vulnerable_covered_ratio:.1%}
+- Composite-vulnerability priority population assigned share: {vulnerability_coverage}
 - Population-weighted access Gini: {gini} (lower is more equal)
 - Mean gradual access score: {solution.mean_access_score:.3f}
 - Assigned population: {solution.assigned_population:.0f}; maximum capacity utilization: {utilization}
@@ -388,10 +470,13 @@ def render_heat_report(task: TaskSpec, summary: dict, lineage: list[Provenance])
                f"({stats['permutations']} permutations; {stats['islands']} tract islands).")
     hottest = "\n".join(f"- Tract {row['GEOID']}: {row['heat_exposure']:.1f} °C" for row in summary["top_tracts"])
     sources = "\n".join(f"- {item.source} ({item.tier} tier, {item.record_count} records) {item.notes}" for item in lineage)
+    thermal = thermal_methodology(summary.get("thermal", {}), task.heat_metric)
+    basis = "ERA5-HEAT outdoor UTCI on the native reanalysis grid" if task.heat_metric == "utci" else "Landsat-derived land-surface temperature aggregated to Census tracts"
     return (f"# Heat Exposure Review — {task.place_name}\n\n## Deterministic findings\n\n"
             f"- Tracts reviewed: {stats['tracts']}\n- Mean temperature: {stats['mean_c']:.1f} °C; range: {stats['minimum_c']:.1f}–{stats['maximum_c']:.1f} °C\n"
-            f"- {spatial}\n\n## Highest-exposure tracts\n\n{hottest}\n\n## Measurement basis\n\n{summary.get('evidence_basis', 'Landsat-derived tract heat exposure.')}\n\n## Data provenance and interpretation limits\n\n{sources}\n\n"
-            "> Temperatures are Landsat-derived land-surface temperature aggregated to Census tracts. Moran's I measures spatial clustering, not causation.\n")
+            f"- {spatial}\n\n## Highest-exposure tracts\n\n{hottest}\n\n## Measurement basis\n\n{summary.get('evidence_basis', 'Landsat-derived tract heat exposure.')}\n\n"
+            f"{thermal}\n\n## Data provenance and interpretation limits\n\n{sources}\n\n"
+            f"> Measurement basis: {basis}. Moran's I describes spatial clustering.\n")
 
 
 def append_heat_narrative(report_path: str, narrative: ResultNarrative) -> str:

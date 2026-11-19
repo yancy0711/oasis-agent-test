@@ -65,6 +65,6 @@ export function CheckboxDropdown({ ariaLabel, options, selected, summary, detail
   </div>;
   return <div ref={rootRef} className={`checkbox-dropdown${open ? " is-open" : ""}`}>
     <button type="button" className="checkbox-dropdown__trigger" aria-label={ariaLabel} aria-haspopup="listbox" aria-expanded={open} onClick={() => setOpen((value) => !value)}><span><strong>{summary}</strong>{detail && <small>{detail}</small>}</span><i aria-hidden="true" /></button>
-    {open && (portal ? createPortal(menu, document.body) : menu)}
+    {open && (portal ? createPortal(menu, rootRef.current?.closest("dialog") ?? document.body) : menu)}
   </div>;
 }

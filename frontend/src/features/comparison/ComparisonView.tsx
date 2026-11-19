@@ -1,3 +1,4 @@
+import { useWorkspacePreferences } from "../../app/WorkspacePreferences";
 import { lazy, Suspense, useState } from "react";
 import { LoadingText } from "../../components/LoadingText";
 import type { RunResult } from "../../api/models";
@@ -12,6 +13,7 @@ const record = (value: unknown): Record<string, unknown> => value && typeof valu
 const rows = (value: unknown): Record<string, unknown>[] => Array.isArray(value) ? value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item)) : [];
 
 export function ComparisonView({ result }: { result: RunResult }) {
+  const { t } = useWorkspacePreferences();
   const [mode, setMode] = useState<"scenario" | "mobility">("scenario");
   const withinRun = record(record(result.diagnostics).scenario_comparison);
   const profileScenarios = rows(withinRun.scenarios);
@@ -19,8 +21,8 @@ export function ComparisonView({ result }: { result: RunResult }) {
   return (
     <div>
       <div className="subtabs">
-        <button type="button" className={mode === "scenario" ? "is-active" : ""} onClick={() => setMode("scenario")}>Profiles / scenarios</button>
-        <button type="button" className={mode === "mobility" ? "is-active" : ""} onClick={() => setMode("mobility")}>Mobility modes</button>
+        <button type="button" className={mode === "scenario" ? "is-active" : ""} onClick={() => setMode("scenario")}>{t("Profiles / scenarios")}</button>
+        <button type="button" className={mode === "mobility" ? "is-active" : ""} onClick={() => setMode("mobility")}>{t("Mobility modes")}</button>
       </div>
       {mode === "scenario" ? <>
         {profileScenarios.length > 0 && <section className="detail-stack">

@@ -95,7 +95,7 @@ def test_request_scope_routes_clear_boundaries_with_a_useful_alternative():
     assert classify_request("Compare candidate facilities in Phoenix").disposition == "full_analysis"
     vague = classify_request("Help me improve cooling access.")
     assert vague.disposition == "needs_clarification"
-    assert "US city or county" in vague.alternative
+    assert "study area" in vague.alternative
     realtime = classify_request("Which NYC cooling centers are open right now?")
     assert realtime.disposition == "out_of_scope"
     assert "311" in realtime.alternative
@@ -1046,6 +1046,28 @@ def test_heat_review_uses_its_dependency_chain_without_action_loop_calls(monkeyp
         TaskSpec(place_name="Phoenix, Arizona, USA", analysis_goal="heat_review"), explain=False)
     assert result["ok"] and not llm.calls
     assert [item.tool for item in result["results"]] == ["resolve_study_area", "prepare_demand", "summarize_heat_exposure"]
+
+def test_registered_demand_tool_pauses_for_utci_recovery(monkeypatch):
+    from oasis.services import workflow
+
+    def resolve(ctx, place_name):
+        ctx.put("study", {"place_name": place_name, "state_fips": "04", "county_fips": "013", "year": 2022})
+        return ToolResult(ok=True, tool="resolve_study_area", handle="study")
+
+    monkeypatch.setattr(registry.get("resolve_study_area"), "fn", resolve)
+    monkeypatch.setattr(workflow, "utci_paths", lambda cfg: [])
+    monkeypatch.setattr(workflow, "cds_configured", lambda: False)
+    llm = RecordingLLM([])
+    task = TaskSpec(place_name="Phoenix, Arizona, USA", analysis_goal="heat_review", heat_metric="utci")
+
+    result = Orchestrator(llm, {"max_agent_steps": 6}).run(task, explain=False)
+
+    assert result["paused"] and not result["ok"] and not llm.calls
+    assert result["failed_tool"] == "prepare_demand"
+    assert result["recovery"].suggested_changes == {"heat_metric": "landsat_lst"}
+    assert "Configure Copernicus CDS access" in result["recovery"].diagnosis
+    assert task.heat_metric == "utci"
+
 
 def test_hard_constraint_hitl_reports_exact_relaxation_bounds(monkeypatch):
     """A stopped hard-coverage run must report exact facility and time alternatives."""

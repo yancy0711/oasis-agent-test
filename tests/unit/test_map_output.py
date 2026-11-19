@@ -42,7 +42,8 @@ def test_coverage_map_reprojects_and_writes_maplibre_layers(tmp_path):
     payload, layers = _layers(path)
     assert payload["metadata"]["renderer"] == "maplibre"
     assert payload["metadata"]["indicator_label"] == "Heat exposure (°C)"
-    assert set(layers) == {"tract", "boundary", "selected_site"}
+    assert set(layers) == {"tract", "boundary", "candidate", "selected_site"}
+    assert layers["candidate"][0]["properties"]["name"] == "New York Public Library"
     assert layers["tract"][0]["properties"]["population"] == 1000
     assert layers["tract"][0]["properties"]["population_weighted_heat_c"] == 30.0
     assert layers["tract"][0]["properties"]["tract_mean_heat_c"] == 31.0

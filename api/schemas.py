@@ -158,6 +158,7 @@ class PlaceConfirmResponse(PlaceCandidate):
     """Return the canonical place selected by the user."""
 
     query: str
+    boundary: dict[str, Any] | None = None
 
 
 class UploadResponse(BaseModel):
@@ -166,6 +167,7 @@ class UploadResponse(BaseModel):
     upload_id: str
     filename: str
     size: int
+    preview_points: list[tuple[float, float, str]] = Field(default_factory=list)
 
 
 class RunRequest(BaseModel):
@@ -261,6 +263,9 @@ class UiConfigResponse(BaseModel):
     execution: UiExecutionConfig
     value_profiles: dict[str, Any]
     carto_basemap_api_key: str = ""
+    sf_utci_configured: bool = False
+    utci_configured: bool = False
+    utci_auto_download: bool = False
 
 
 class DataSourceStatusResponse(BaseModel):

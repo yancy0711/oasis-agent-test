@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { RunProgress as Progress, RunSnapshot } from "../../api/models";
+import { useWorkspacePreferences } from "../../app/WorkspacePreferences";
 
 interface RunProgressProps {
   status: RunSnapshot["status"];
@@ -8,6 +9,7 @@ interface RunProgressProps {
 }
 
 export function RunProgress({ status, phase, progress }: RunProgressProps) {
+  const { t } = useWorkspacePreferences();
   const active = status === "queued" || status === "running";
   const complete = status === "succeeded";
   const visibleProgress = active ? progress : null;
@@ -29,8 +31,8 @@ export function RunProgress({ status, phase, progress }: RunProgressProps) {
     <section className="run-progress" aria-live="polite">
       <div className="run-progress__labels">
         <div>
-          <strong>{complete ? "Run complete" : visibleProgress?.label ?? status.replaceAll("_", " ")}{active && <span className="animated-ellipsis" aria-label="in progress" />}</strong>
-          <span>{phase ? `${phase} phase` : "Preparing execution"}</span>
+          <strong>{complete ? t("Run complete") : visibleProgress?.label ?? t(status.replaceAll("_", " "))}{active && <span className="animated-ellipsis" aria-label="in progress" />}</strong>
+          <span>{phase ? `${phase} phase` : t("Preparing execution")}</span>
         </div>
         <span>{complete ? "100%" : visibleProgress ? `${percent}%` : status}</span>
       </div>

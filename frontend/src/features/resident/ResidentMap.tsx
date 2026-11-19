@@ -3,6 +3,7 @@ import maplibregl, { type GeoJSONSource, type Map as MapLibreMap } from "maplibr
 import type { FeatureCollection } from "geojson";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { useBasemapStyle } from "../result/useBasemapStyle";
+import { useMapTheme } from "../result/useMapTheme";
 import { CATEGORIES, type Origin, type Place, type DisplayRoute, type SearchResult } from "./residentApi";
 
 interface Props {
@@ -23,6 +24,7 @@ export function ResidentMap({ origin, places, routes, onSelect, onOrigin, pickin
   const placePopup = useRef<maplibregl.Popup | null>(null);
   const placeMarkers = useRef(new Map<string, maplibregl.Marker>());
   const [ready, setReady] = useState(false);
+  useMapTheme(mapRef, ready);
   const [notice, setNotice] = useState("");
   const style = useBasemapStyle();
   useEffect(() => { callbacks.current = { onSelect, onOrigin, onPickingChange }; }, [onSelect, onOrigin, onPickingChange]);
@@ -90,10 +92,9 @@ export function ResidentMap({ origin, places, routes, onSelect, onOrigin, pickin
     const registry = placeMarkers.current;
     if (origin) {
       const element = document.createElement("div");
-      const outside = !!origin.country_code && origin.country_code !== "us";
-      element.className = `resident-origin${outside ? " resident-origin--outside" : ""}`;
+      element.className = "resident-origin";
       element.setAttribute("role", "img");
-      element.setAttribute("aria-label", outside ? "Location outside the United States" : "Starting point");
+      element.setAttribute("aria-label", "Starting point");
       element.title = origin.label;
       const dot = document.createElement("span"); element.appendChild(dot);
       markers.push(new maplibregl.Marker({ element }).setLngLat([origin.longitude, origin.latitude]).addTo(map));
@@ -115,7 +116,7 @@ export function ResidentMap({ origin, places, routes, onSelect, onOrigin, pickin
         places.forEach((place) => bounds.extend([place.longitude, place.latitude]));
         map.fitBounds(bounds, { padding: 65, maxZoom: 15, duration: 700 });
       } else {
-        map.flyTo({ center: [origin.longitude, origin.latitude], zoom: origin.country_code === "us" ? 14 : 5, duration: 1100 });
+        map.flyTo({ center: [origin.longitude, origin.latitude], zoom: 14, duration: 700 });
       }
     }
     return () => { markers.forEach((marker) => marker.remove()); registry.clear(); };

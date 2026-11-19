@@ -27,6 +27,14 @@ def load_cfg() -> dict:
     cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
     output = Path(os.getenv("OASIS_OUTPUT_DIR", cfg.get("output", {}).get("dir", "outputs_run")))
     cfg["output"] = {**cfg.get("output", {}), "dir": str(output if output.is_absolute() else PROJECT_ROOT / output)}
+    data = cfg.get("data", {})
+    utci = Path(os.getenv("OASIS_UTCI_PATH") or data.get("utci_path")
+                or os.getenv("OASIS_SF_UTCI_PATH") or data.get("sf_utci_path") or "data/thermal/sf_era5_heat")
+    cfg["data"] = {
+        **data,
+        "utci_path": str(utci if utci.is_absolute() else PROJECT_ROOT / utci),
+        "utci_timezone": os.getenv("OASIS_UTCI_TIMEZONE") or data.get("utci_timezone", "UTC"),
+    }
     return cfg
 
 

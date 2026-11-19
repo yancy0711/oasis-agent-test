@@ -14,7 +14,7 @@ const DEFAULT_TASK: TaskSpec = {
 };
 
 export function taskFromDraft(draft: Record<string, unknown>): TaskSpec {
-  return { ...DEFAULT_TASK, ...draft } as TaskSpec;
+  return { ...DEFAULT_TASK, ...draft, demand_upload_id: null } as TaskSpec;
 }
 
 export function toTaskFormValues(task: TaskSpec): TaskFormValues {
@@ -69,6 +69,7 @@ export function toTaskSpec(draft: TaskSpec, values: TaskFormValues, confirmedPla
     coverage_target: values.coverage_target_enabled ? values.coverage_target : null,
     mobility_scenario: values.mobility_scenario,
     candidate_source: values.candidate_source,
+    heat_metric: "utci",
     candidate_file: null,
     coverage_group: values.coverage_group,
     candidate_amenities: values.candidate_amenities,

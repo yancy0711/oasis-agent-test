@@ -6,7 +6,7 @@ import { ResidentWorkspace, type ResidentRequest } from "./ResidentWorkspace";
 import { DEFAULT_PREFERENCES, residentPost, type Origin, type Preferences, type ResidentRoute, type SearchResult, type DisplayRoute } from "./residentApi";
 
 vi.mock("./ResidentMap", () => ({ ResidentMap: ({ origin, routes }: { origin: Origin | null; routes: DisplayRoute[] }) =>
-  <div aria-label="Test map" data-routes={routes.map((item) => `${item.variant}:${item.route.summary.destination_id}`).join(",")}>{origin?.country_code === "hk" ? "Outside marker: Hong Kong" : origin?.label}</div> }));
+  <div aria-label="Test map" data-routes={routes.map((item) => `${item.variant}:${item.route.summary.destination_id}`).join(",")}>{origin?.label}</div> }));
 vi.mock("./residentApi", async (original) => ({ ...await original<typeof import("./residentApi")>(), residentPost: vi.fn() }));
 vi.mock("../../api/client", () => ({ getStreetView: vi.fn(async () => ({ available: false, status: "no_image", message: "No nearby image." })) }));
 function render(ui: Parameters<typeof renderUI>[0]) {
@@ -53,8 +53,8 @@ function start(request: ResidentRequest = { id: "input-1", prompt: "Find malls n
 describe("resident discovery", () => {
   it("defaults to all categories without a prompt restriction", () => {
     render(<ResidentWorkspace request={null} cancelVersion={0} onBusy={vi.fn()} />);
-    expect(screen.getByRole("checkbox", { name: "Select all place categories" })).toBeChecked();
-    expect(screen.getByRole("checkbox", { name: "Parks" })).toBeChecked();
+    expect(screen.getByLabelText("Select all place categories", { selector: "input" })).toBeChecked();
+    expect(screen.getByLabelText("Parks", { selector: "input" })).toBeChecked();
   });
   it("does not offer an identical retry when the nearest-candidate limit was reached", async () => {
     const original = post.getMockImplementation()!;
@@ -75,9 +75,9 @@ describe("resident discovery", () => {
     start();
     fireEvent.click(await screen.findByRole("button", { name: "Confirm location and search" }));
     await screen.findByText("Route to Test Mall");
-    fireEvent.click(screen.getByRole("checkbox", { name: "Select all place categories" }));
-    expect(screen.getByRole("checkbox", { name: "Parks" })).toBeChecked();
-    expect(screen.getByRole("checkbox", { name: "Public libraries" })).toBeChecked();
+    fireEvent.click(screen.getByLabelText("Select all place categories", { selector: "input" }));
+    expect(screen.getByLabelText("Parks", { selector: "input" })).toBeChecked();
+    expect(screen.getByLabelText("Public libraries", { selector: "input" })).toBeChecked();
     expect(post.mock.calls.filter(([path]) => path === "search")).toHaveLength(1);
     fireEvent.click(screen.getByRole("button", { name: "Update results" }));
     await screen.findByText("Route to Test Mall");
@@ -86,7 +86,7 @@ describe("resident discovery", () => {
     expect(latest.preferences.categories).toHaveLength(8);
     expect(latest.preferences.excluded_categories).toEqual([]);
     expect(locate).toHaveBeenCalledOnce();
-    fireEvent.click(screen.getByRole("checkbox", { name: "Select all place categories" }));
+    fireEvent.click(screen.getByLabelText("Select all place categories", { selector: "input" }));
     expect(screen.getByRole("button", { name: "Update results" })).toBeDisabled();
   });
 
@@ -95,8 +95,8 @@ describe("resident discovery", () => {
     await screen.findByRole("button", { name: "Confirm location and search" });
     expect(locate).toHaveBeenCalledOnce();
     expect(post.mock.calls.some(([path]) => path === "search")).toBe(false);
-    expect(screen.getByRole("checkbox", { name: "Shopping malls" })).toBeChecked();
-    expect(screen.getByRole("checkbox", { name: "Parks" })).not.toBeChecked();
+    expect(screen.getByLabelText("Shopping malls", { selector: "input" })).toBeChecked();
+    expect(screen.getByLabelText("Parks", { selector: "input" })).not.toBeChecked();
     expect(screen.queryByLabelText("Facilities")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Confirm location and search" }));
     await screen.findByRole("button", { name: "Route to Test Mall" });
@@ -106,21 +106,24 @@ describe("resident discovery", () => {
     expect(search).not.toHaveProperty("n_facilities");
   });
 
-  it("shows an outside-US coordinate and never searches there", async () => {
-    post.mockImplementation(async (path) => path === "origin" ? { ...origin, longitude: 114.17, latitude: 22.3, country_code: "hk", label: "Hong Kong" } : prefs);
+  it("searches from Hong Kong after location confirmation", async () => {
+    const hk = { longitude: 114.17, latitude: 22.3, country_code: "hk", label: "Hong Kong" };
+    const original = post.getMockImplementation()!;
+    post.mockImplementation(async (...args) => args[0] === "origin" ? hk : original(...args));
     start({ id: "locate-1", prompt: "", locate: true });
-    await screen.findByText("Outside supported area");
-    expect(screen.getByText("Outside marker: Hong Kong")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Update results" })).not.toBeInTheDocument();
-    expect(screen.getByLabelText("US address or landmark")).toBeEnabled();
+    const confirm = await screen.findByRole("button", { name: "Confirm location and search" });
+    expect(screen.getByLabelText("Test map")).toHaveTextContent("Hong Kong");
     expect(post.mock.calls.some(([path]) => path === "search")).toBe(false);
+    fireEvent.click(confirm);
+    await screen.findByRole("button", { name: "Route to Test Mall" });
+    expect(post.mock.calls.find(([path]) => path === "search")?.[1]).toMatchObject({ longitude: hk.longitude, latitude: hk.latitude });
   });
 
   it("keeps manual address entry available after permission denial", async () => {
     locate.mockImplementation((_success, failure) => failure({ code: 1 }));
     start({ id: "denied", prompt: "", locate: true });
     await screen.findByText(/Location permission was denied/);
-    fireEvent.change(screen.getByLabelText("US address or landmark"), { target: { value: "Riverside City Hall" } });
+    fireEvent.change(screen.getByLabelText("Address or landmark"), { target: { value: "Riverside City Hall" } });
     fireEvent.click(screen.getByRole("button", { name: "Find address" }));
     await screen.findByRole("button", { name: "Confirm location and search" });
   });
@@ -144,7 +147,7 @@ describe("resident discovery", () => {
     start();
     fireEvent.click(await screen.findByRole("button", { name: "Confirm location and search" }));
     await screen.findByText("Nearby-place data service unavailable");
-    expect(screen.getByRole("checkbox", { name: "Shopping malls" })).toBeChecked();
+    expect(screen.getByLabelText("Shopping malls", { selector: "input" })).toBeChecked();
     expect(screen.getByText("Confirmed starting point")).toBeInTheDocument();
     const retry = screen.getByRole("button", { name: "Retry search" });
     expect(retry).toBeEnabled();
@@ -185,9 +188,9 @@ describe("resident discovery", () => {
       return { candidates: [{ ...origin, label: "New LA address" }], message: "Confirm" };
     });
     render(<ResidentWorkspace request={null} cancelVersion={0} onBusy={vi.fn()} />);
-    fireEvent.change(screen.getByLabelText("US address or landmark"), { target: { value: "Old address" } });
+    fireEvent.change(screen.getByLabelText("Address or landmark"), { target: { value: "Old address" } });
     fireEvent.click(screen.getByRole("button", { name: "Find address" }));
-    fireEvent.change(screen.getByLabelText("US address or landmark"), { target: { value: "New address" } });
+    fireEvent.change(screen.getByLabelText("Address or landmark"), { target: { value: "New address" } });
     fireEvent.click(screen.getByRole("button", { name: "Find address" }));
     await screen.findByRole("button", { name: "Confirm location and search" });
     await act(async () => finishOld({ candidates: [{ ...origin, label: "Old Riverside address" }] }));
@@ -203,7 +206,7 @@ describe("resident discovery", () => {
     expect(post.mock.calls.some(([path]) => path === "parse" || path === "search")).toBe(false);
     expect(screen.getByRole("button", { name: "Update results" })).toBeDisabled();
     expect(screen.getByText("Transit is unavailable. Choose a supported travel mode.")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("checkbox", { name: "Public libraries" }));
+    fireEvent.click(screen.getByLabelText("Public libraries", { selector: "input" }));
     expect(screen.getByRole("button", { name: "Update results" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Use the displayed supported filters" }));
     fireEvent.click(screen.getByRole("button", { name: "Update results" }));

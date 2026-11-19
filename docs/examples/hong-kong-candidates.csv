@@ -1,0 +1,7 @@
+cand_id,name,longitude,latitude
+demo-west,Demo West,114.1835,22.3245
+demo-east,Demo East,114.1905,22.3245
+demo-southwest,Demo Southwest,114.1800,22.3150
+demo-northwest,Demo Northwest,114.1780,22.3250
+demo-north,Demo North,114.1885,22.3300
+demo-far-east,Demo Far East,114.1970,22.3245

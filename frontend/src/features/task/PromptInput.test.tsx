@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PromptInput } from "./PromptInput";
 
-afterEach(cleanup);
+afterEach(() => { cleanup(); sessionStorage.clear(); });
 
 describe("prompt examples", () => {
   it("copies an example into the editable prompt without submitting it", () => {
@@ -69,5 +69,28 @@ describe("prompt examples", () => {
     render(<PromptInput pending onSubmit={vi.fn()} onCancel={cancel} />);
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("recalls submitted prompts after remount and returns to the unsent draft", () => {
+    const submit = vi.fn();
+    const props = { pending: false, onSubmit: submit, onCancel: vi.fn() };
+    const firstRender = render(<PromptInput {...props} />);
+    const input = () => screen.getByLabelText("Describe the cooling-access question");
+    const prompts = Array.from({ length: 23 }, (_, index) => "Analysis " + index);
+    for (const value of prompts) {
+      fireEvent.change(input(), { target: { value } });
+      fireEvent.keyDown(input(), { key: "Enter" });
+    }
+    firstRender.unmount();
+    render(<PromptInput {...props} />);
+    fireEvent.change(input(), { target: { value: "New draft" } });
+    fireEvent.keyDown(input(), { key: "ArrowUp" });
+    expect(input()).toHaveValue("Analysis 22");
+    for (let i = 1; i < prompts.length; i += 1) fireEvent.keyDown(input(), { key: "ArrowUp" });
+    expect(input()).toHaveValue("Analysis 0");
+    for (let i = 0; i < prompts.length; i += 1) fireEvent.keyDown(input(), { key: "ArrowDown" });
+    expect(input()).toHaveValue("New draft");
+    expect(screen.queryByRole("button", { name: "Reuse last prompt" })).not.toBeInTheDocument();
+    expect(submit).toHaveBeenCalledTimes(prompts.length);
   });
 });

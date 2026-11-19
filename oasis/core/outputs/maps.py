@@ -51,6 +51,8 @@ def _tract_properties(row: pd.Series, indicator: str) -> dict[str, Any]:
         ("elderly_ratio", "elderly_pct", 1, 100),
         ("poverty_rate", "poverty_pct", 1, 100),
         ("heat_exposure", "heat_c", 1, 1),
+        ("lst_exposure_c", "lst_exposure_c", 4, 1),
+        ("utci_c", "utci_c", 4, 1),
         ("population_weighted_lst", "population_weighted_heat_c", 1, 1),
         ("mean_lst", "tract_mean_heat_c", 1, 1),
         ("exposure_gap", "heat_exposure_gap_c", 1, 1),
@@ -77,6 +79,7 @@ def _tract_properties(row: pd.Series, indicator: str) -> dict[str, Any]:
         "population_weighted_block_group": "Population weighted using Census block groups",
         "tract_mean_fallback": "Tract mean used because population weighting was unavailable or incomplete",
         "unavailable_neutral": "Landsat was unavailable; heat was neutralized and is not interpretable as temperature",
+        "era5_heat_utci": "ERA5-HEAT UTCI: daily peaks averaged within the run period at the nearest grid cell",
     }
     properties["heat_exposure_method"] = method_labels.get(method) if isinstance(method, str) else None
     properties["is_hardest_reachability"] = bool(row.get("is_hardest_reachability", False))
@@ -163,6 +166,25 @@ def _feature(geometry: Any, properties: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def input_layer(frame: gpd.GeoDataFrame, kind: str) -> dict:
+    """Build a lightweight feature collection of a prepared input layer."""
+    rows = []
+    for _, row in ensure_crs(frame).iterrows():
+        geometry = row.geometry
+        if geometry is None or geometry.is_empty:
+            continue
+        if kind == "candidate":
+            properties = {**_site_properties(row, None), "layer_kind": kind}
+        elif kind == "tract":
+            properties = _tract_properties(row, "heat_exposure")
+            geometry = geometry.simplify(0.00005, preserve_topology=True)
+        else:
+            properties = {"layer_kind": "boundary"}
+            geometry = geometry.simplify(0.00005, preserve_topology=True)
+        rows.append(_feature(geometry, properties))
+    return {"type": "FeatureCollection", "features": rows}
+
+
 def _write_map(
     tracts: gpd.GeoDataFrame,
     out_path: str,
@@ -187,6 +209,10 @@ def _write_map(
                 features.append(_feature(row.geometry, {"layer_kind": "boundary"}))
     if candidates is not None and solution is not None and not candidates.empty:
         candidates = ensure_crs(candidates)
+        actual_candidates = candidates
+        if "is_hypothetical" in candidates:
+            actual_candidates = candidates.loc[~candidates["is_hypothetical"].eq(True)]
+        features.extend(input_layer(actual_candidates, "candidate")["features"])
         selected_ids = set(map(str, solution.selected_ids))
         selected = candidates[candidates["cand_id"].astype(str).isin(selected_ids)]
         for _, row in selected.iterrows():
@@ -211,16 +237,34 @@ def _write_map(
     minx, miny, maxx, maxy = map(float, tracts.total_bounds)
     values = pd.to_numeric(tracts.get(indicator), errors="coerce")
     finite = values.dropna() if isinstance(values, pd.Series) else pd.Series(dtype=float)
+    thermal_layers = {}
+    if indicator == "heat_exposure":
+        for metric, layer in tracts.attrs.get("thermal_layers", {}).items():
+            field = "utci_c" if metric == "utci" else "lst_exposure_c"
+            temperatures = tracts[field].dropna()
+            if not temperatures.empty:
+                thermal_layers[metric] = {
+                    **layer, "field": field,
+                    "value_range": [float(temperatures.min()), float(temperatures.max())],
+                }
+    run_metric = tracts.attrs.get("run_heat_metric", "landsat_lst")
+    heat_weight = None if solution is None else (
+        solution.weights_used.heat_exposure if solution.weights_used else 0.0
+    )
     payload = {
         "type": "FeatureCollection",
         "metadata": {
             "renderer": "maplibre",
             "indicator": indicator,
             "indicator_label": (
-                "Heat exposure (°C)" if indicator == "heat_exposure" else indicator.replace("_", " ").title()
+                ("UTCI (°C)" if run_metric == "utci" else "Heat exposure (°C)")
+                if indicator == "heat_exposure" else indicator.replace("_", " ").title()
             ),
             "value_range": [float(finite.min()), float(finite.max())] if not finite.empty else None,
             "bounds": [[minx, miny], [maxx, maxy]],
+            **({"candidate_source": task.candidate_source} if task is not None else {}),
+            **({"thermal_layers": thermal_layers, "run_heat_metric": run_metric,
+                "siting_heat_weight": heat_weight} if thermal_layers else {}),
         },
         "features": features,
     }

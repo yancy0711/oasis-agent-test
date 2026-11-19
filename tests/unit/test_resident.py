@@ -169,10 +169,19 @@ def test_cancel_during_matrix_acknowledges_cleanup_and_allows_new_search(service
     assert service.search(fresh).complete
 
 
-def test_non_us_origin_never_downloads_candidates(service, monkeypatch):
-    monkeypatch.setattr(module, "coordinate_origin", lambda *args, **kwargs: ORIGIN.model_copy(update={"country_code": "hk", "label": "Hong Kong"}))
-    monkeypatch.setattr(module, "fetch_nearby_places", lambda *args, **kwargs: pytest.fail("out-of-area search executed"))
-    with pytest.raises(ValueError, match="outside"): service.search(search_request())
+def test_hong_kong_origin_search_uses_requested_coordinates(service, monkeypatch):
+    origin = ResidentOrigin(longitude=114.17, latitude=22.3, country_code="hk", label="Hong Kong")
+    monkeypatch.setattr(module, "coordinate_origin", lambda *args, **kwargs: origin)
+    calls = []
+
+    def fetch(longitude, latitude, *args, **kwargs):
+        calls.append((longitude, latitude))
+        return [], True
+
+    monkeypatch.setattr(module, "fetch_nearby_places", fetch)
+    request = search_request().model_copy(update={"longitude": origin.longitude, "latitude": origin.latitude})
+    assert service.search(request).origin == origin
+    assert calls == [(114.17, 22.3)]
 
 
 def test_route_is_bound_to_search_and_reports_threshold_change(service, monkeypatch):
@@ -276,7 +285,7 @@ def test_hosted_header_key_is_sent_only_to_its_provider(monkeypatch):
     assert "test-header-secret" not in json.dumps(payload)
 
 
-def test_origin_api_keeps_outside_coordinates_for_map_warning(monkeypatch):
+def test_origin_api_keeps_hong_kong_coordinates(monkeypatch):
     monkeypatch.setattr(module, "coordinate_origin", lambda *args, **kwargs: ResidentOrigin(longitude=114.17, latitude=22.3, label="Hong Kong", country_code="hk"))
     app = FastAPI(); app.include_router(create_resident_router(SimpleNamespace(cfg={})))
     client = TestClient(app)
@@ -587,18 +596,18 @@ def test_geocoder_retry_exhaustion_retains_provider_diagnostic(monkeypatch):
     assert response.json()["detail"] == "Nominatim 503"
 
 
-def test_named_origin_filters_non_us_options_and_requests_us_scope(monkeypatch):
+def test_named_origin_retains_international_options(monkeypatch):
     calls = []
     def search(query, **kwargs):
         calls.append((query, kwargs))
         return [
             {"lon": "-118.24", "lat": "34.05", "display_name": "Los Angeles", "address": {"country_code": "us"}},
-            {"lon": "2.3", "lat": "48.8", "display_name": "Outside US", "address": {"country_code": "fr"}},
+            {"lon": "2.3", "lat": "48.8", "display_name": "Paris", "address": {"country_code": "fr"}},
         ]
     monkeypatch.setattr(module, "search_origin_candidates", search)
     origins = module.named_origins("LA")
-    assert len(origins) == 1 and origins[0].country_code == "us"
-    assert calls[0][1]["countrycodes"] == "us"
+    assert [origin.country_code for origin in origins] == ["us", "fr"]
+    assert "countrycodes" not in calls[0][1]
 
 
 def test_resident_parse_does_not_restore_removed_strict_indoor_filter():

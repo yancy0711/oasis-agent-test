@@ -10,6 +10,6 @@ Rules:
 1. Use only supplied facts and numbers; do not invent causes or neighborhood characteristics.
 2. Explain whether the supplied Moran's I indicates positive, negative, or weak spatial clustering.
 3. Treat the permutation p-value as evidence about spatial randomness, not causation.
-4. Mention Landsat land-surface temperature and tract aggregation.
+4. Name the reported heat metric and how it was aggregated. Treat UTCI as an outdoor thermal-stress index and Landsat LST as surface temperature. Only describe the confirmed run's metric.
 5. Use the self-reflection sentence for one supported data or interpretation limitation.
 6. No markdown headings, bullets, recommendations, or hidden reasoning.

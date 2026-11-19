@@ -10,12 +10,14 @@ from time import monotonic, time
 from uuid import uuid4
 
 import httpx
+import requests
 from oasis.contracts.resident import ResidentOrigin, ResidentSearchRequest, ResidentSearchResponse
 from oasis.core.cache import CACHE_DIR, atomic_write_text
 from oasis.core.cancellation import CancellationToken, RunCancelled
 from oasis.core.http import cancellable_request
 from oasis.core.data.geocoding import reverse_origin_address, search_origin_candidates
 from oasis.core.data.resident_places import fetch_nearby_places
+from oasis.core.retry import TransientError
 from oasis.core.spatial.accessibility.backend import ORS_PROFILES, RequestGate
 from oasis.core.spatial.routes import _directions_url
 
@@ -35,19 +37,21 @@ def route_green_score(feature):
 
 
 def coordinate_origin(longitude, latitude, *, check=lambda: None):
-    address = reverse_origin_address(latitude, longitude, check=check)
+    try:
+        address = reverse_origin_address(latitude, longitude, check=check)
+    except (requests.RequestException, httpx.HTTPError, TimeoutError, TransientError, ValueError):
+        check()
+        address = {}
     country = str(address.get("country_code", "")).lower()
-    if not country:
-        raise ValueError("Could not verify the country of this location. Enter a US address or try again.")
-    label = ", ".join(dict.fromkeys(str(address[k]) for k in ("city", "town", "county", "state", "country") if address.get(k)))
+    label = ", ".join(dict.fromkeys(str(address[k]) for k in ("suburb", "city", "town", "county", "state", "country") if address.get(k)))
     return ResidentOrigin(longitude=longitude, latitude=latitude, label=label or f"{latitude:.5f}, {longitude:.5f}", country_code=country)
 
 
 def named_origins(query, *, check=lambda: None):
     return [ResidentOrigin(longitude=float(row["lon"]), latitude=float(row["lat"]),
                            label=row.get("display_name", query), country_code=row.get("address", {}).get("country_code", ""))
-            for row in search_origin_candidates(query, countrycodes="us", check=check)
-            if "lon" in row and "lat" in row and row.get("address", {}).get("country_code") == "us"]
+            for row in search_origin_candidates(query, check=check)
+            if "lon" in row and "lat" in row]
 
 
 class ResidentService:
@@ -138,8 +142,6 @@ class ResidentService:
         if request.preferences.needs_clarification:
             raise ValueError(request.preferences.clarification)
         origin = coordinate_origin(request.longitude, request.latitude, check=check)
-        if origin.country_code != "us":
-            raise ValueError(f"{origin.label} is outside the supported US area. Enter a US address.")
         check()
         places, complete = fetch_nearby_places(request.longitude, request.latitude, request.radius_km, request.preferences, check=check)
         check()

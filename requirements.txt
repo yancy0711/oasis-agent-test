@@ -12,6 +12,11 @@ planetary-computer>=1.0
 rasterio>=1.3
 odc-stac>=0.3
 rasterstats>=0.19
+# --- ERA5-HEAT / UTCI ---
+cdsapi>=0.7.7
+xarray>=2024.1
+netCDF4>=1.6
+tzdata>=2024.1
 # --- optimization ---
 pulp>=2.8,<4.0          # Prefer system CBC (Docker: coinor-cbc); bundled fallback locally.
 numpy>=1.26

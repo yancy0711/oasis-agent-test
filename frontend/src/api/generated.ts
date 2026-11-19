@@ -564,6 +564,8 @@ export interface components {
         };
         /** Body_upload_candidates_v1_uploads_post */
         Body_upload_candidates_v1_uploads_post: {
+            coordinate_system?: "epsg" | "gcj02";
+            epsg?: number;
             /** File */
             file: string;
         };
@@ -887,6 +889,7 @@ export interface components {
          * @description Return the canonical place selected by the user.
          */
         PlaceConfirmResponse: {
+            boundary?: Record<string, unknown> | null;
             /** Candidate Id */
             candidate_id: string;
             /** Canonical Name */
@@ -1639,8 +1642,11 @@ export interface components {
              * @enum {string}
              */
             candidate_source: "osm" | "csv";
+            /** Confirmed tract heat source */
+            heat_metric?: "landsat_lst" | "utci";
             /** Candidate File */
             candidate_file?: string | null;
+            demand_upload_id?: string | null;
             /**
              * Mobility Scenario
              * @default walking
@@ -1747,6 +1753,9 @@ export interface components {
              * @default
              */
             carto_basemap_api_key: string;
+            sf_utci_configured?: boolean;
+            utci_configured?: boolean;
+            utci_auto_download?: boolean;
         };
         /**
          * UiExecutionConfig
@@ -1772,6 +1781,7 @@ export interface components {
             filename: string;
             /** Size */
             size: number;
+            preview_points?: [number, number, string][];
         };
         /** ValidationError */
         ValidationError: {

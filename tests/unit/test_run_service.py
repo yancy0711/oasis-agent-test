@@ -511,6 +511,17 @@ def _terminal(service: OasisService, run_id: str) -> dict:
         time.sleep(0.01)
 
 
+def test_candidate_upload_previews_only_valid_coordinates(tmp_path, monkeypatch):
+    service = _service(tmp_path, monkeypatch)
+    payload = service.upload_candidates(
+        "sites.csv",
+        b"name,lat,lng,private_note\nLibrary,33.45,-112.07,private\nBad,100,-112,hidden\n",
+    )
+    assert payload["filename"] == "sites.csv"
+    assert payload["preview_points"] == [(-112.07, 33.45, "Library")]
+    assert payload["upload_id"] in service.uploads
+
+
 def test_auto_keeps_quick_preview_and_finishes_with_precise_provenance(tmp_path, monkeypatch):
     """Auto mode must preserve both accuracy phases and a stable spec hash."""
     service = _service(tmp_path, monkeypatch)
