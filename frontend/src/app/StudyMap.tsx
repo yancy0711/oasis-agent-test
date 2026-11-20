@@ -57,7 +57,7 @@ export function StudyMap({ inputLayers, uploadedRun, place }: {
     let map: maplibregl.Map;
     try {
       map = new maplibregl.Map({
-        container: container.current, style, center: [-98.6, 39.8], zoom: 3.45, attributionControl: false,
+        container: container.current, style, center: [0, 20], zoom: 1.2, attributionControl: false,
       });
     } catch {
       setFailedStyle(style);

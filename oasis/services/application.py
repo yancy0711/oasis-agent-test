@@ -30,7 +30,7 @@ from oasis.core.cancellation import CancellationToken, RunCancelled
 from oasis.settings import PROJECT_ROOT, load_cfg
 from oasis.settings import load_profiles
 from oasis.core.outputs.report import render_diagnostic_report, thermal_methodology
-from oasis.core.data.geocoding import (AmbiguousPlaceError, OutsideUSBoundaryError, cache_place_candidates,
+from oasis.core.data.geocoding import (AmbiguousPlaceError, cache_place_candidates,
                                        canonical_place_name, route_origin_options, search_origin_candidates,
                                        reverse_origin_address, select_place_candidate)
 from oasis.core.data.source_status import inspect_data_sources
@@ -485,20 +485,24 @@ class OasisService:
         if regional_name:
             resolution_id = uuid4().hex
             kind = "district" if regional_name != "Hong Kong" else "territory"
-            prefix = "hk" if regional.hong_kong_place(regional_name) else "sz"
+            prefix = ("hk" if regional.hong_kong_place(regional_name)
+                      else "sz" if regional_name == regional.shenzhen.NAME else "worldpop")
             selected = {"candidate_id": f"{prefix}:{resolution_id}", "canonical_name": regional_name,
                         "display_name": regional_name, "place_type": kind, "label": regional_name}
             with self.lock:
                 self.resolutions[resolution_id] = {"query": place_name, "regional_candidate": selected}
             return {"resolution_id": resolution_id, "query": place_name, "ambiguous": False,
                     "candidates": [selected], "selected": selected}
+        country = place_name.replace("，", ",").rsplit(",", 1)[-1].strip().casefold()
+        if country in {"china", "中国", "中國"}:
+            return self._resolve_international_place(place_name)
         try:
             selected, rows = select_place_candidate(place_name)
             ambiguous = False
         except AmbiguousPlaceError as exc:
             rows, selected, ambiguous = exc.candidates[:5], None, True
-        except OutsideUSBoundaryError as exc:
-            raise ValueError(f"No automatic study boundary is available for '{place_name}'.") from exc
+        except ValueError:
+            return self._resolve_international_place(place_name)
         resolution_id = uuid4().hex
         with self.lock: self.resolutions[resolution_id] = {"query": place_name, "rows": rows}
         candidates = [self._candidate(row, index) for index, row in enumerate(rows)]
@@ -506,14 +510,43 @@ class OasisService:
         return {"resolution_id": resolution_id, "query": place_name, "ambiguous": ambiguous,
                 "candidates": candidates, "selected": chosen}
 
+    def _resolve_international_place(self, place_name: str) -> dict:
+        rows = regional.international_boundary_candidates(place_name)
+        if not rows:
+            raise ValueError(f"No automatic study boundary is available for '{place_name}'.")
+        resolution_id = uuid4().hex
+        candidates = [
+            {"candidate_id": f"worldpop:{index}", "canonical_name": row["display_name"],
+             "display_name": row["display_name"], "place_type": row.get("addresstype", "district"),
+             "label": row["display_name"]}
+            for index, row in enumerate(rows)
+        ]
+        with self.lock:
+            self.resolutions[resolution_id] = {"query": place_name, "regional_rows": {
+                candidate["candidate_id"]: (candidate, row) for candidate, row in zip(candidates, rows, strict=True)
+            }}
+        selected = candidates[0] if len(candidates) == 1 else None
+        return {"resolution_id": resolution_id, "query": place_name, "ambiguous": selected is None,
+                "candidates": candidates, "selected": selected,
+                "preview_boundary": {"type": "FeatureCollection", "features": [
+                    {"type": "Feature", "properties": {}, "geometry": rows[0]["geojson"]}
+                ]} if selected else None}
+
     def confirm_place(self, resolution_id: str, candidate_id: str) -> dict:
         """Confirm one retained candidate and write its canonical query cache."""
         with self.lock: resolution = self.resolutions.get(resolution_id)
         if resolution is None: raise KeyError("Unknown or expired place resolution")
+        if regional_rows := resolution.get("regional_rows"):
+            selected, row = regional_rows[candidate_id]
+            regional.confirm_international_boundary(selected["canonical_name"], row)
+            _, boundary = regional.automatic_boundary(selected["canonical_name"])
+            return {**selected, "query": resolution["query"], "boundary": regional.demand_preview(boundary),
+                    "socioeconomic_indicator": regional.socioeconomic_indicator(selected["canonical_name"])}
         if selected := resolution.get("regional_candidate"):
             if selected["candidate_id"] != candidate_id:
                 raise KeyError("Unknown place candidate")
-            return {**selected, "query": resolution["query"]}
+            return {**selected, "query": resolution["query"],
+                    "socioeconomic_indicator": regional.socioeconomic_indicator(selected["canonical_name"])}
         rows = resolution["rows"]
         try: index = int(candidate_id.split(":", 1)[0]); selected = rows[index]
         except (ValueError, IndexError): raise KeyError("Unknown place candidate") from None
@@ -659,8 +692,15 @@ class OasisService:
         if not name:
             raise ValueError("No automatic regional census adapter is registered for this place. Upload demand polygons.")
         metadata, _, areas = regional.automatic_data(name)
+        field = regional.socioeconomic_indicator(name)
+        socioeconomic = regional.socioeconomic_metadata(field) if field else None
+        if socioeconomic is not None:
+            observed = int(areas[field].notna().sum()) if field in areas else None
+            socioeconomic.update(observed_zones=observed,
+                                 status="during_run" if observed is None else "ready" if observed else "unavailable")
         return {"place_name": name, **metadata,
                 "units": len(areas), "older_units": int(areas["elderly_population"].notna().sum()),
+                "socioeconomic": socioeconomic,
                 "geometry": regional.demand_preview(areas)}
 
     def regional_demand_geojson(self, place_name: str, layer: str = "demand") -> str:

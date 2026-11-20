@@ -64,7 +64,9 @@ describe("facility-siting analysis", () => {
     const result = {
       ok: true, paused: false, message: "done", task: taskFromDraft({ place_name: "Phoenix" }),
       execution: { mode: "precise", phase: "precise", router_requested: "ors", router_used: "ors", accuracy: "network", status: "complete" },
-      diagnostics: { vulnerability_analysis: {
+      diagnostics: {
+        built_environment: { burden_observed_zones: 4, demand_zones: 38, burden_observed_share: 4 / 38, burden_imputed_zones: 34, burden_low_coverage: true },
+        vulnerability_analysis: {
         tract_count: 4, priority_tracts: 1, priority_definition: "top 25% of the active composite vulnerability score",
         active_scheme: "configured", normalization: "percentile",
         missingness: [{ indicator: "elderly_ratio", missing_count: 1, missing_percent: .25, strategy: "median" }],
@@ -81,6 +83,7 @@ describe("facility-siting analysis", () => {
     expect(screen.getByText("Feature correlation")).toBeInTheDocument();
     expect(screen.getByText("70.0%")).toBeInTheDocument();
     expect(screen.getByText("Observed feature correlations")).toBeInTheDocument();
+    expect(screen.getByText("Low environmental coverage.").parentElement).toHaveTextContent("34 missing scores used the observed median");
     fireEvent.click(screen.getByText("Missingness, collinearity, and weight-scheme details"));
     expect(screen.getByText("Weight sensitivity")).toBeInTheDocument();
   });

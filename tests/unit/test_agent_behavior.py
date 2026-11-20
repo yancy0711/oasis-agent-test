@@ -31,6 +31,15 @@ class RecordingLLM:
         return self.responses.pop(0)
 
 
+def test_decision_inputs_align_environment_observed_after_routing():
+    from oasis.services.workflow import _decision_inputs
+
+    demand = {"population": np.array([80, 90]), "indicators": {"environment_burden": [0.1, 0.9]}}
+    travel = {"matrix": [[4], [6]], "base_index": [1, 0], "population": [90, 80], "indicators": {}}
+    _, _, _, indicators = _decision_inputs(demand, travel)
+    assert indicators["environment_burden"].tolist() == [0.9, 0.1]
+
+
 def test_requested_coverage_timeout_does_not_claim_a_constraint_conflict(monkeypatch):
     from oasis.services import workflow
     ctx = Context()

@@ -5,6 +5,20 @@ import { PromptInput } from "./PromptInput";
 afterEach(() => { cleanup(); sessionStorage.clear(); });
 
 describe("prompt examples", () => {
+  it("uses Tab to fill the visible example and keeps normal focus navigation otherwise", () => {
+    const submit = vi.fn();
+    render(<PromptInput pending={false} onSubmit={submit} onCancel={vi.fn()} />);
+    const input = screen.getByRole("textbox");
+    input.focus();
+    expect(fireEvent.keyDown(input, { key: "Tab", shiftKey: true })).toBe(true);
+    expect(input).toHaveValue("");
+    expect(fireEvent.keyDown(input, { key: "Tab" })).toBe(false);
+    expect(input).toHaveValue(input.getAttribute("placeholder"));
+    expect(input).toHaveFocus();
+    expect(fireEvent.keyDown(input, { key: "Tab" })).toBe(true);
+    expect(submit).not.toHaveBeenCalled();
+  });
+
   it("copies an example into the editable prompt without submitting it", () => {
     const submit = vi.fn();
     render(<PromptInput pending={false} onSubmit={submit} onCancel={vi.fn()} />);

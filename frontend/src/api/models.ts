@@ -13,7 +13,9 @@ export type ParseResponse = components["schemas"]["ParseResponse"];
 export type RouteOriginCandidate = components["schemas"]["RouteOriginCandidate"];
 export type RequestDisposition = ParseResponse["disposition"];
 export type PlaceCandidate = components["schemas"]["PlaceCandidate"];
-export type PlaceResolveResponse = components["schemas"]["PlaceResolveResponse"];
+export type PlaceResolveResponse = Omit<components["schemas"]["PlaceResolveResponse"], "preview_boundary"> & {
+  preview_boundary?: FeatureCollection | null;
+};
 export type PlaceConfirmResponse = Omit<components["schemas"]["PlaceConfirmResponse"], "boundary"> & { boundary?: FeatureCollection | null };
 export type UploadResponse = components["schemas"]["UploadResponse"];
 export type UiConfigResponse = components["schemas"]["UiConfigResponse"];
@@ -34,6 +36,13 @@ export interface RegionalCensus extends RegionalDataInfo {
   source_url: string;
   older_units: number;
   notes?: string;
+  socioeconomic?: {
+    indicator: "low_income_household_share" | "deprivation_index";
+    status: "ready" | "unavailable" | "during_run";
+    observed_zones: number | null;
+    source: string;
+    source_url: string;
+  } | null;
 }
 
 export interface DemandUpload extends RegionalDataInfo {

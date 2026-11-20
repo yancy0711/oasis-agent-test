@@ -154,7 +154,7 @@ export async function resolvePlace(placeName: string): Promise<PlaceResolveRespo
   const { data, error } = await client.POST("/v1/places/resolve", {
     body: { place_name: placeName },
   });
-  return valueOrThrow(data, error, "Could not resolve the study area.");
+  return valueOrThrow(data, error, "Could not resolve the study area.") as PlaceResolveResponse;
 }
 
 export async function confirmPlace(

@@ -12,6 +12,7 @@ from typing import Callable
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import requests
 
 from oasis.agent.context import Context
 from oasis.contracts.domain import Provenance, TaskSpec, ToolError, ToolResult, ValueWeights
@@ -25,7 +26,7 @@ from oasis.core.data.census import (derive_indicators, fetch_acs, fetch_block_gr
                                     fetch_county_geometry, fetch_tract_geometry)
 from oasis.core.data.geocoding import AmbiguousPlaceError, resolve_fips, resolve_place
 from oasis.core.data.heat import fetch_heat_exposure
-from oasis.core.data import regional
+from oasis.core.data import grdi, regional
 from oasis.core.data.thermal import UTCI_AGGREGATION, UTCI_SOURCE, load_utci, thermal_layer, utci_paths
 from oasis.core.data.era5_download import cds_configured, regional_utci_files
 from oasis.core.data.candidate_csv import read_candidate_csv
@@ -94,11 +95,19 @@ def _decision_inputs(demand: dict, travel: dict) -> tuple[np.ndarray, ...]:
         travel.get("vulnerable_mask", demand.get("vulnerable_mask", np.zeros(len(population), dtype=bool))),
         dtype=bool,
     )
+    indicators = travel.get("indicators", demand.get("indicators", {}))
+    if "base_index" in travel and "indicators" in demand:
+        base_index = np.asarray(travel["base_index"], dtype=int)
+        # Optional measurements can arrive after the travel matrix was assembled.
+        indicators = {
+            name: np.asarray(values, dtype=float)[base_index]
+            for name, values in demand["indicators"].items()
+        }
     return (
         np.asarray(travel["matrix"], dtype=float),
         population,
         np.asarray(travel.get("equity_population", demand.get("equity_population", population * legacy_mask)), dtype=float),
-        travel.get("indicators", demand.get("indicators", {})),
+        indicators,
     )
 
 
@@ -420,6 +429,56 @@ def _us_demand_areas(ctx: Context, study: dict, data_cfg: dict):
     return areas, population_source, population_areas, provenance
 
 
+def _regional_socioeconomic(ctx: Context, study: dict, areas: gpd.GeoDataFrame) -> dict:
+    field = regional.socioeconomic_indicator(study["place_name"])
+    if not field:
+        return {}
+    info = regional.socioeconomic_metadata(field)
+    provenance = None
+    if field == grdi.FIELD:
+        ctx.progress("Preparing regional GRDI", 0, len(areas))
+        try:
+            areas[field], provenance = grdi.sample_grdi(
+                areas, ctx.check_cancelled,
+                lambda done, total: ctx.progress("Downloading GRDI v1", done, total, unit="bytes"),
+            )
+            ctx.progress("Preparing regional GRDI", len(areas), len(areas))
+        except RunCancelled:
+            raise
+        except (OSError, ValueError, requests.RequestException) as exc:
+            log.warning("Regional GRDI unavailable: %s", exc)
+            info["message"] = "Cannot read GRDI v1. Retry the download or set OASIS_GRDI_PATH."
+    elif study.get("place_type") == "uploaded":
+        try:
+            areas[field] = regional.matching_hong_kong_income(study["place_name"], areas)
+        except (OSError, ValueError, requests.RequestException) as exc:
+            log.warning("Cannot verify uploaded zones against Hong Kong census: %s", exc)
+            info["message"] = "The official Hong Kong census groups could not be verified."
+    if field not in areas:
+        areas[field] = np.nan
+    observed = int(areas[field].notna().sum())
+    info.update(observed_zones=observed, demand_zones=len(areas),
+                status="ready" if observed else "unavailable")
+    if observed and field == regional.HK_INCOME_FIELD:
+        provenance = Provenance(
+            source=info["source"], record_count=observed, crs="EPSG:4326",
+            notes=f"{info['method']} {info['source_url']}",
+        )
+    if observed and provenance:
+        ctx.put("regional_socioeconomic_input", field, provenance)
+    elif field == regional.HK_INCOME_FIELD and study.get("place_type") == "uploaded":
+        info.setdefault("message", "Income shares require matching official small TPU group IDs and boundaries.")
+    return info
+
+
+def _public_objective_weights(weights: ValueWeights | None, demand: dict) -> dict:
+    field = demand.get("socioeconomic", {}).get("indicator", "poverty_rate")
+    return {
+        field if name == "poverty_rate" else name: value
+        for name, value in weights.model_dump().items() if value > 0
+    } if weights else {}
+
+
 @registry.register("prepare_demand", "Fetch and align population, tract boundaries, and confirmed heat exposure.")
 @_guard("prepare_demand")
 def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = "2022-06-01",
@@ -515,6 +574,9 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
     metric_crs = pick_metric_crs(areas)
     areas["population_density"] = areas["total_population"].astype(float) / _land_area_km2(areas).replace(0, np.nan)
     areas = areas.loc[areas["total_population"].fillna(0).gt(0)].reset_index(drop=True)
+    socioeconomic = _regional_socioeconomic(ctx, study, areas) if regional_demand else {}
+    if socioeconomic.get("status") == "ready":
+        _preview_input(ctx, "tract", areas)
     thermal_layers = {}
     utci_prov = None
     if lst_available:
@@ -578,6 +640,15 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
         "interpretation": "tract-level household proxy, not individual travel behavior",
     }
     vulnerability_cfg = _cfg(ctx, "vulnerability") or DEFAULT_VULNERABILITY_CONFIG
+    socioeconomic_field = socioeconomic.get("indicator", "poverty_rate")
+    if socioeconomic:
+        quality["socioeconomic"] = socioeconomic
+        ctx.put("socioeconomic", socioeconomic)
+        vulnerability_cfg = {
+            **vulnerability_cfg,
+            "indicators": {socioeconomic_field if name == "poverty_rate" else name: definition
+                           for name, definition in vulnerability_cfg.get("indicators", {}).items()},
+        }
     if regional_demand:
         quality["regional_data"] = {
             "source": study["regional_provenance"].source, "year": year,
@@ -587,15 +658,19 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
     task_weights = getattr(ctx.get("task", None), "weights", None)
     if task_weights:
         public_weights = task_weights.normalized().model_dump()
+        if socioeconomic:
+            public_weights[socioeconomic_field] = public_weights.pop("poverty_rate")
         custom_vulnerability_weights = {
             name: public_weights.get(name, 0.0)
             for name in vulnerability_cfg.get("indicators", {})
         }
-    observed = areas[[name for name in ("elderly_ratio", "poverty_rate", "heat_exposure") if name in areas]].copy()
+    observed = areas[["elderly_ratio", socioeconomic_field, "heat_exposure"]].copy()
     areas, vulnerability_score, priority_mask, vulnerability = analyze_vulnerability(
         areas, vulnerability_cfg, custom_vulnerability_weights,
         progress=lambda label, done, total: ctx.progress(label, done, total, unit="stages"),
     )
+    if socioeconomic:
+        areas[socioeconomic_field] = observed[socioeconomic_field]
     observed["vulnerability_score"] = vulnerability_score
     relationships = _input_relationships(observed)
     if relationships:
@@ -624,8 +699,15 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
     ) if vulnerability["status"] == "ready" else None
     ctx.put("vulnerability_analysis", vulnerability, vulnerability_provenance)
     indicators = {name: areas[name].to_numpy(float) for name in
-                  ["population_density", "elderly_ratio", "poverty_rate", "heat_exposure"]
+                  ["population_density", "elderly_ratio", socioeconomic_field, "heat_exposure"]
                   if np.isfinite(areas[name].to_numpy(float)).any()}
+    if socioeconomic and socioeconomic_field in indicators:
+        # The API/profile field is stable. The observed series keeps its own name and units.
+        socioeconomic_values = observed[socioeconomic_field]
+        median = socioeconomic_values.median()
+        indicators["poverty_rate"] = socioeconomic_values.fillna(median).to_numpy(float)
+        if socioeconomic_values.nunique() >= 2:
+            socioeconomic["objective_median_filled_zones"] = int(socioeconomic_values.isna().sum())
     indicators["vulnerability_score"] = vulnerability_score
     elderly_population = areas.get(
         "elderly_population", areas["elderly_ratio"].fillna(0) * areas["total_population"]
@@ -648,7 +730,8 @@ def prepare_demand(ctx: Context, study_handle: str = "study", start_date: str = 
               "group_population": group_population,
               "equity_population": group_population["vulnerability_priority"],
               "priority_mask": priority_mask,
-              "vulnerable_mask": priority_mask, "indicators": indicators, "observed_indicators": observed}
+              "vulnerable_mask": priority_mask, "indicators": indicators, "observed_indicators": observed,
+              "socioeconomic": socioeconomic}
     if population_source and weighted_ok.any():
         provenance.append(Provenance(
             source=(f"US Census ACS {year} 5-year block-group population + TIGER/Line {year}"
@@ -684,6 +767,8 @@ def _input_relationships(observed: pd.DataFrame) -> dict:
     return analyze_feature_relationships(observed, {
         "elderly_ratio": "vulnerability input",
         "poverty_rate": "vulnerability input",
+        "low_income_household_share": "2021 domestic household income share",
+        "deprivation_index": "relative deprivation index",
         "heat_exposure": "measured thermal exposure",
         "vulnerability_score": "derived composite score",
         "mean_ndvi": "vegetation proxy",
@@ -730,6 +815,11 @@ def prepare_built_environment(
         summary = {
             "status": "unavailable",
             "reason": f"{type(exc).__name__}: {exc}",
+            "burden_observed_zones": 0,
+            "demand_zones": len(demand["areas"]),
+            "burden_imputed_zones": 0,
+            "burden_observed_share": 0.0,
+            "burden_low_coverage": True,
         }
         ctx.put("built_environment", summary)
         quality = ctx.get("quality", {}); quality["built_environment"] = summary
@@ -744,15 +834,20 @@ def prepare_built_environment(
     burden = derive_environment_burden(areas)
     for name in burden:
         areas[name] = burden[name]
+    observed_burden = areas["environment_burden"].where(areas["environment_components_available"].gt(0))
+    burden_observed_zones = int(observed_burden.notna().sum())
+    burden_imputed_zones = int(areas["environment_burden"].notna().sum()) - burden_observed_zones
+    observed_share = burden_observed_zones / len(areas) if len(areas) else 0.0
     indicators = dict(demand["indicators"])
-    if areas["environment_burden"].notna().any():
+    indicators.pop("environment_burden", None)
+    if burden_observed_zones:
         indicators["environment_burden"] = areas["environment_burden"].to_numpy(float)
     demand = {**demand, "areas": areas, "indicators": indicators}
     fields = [name for name in ("mean_ndvi", "mean_ndbi", "mean_albedo") if areas[name].notna().any()]
     observed = demand.get("observed_indicators", original)
-    relationships = _input_relationships(observed.assign(**{
-        name: areas[name] for name in (*fields, "environment_burden")
-    }))
+    relationships = _input_relationships(observed.assign(
+        **{name: areas[name] for name in fields}, environment_burden=observed_burden,
+    ))
     components = [name for name in fields if areas[name].nunique() > 1]
     formulas = {
         "mean_ndvi": "(NIR - red) / (NIR + red)",
@@ -764,7 +859,12 @@ def prepare_built_environment(
         "available_tracts": {name: int(areas[name].notna().sum()) for name in fields},
         "formulas": {name: formulas[name] for name in fields},
         "burden_components": components,
-        "burden_imputed_zones": int(areas["environment_components_available"].eq(0).sum()) if components else 0,
+        "burden_observed_zones": burden_observed_zones,
+        "demand_zones": len(areas),
+        "burden_imputed_zones": burden_imputed_zones,
+        "burden_imputation_value": float(observed_burden.median()) if burden_imputed_zones else None,
+        "burden_observed_share": observed_share,
+        "burden_low_coverage": observed_share < 0.5,
         "feature_relationships": relationships,
     }
     vulnerability = dict(ctx.get("vulnerability_analysis", {}))
@@ -778,7 +878,9 @@ def prepare_built_environment(
     if measured_provenance:
         measured_provenance = provenance.model_copy(update={
             "record_count": int(areas[fields].notna().any(axis=1).sum()),
-            "notes": f"{provenance.notes}; observed zones: {summary['available_tracts']}",
+            "notes": (f"{provenance.notes}; observed zones: {summary['available_tracts']}; "
+                      f"burden observed in {burden_observed_zones}/{len(areas)} zones; "
+                      f"median-filled zones: {burden_imputed_zones}"),
         })
     ctx.put("demand", demand, measured_provenance)
     _preview_input(ctx, "tract", areas)
@@ -1198,10 +1300,11 @@ def optimize_sites(ctx: Context, n_facilities: int = 10, threshold_minutes: floa
                    "pareto_completed_points": len(points),
                    "pareto_requested_points": 11,
                    "pareto_complete": len(points) == 11,
-                   "applied_weights": {name: value for name, value in applied_weights.model_dump().items()
-                                       if value > 0} if applied_weights else {},
+                   "applied_weights": _public_objective_weights(applied_weights, demand),
+                   **({"socioeconomic": demand["socioeconomic"]} if demand.get("socioeconomic") else {}),
                    "omitted_objective_indicators": [
-                       name for name, value in requested_weights.model_dump().items()
+                       demand.get("socioeconomic", {}).get("indicator", name) if name == "poverty_rate" else name
+                       for name, value in requested_weights.model_dump().items()
                        if value > 0 and not getattr(value_weights, name)
                    ] if requested_weights and selected_alpha is None else [],
                    "final_solution_basis": ("efficiency_gini_frontier" if selected_alpha is not None
@@ -1853,8 +1956,7 @@ def run_sensitivity_analysis(
         )
     summary = {
         "baseline": baseline,
-        "applied_weights": {name: value for name, value in value_weights.model_dump().items() if value > 0}
-        if value_weights else {},
+        "applied_weights": _public_objective_weights(value_weights, demand),
         "experiments": results,
         "experiment_count": len(results),
         "coverage_group": coverage_group,
@@ -1924,7 +2026,7 @@ def compare_value_profiles(
         scenario_solutions.append(solution)
         scenarios.append({
             "profile": name, "profile_label": configured[name].get("label", name),
-            "applied_weights": {key: value for key, value in weights.model_dump().items() if value > 0},
+            "applied_weights": _public_objective_weights(weights, demand),
             "selected_ids": solution.selected_ids,
             "covered_population_ratio": solution.covered_ratio,
             "vulnerable_covered_ratio": solution.vulnerable_covered_ratio,
@@ -2003,6 +2105,7 @@ def generate_outputs(ctx: Context, output_dir: str | None = None, indicator: str
             ),
             "vulnerability": ctx.get("vulnerability_analysis", {}),
             "thermal": ctx.get("quality", {}).get("heat", {}),
+            "socioeconomic": demand.get("socioeconomic", {}),
             "omitted_objective_indicators": analysis.get("diagnostics", {}).get("omitted_objective_indicators", []),
         },
     ), encoding="utf-8")

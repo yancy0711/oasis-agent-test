@@ -4,7 +4,7 @@ This guide runs the current web application on one machine. It keeps the existin
 
 ## 1. Save this version from Windows
 
-The current working branch is `demo-optimization`. Review the changes before committing:
+The web application branch is `ui/visual-polish`. Review changes before staging:
 
 ```powershell
 Set-Location 'D:\Research\ACM SIGSPATIAL\oasis-agent'
@@ -12,16 +12,15 @@ git branch --show-current
 git status --short
 git diff --check
 git check-ignore .env
-git add -A
 git diff --cached --stat
 git diff --cached --name-only
 ```
 
-The staged list should include `.env.example`, deployment files, source, tests, and documentation. It must not include your populated `.env`, cached data, generated outputs, or local skills. If `.env` was previously tracked, remove it from the index with `git rm --cached -- .env`; the local file stays in place. Then:
+Stage the source, tests, documentation, and example files required by the change. Keep populated `.env` files, caches, and generated results local. Then:
 
 ```powershell
-git commit -m "Improve demo reliability and Mac Docker deployment"
-git push -u origin demo-optimization
+git commit -m "Update the OASIS web application"
+git push origin HEAD:refs/heads/ui/visual-polish
 ```
 
 Use `git remote get-url origin` to obtain your repository URL for cloning. Transfer actual keys privately or populate them again on the Mac; do not upload `.env` to GitHub.
@@ -31,7 +30,7 @@ Use `git remote get-url origin` to obtain your repository URL for cloning. Trans
 Install and open [Docker Desktop for Mac](https://docs.docker.com/desktop/setup/install/mac-install/), choosing the installer for Apple Silicon or Intel. Wait until its engine is running. Native Python, Conda, Node, and GDAL are not needed to run these containers.
 
 ```bash
-git clone --branch demo-optimization https://github.com/yancy0711/oasis-agent-test.git oasis-agent
+git clone --branch ui/visual-polish https://github.com/yancy0711/oasis-agent-test.git oasis-agent
 cd oasis-agent
 cp .env.example .env
 open -e .env
@@ -126,13 +125,19 @@ docker compose restart frontend
 
 Reload the browser and repeat the model connection check. Environment variables are supplied at container creation, not baked into the image; see [Compose environment configuration](https://docs.docker.com/compose/how-tos/environment-variables/set-environment-variables/).
 
-After pulling source or changing YAML configuration (copied into the backend image):
+For an existing Mac clone, fetch and switch to the web application branch before rebuilding both services:
 
 ```bash
-git pull --ff-only
-docker compose up --build -d
-docker compose restart frontend
+git fetch origin
+git switch ui/visual-polish
+git pull --ff-only origin ui/visual-polish
+git rev-parse --short HEAD
+docker compose up --build -d --force-recreate backend frontend
+docker compose ps
+curl --fail http://127.0.0.1:5173/api/health
 ```
+
+After the health check succeeds, open `http://127.0.0.1:5173` and hard refresh. Focus the empty prompt box and press Tab to fill its example. For a regional test, enter “Select 1 cooling centre in Kowloon City, Hong Kong within a 5-minute walk.” Confirm the study area and open Data. OASIS fetches the government district boundary and census population on a fresh installation. For a mainland administrative area, try “Select 1 cooling centre in Gulou District, Nanjing, China within a 15-minute walk.” Confirm the OpenStreetMap result to load its boundary and WorldPop demand. The first fetch can take longer than a cached request.
 
 Stop with `docker compose down`. Bind-mounted caches, results, and uploads remain on the Mac. A standalone `docker build` only creates one image: it does not configure and run both services, load runtime secrets, or mount persistent data. Use Compose for this setup.
 

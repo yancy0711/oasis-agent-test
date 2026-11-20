@@ -73,6 +73,8 @@ export function PromptInput({ pending, onSubmit, onCancel, onUseLocation, audien
   const audience = controlledAudience ?? localAudience;
   const composer = useRef<HTMLTextAreaElement>(null);
   const active = AUDIENCES[audience];
+  const placeholder = t(active.placeholder);
+  const canFillExample = prompt === "" && !pending;
   const showQuickStart = !submitted && !hasActiveRun && Boolean(onShowUpload);
 
   function fill(value: string) {
@@ -171,7 +173,7 @@ export function PromptInput({ pending, onSubmit, onCancel, onUseLocation, audien
           ref={composer}
           id="prompt"
           aria-label={t("Describe the cooling-access question")}
-          aria-describedby={history.length ? "prompt-history-help" : undefined}
+          aria-describedby={[canFillExample && "prompt-example-help", history.length > 0 && "prompt-history-help"].filter(Boolean).join(" ") || undefined}
           value={prompt}
           onChange={(event) => { setPrompt(event.target.value); setHistoryIndex(-1); }}
           rows={2}
@@ -179,6 +181,11 @@ export function PromptInput({ pending, onSubmit, onCancel, onUseLocation, audien
             if (event.nativeEvent.isComposing) return;
             const input = event.currentTarget;
             const unmodified = !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey;
+            if (event.key === "Tab" && unmodified && canFillExample) {
+              event.preventDefault();
+              fill(placeholder);
+              return;
+            }
             const atFirstLine = !input.value.slice(0, input.selectionStart).includes("\n");
             if (history.length && unmodified && input.selectionStart === input.selectionEnd) {
               if (event.key === "ArrowUp" && (historyIndex >= 0 || atFirstLine)) {
@@ -195,10 +202,11 @@ export function PromptInput({ pending, onSubmit, onCancel, onUseLocation, audien
               analyze();
             }
           }}
-          placeholder={t(active.placeholder)}
+          placeholder={placeholder}
         />
         {history.length > 0 && <span id="prompt-history-help" className="workbench-visually-hidden">{t("Press ↑ on the first line to recall earlier prompts. Press ↓ to return.")}</span>}
         {onShowUpload && audience === "research" && <button className="workbench-icon-button composer-upload" type="button" onClick={onShowUpload} aria-label={t("Upload candidate CSV")} title={t("Upload candidate CSV")}><WorkspaceIcon name="upload" /></button>}
+        {canFillExample && <small id="prompt-example-help" className="prompt-example-help">{t("Tab to use example")}</small>}
         <button type="submit" disabled={pending || !prompt.trim()}>
           {pending ? <LoadingText>{t("Analyzing")}</LoadingText> : <>{t("Analyze request")} <WorkspaceIcon name="send" /></>}
         </button>

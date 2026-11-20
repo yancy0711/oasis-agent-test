@@ -125,7 +125,7 @@ def create_app(service: OasisService | None = None) -> FastAPI:
 
     @router.post("/places/resolve", response_model=PlaceResolveResponse)
     def resolve_place(request: PlaceRequest) -> dict:
-        """Resolve one US place into compact candidate metadata."""
+        """Resolve a study area into compact candidate metadata."""
         try: return app.state.service.resolve_place(request.place_name)
         except Exception as exc: raise HTTPException(422, str(exc)) from exc
 
@@ -173,7 +173,7 @@ def create_app(service: OasisService | None = None) -> FastAPI:
         try:
             body = app.state.service.regional_demand_geojson(place_name, layer)
         except (requests.RequestException, OSError, ValueError) as exc:
-            raise HTTPException(422, "Check the regional population layer in Data or upload demand polygons.") from exc
+            raise HTTPException(422, f"Could not load the regional {layer} layer. {exc}") from exc
         return Response(body, media_type="application/geo+json",
                         headers={"Content-Disposition": f'attachment; filename="regional-{layer}.geojson"'})
 

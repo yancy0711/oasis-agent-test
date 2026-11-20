@@ -43,19 +43,21 @@ def _boundary():
     return geometry
 
 
-def _zones(boundary):
-    projected = gpd.GeoSeries([boundary], crs=4326).to_crs(32649).iat[0]
+def _zones(boundary, grid_m=GRID_M, *, crs=None):
+    series = gpd.GeoSeries([boundary], crs=4326)
+    crs = crs or series.estimate_utm_crs()
+    projected = series.to_crs(crs).iat[0]
     west, south, east, north = projected.bounds
     zones = []
-    for x in range(floor(west / GRID_M), ceil(east / GRID_M)):
-        for y in range(floor(south / GRID_M), ceil(north / GRID_M)):
-            clipped = projected.intersection(box(x * GRID_M, y * GRID_M, (x + 1) * GRID_M, (y + 1) * GRID_M))
+    for x in range(floor(west / grid_m), ceil(east / grid_m)):
+        for y in range(floor(south / grid_m), ceil(north / grid_m)):
+            clipped = projected.intersection(box(x * grid_m, y * grid_m, (x + 1) * grid_m, (y + 1) * grid_m))
             if clipped.area <= 0:
                 continue
             if clipped.geom_type == "GeometryCollection":
                 clipped = union_all([part for part in clipped.geoms if part.area > 0])
             zones.append({"GEOID": f"grid-{x}-{y}", "geometry": clipped})
-    return gpd.GeoDataFrame(zones, crs=32649).to_crs(4326)
+    return gpd.GeoDataFrame(zones, crs=crs).to_crs(4326)
 
 
 def _population(zones: gpd.GeoDataFrame) -> tuple[list[float], list[float]]:
@@ -110,7 +112,7 @@ def nanshan_data() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
             cached = json.loads(path.read_text(encoding="utf-8"))
         else:
             boundary = nanshan_boundary()
-            zones = _zones(boundary)
+            zones = _zones(boundary, crs=32649)
             totals, older = _population(zones)
             zones["total_population"], zones["elderly_population"] = totals, older
             zones = zones.loc[zones["total_population"].gt(0)].copy()

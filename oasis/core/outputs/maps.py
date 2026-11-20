@@ -50,6 +50,8 @@ def _tract_properties(row: pd.Series, indicator: str) -> dict[str, Any]:
         ("total_population", "population", 0, 1),
         ("elderly_ratio", "elderly_pct", 1, 100),
         ("poverty_rate", "poverty_pct", 1, 100),
+        ("low_income_household_share", "low_income_household_pct", 1, 100),
+        ("deprivation_index", "deprivation_index", 2, 1),
         ("heat_exposure", "heat_c", 1, 1),
         ("lst_exposure_c", "lst_exposure_c", 4, 1),
         ("utci_c", "utci_c", 4, 1),

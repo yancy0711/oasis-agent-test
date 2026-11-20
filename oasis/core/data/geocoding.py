@@ -119,6 +119,33 @@ def search_place_candidates(place_name: str, limit: int = 5) -> list[dict]:
     response.raise_for_status(); return response.json()
 
 
+@with_retry(max_retries=2)
+def international_boundary_candidates(place_name: str) -> list[dict]:
+    """Return supported administrative polygons when the US adapter cannot resolve a place."""
+    query = re.sub(r"\s*[,，]\s*", ", ", place_name.strip())
+    params = {**_candidate_params(query, 5), "q": query, "accept-language": "en", "polygon_threshold": 0.00003}
+    params.pop("countrycodes")
+    key = hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()[:20]
+    path = CACHE_DIR / "regional" / f"osm_search_{key}.json"
+    if path.is_file():
+        return json.loads(path.read_text(encoding="utf-8"))
+    response = requests.get(NOMINATIM_URL, params=params,
+                            headers={"User-Agent": "oasis-agent/0.1"}, timeout=(5, 20))
+    if response.status_code in RETRYABLE_STATUS:
+        raise TransientError(f"Nominatim {response.status_code}")
+    response.raise_for_status()
+    rows = _merge_candidates([
+        row for row in response.json()
+        if row.get("address", {}).get("country_code") not in {None, "", "us"}
+        and row.get("type") == "administrative"
+        and row.get("geojson", {}).get("type") in {"Polygon", "MultiPolygon"}
+        and row.get("addresstype") not in {"country", "continent"}
+    ])
+    if rows:
+        atomic_write_text(path, json.dumps(rows, ensure_ascii=False))
+    return rows
+
+
 def search_origin_candidates(query: str, limit: int = 5, *, countrycodes: str | None = None, viewbox: tuple | None = None, check=lambda: None) -> list[dict]:
     """Try the supplied name, then US centre/center spelling in the same scope."""
     if countrycodes == "us":

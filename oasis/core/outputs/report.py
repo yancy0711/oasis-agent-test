@@ -72,6 +72,8 @@ def _method_section(
     context: dict[str, Any],
 ) -> str:
     weights = solution.weights_used.normalized().model_dump() if solution.weights_used else None
+    socioeconomic = context.get("socioeconomic", {})
+    socioeconomic_field = socioeconomic.get("indicator", "poverty_rate")
     if weights:
         terms = {
             "population_density": r"\beta_{\mathrm{pop}}",
@@ -80,7 +82,12 @@ def _method_section(
             "heat_exposure": r"\beta_{\mathrm{heat}}z(E_i)",
             "environment_burden": r"\beta_{\mathrm{env}}z(B_i)",
         }
-        weight_text = ", ".join(f"{name}={value:.3f}" for name, value in weights.items() if value > 0)
+        if socioeconomic:
+            terms["poverty_rate"] = r"\beta_{\mathrm{soc}}z(S_i)"
+        weight_text = ", ".join(
+            f"{socioeconomic_field if name == 'poverty_rate' else name}={value:.3f}"
+            for name, value in weights.items() if value > 0
+        )
         formula = " + ".join(term for name, term in terms.items() if weights[name] > 0)
         demand_formula = (
             "The evaluated inputs formed each demand zone's weight as:\n\n"
@@ -99,6 +106,25 @@ def _method_section(
         )
     if omitted := context.get("omitted_objective_indicators"):
         demand_formula += "\n\nRequested weights excluded for absent or spatially constant inputs: " + ", ".join(omitted) + "."
+    if socioeconomic:
+        label, unit = ("Low-income HH", "%") if socioeconomic_field == "low_income_household_share" else ("GRDI", "0–100")
+        coverage = f"{socioeconomic['observed_zones']}/{socioeconomic['demand_zones']} demand zones"
+        coefficient = weights.get("poverty_rate", 0.0) if weights else 0.0
+        if socioeconomic["observed_zones"]:
+            demand_formula += (
+                f"\n\n**{label} ({unit}) · {coverage} observed.** "
+                f"The demand-zone map displays the observed value of $S_i$ (`{socioeconomic_field}`). "
+                f"{socioeconomic['method']} Applied siting coefficient: {coefficient:.3f}. "
+                f"[{socioeconomic['source']}]({socioeconomic['source_url']})."
+            )
+            if coefficient and (filled := socioeconomic.get("objective_median_filled_zones")):
+                unit = "zone" if filled == 1 else "zones"
+                demand_formula += f" The siting objective used the median observed value in {filled} {unit}."
+            if socioeconomic["observed_zones"] * 2 < socioeconomic["demand_zones"]:
+                demand_formula += "\n\n> **Low socioeconomic coverage.** Fewer than half of the demand zones had observations."
+        else:
+            message = socioeconomic.get("message", "No demand zones had valid observations.")
+            demand_formula += f"\n\n**{label} ({unit}) · {coverage} observed.** {message}"
     capacity_active = bool(solution.facility_capacities)
     capacity_text = (
         "Capacity constraints were active using observed/user-confirmed people capacities."
@@ -216,9 +242,22 @@ $$
                      "mean_albedo": r"1-F(\mathrm{Albedo}_i)"}
             expression = ", ".join(terms[name] for name in components)
             lines.extend(["", f"$$B_i = \\operatorname{{mean}}\\left[{expression}\\right]$$", "",
-                          "Each zone averages its available components using within-run percentile ranks $F$.",
-                          f"Median burden was assigned in {environment['burden_imputed_zones']} zones with no usable components."])
+                          "Each zone averages its available components using within-run percentile ranks $F$."])
+            if "burden_observed_zones" in environment:
+                lines.append(f"Observed components contributed in {environment['burden_observed_zones']} of "
+                             f"{environment['demand_zones']} demand zones.")
+            if imputed := environment.get("burden_imputed_zones"):
+                fill = environment.get("burden_imputation_value")
+                fill_text = f" ({fill:.3f})" if fill is not None else ""
+                lines.append(f"In {imputed} zones, the burden score was filled with the median of the observed scores"
+                             f"{fill_text}. Correlations use observed scores.")
+        if environment.get("burden_low_coverage"):
+            lines.extend(["", f"> **Low environmental coverage.** Only {environment['burden_observed_share']:.1%} "
+                          "of demand zones had an observed burden score (below 50%). "
+                          "The resulting burden provides limited evidence of spatial differences."])
         lines.extend(["", f"Applied siting coefficient for environment burden: {environment_weight:.3f}."])
+        if not environment_weight:
+            lines.append("The environmental diagnostics did not change the selected site's demand weights.")
         environment_method = "\n".join(lines)
 
     return rf"""## 4. Model Equations and Variable Definitions
@@ -285,7 +324,10 @@ def render_report(
     model_context: dict[str, Any] | None = None,
 ) -> str:
     """Render the deterministic decision report from typed results."""
-    weights = ({name: value for name, value in solution.weights_used.model_dump().items() if value > 0}
+    model_context = model_context or {}
+    field = model_context.get("socioeconomic", {}).get("indicator", "poverty_rate")
+    weights = ({field if name == "poverty_rate" else name: value
+                for name, value in solution.weights_used.model_dump().items() if value > 0}
                if solution.weights_used else "population efficiency")
     mobility = {
         "walking": "Walking", "cycling": "Cycling", "driving": "Driving",
@@ -303,7 +345,6 @@ def render_report(
         f"- {item.source} ({item.tier} tier, {item.record_count} records, {item.crs}) {item.notes}"
         for item in lineage
     )
-    model_context = model_context or {}
     method = _method_section(task, solution, model_context)
     vulnerability_coverage = ("not assessed" if model_context.get("vulnerability", {}).get("status") == "unavailable"
                               else f"{solution.vulnerable_covered_ratio:.1%}")

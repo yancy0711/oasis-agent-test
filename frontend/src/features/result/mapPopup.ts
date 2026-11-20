@@ -114,6 +114,8 @@ export function popupContent(
   ] : [
     ["Population", properties.population], ["Age 65+", properties.elderly_pct == null ? null : `${properties.elderly_pct}%`],
     ["Poverty", properties.poverty_pct == null ? null : `${properties.poverty_pct}%`],
+    ["Low-income HH", properties.low_income_household_pct == null ? null : `${properties.low_income_household_pct}%`],
+    ["GRDI", properties.deprivation_index == null ? null : `${properties.deprivation_index}/100`],
     ["ERA5-HEAT UTCI", properties.utci_c == null ? null : temperature(properties.utci_c)],
     ["Landsat LST", properties.lst_exposure_c == null ? null : temperature(properties.lst_exposure_c)],
     ["Population-weighted LST", properties.population_weighted_heat_c == null ? null : temperature(properties.population_weighted_heat_c)],
@@ -128,7 +130,7 @@ export function popupContent(
     ["Reachability rank", properties.reachability_rank],
     ["Diagnostic marker", properties.is_hardest_reachability ? "Hardest tract in this review" : null],
   ];
-  const hoverLabels = ["Population", "Age 65+", "ERA5-HEAT UTCI", "Landsat LST", "Facility type",
+  const hoverLabels = ["Population", "Age 65+", "Poverty", "Low-income HH", "GRDI", "ERA5-HEAT UTCI", "Landsat LST", "Facility type",
     "Opening hours", "Duration", "Mode", "Preview alpha"];
   for (const [label, value] of rows) {
     if (!includeStreetView && !hoverLabels.includes(String(label))) continue;

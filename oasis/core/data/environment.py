@@ -46,10 +46,11 @@ def derive_environment_burden(indices: pd.DataFrame) -> pd.DataFrame:
         "low_albedo_burden": 1 - percentile(indices["mean_albedo"]),
     }, index=indices.index)
     score = components.mean(axis=1, skipna=True)
-    fill = float(score.median()) if score.notna().any() else float("nan")
     result = components.copy()
     result["environment_components_available"] = components.notna().sum(axis=1)
-    result["environment_burden"] = score.fillna(fill).clip(0, 1)
+    if score.notna().any():
+        score = score.fillna(float(score.median()))
+    result["environment_burden"] = score.clip(0, 1)
     return result
 
 

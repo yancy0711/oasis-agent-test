@@ -1327,8 +1327,7 @@ class Orchestrator:
                 "population_weighted_access_gini": solution.population_weighted_access_gini,
                 "mean_travel_minutes": solution.mean_travel_minutes,
                 "solver_status": solution.solver_status,
-                "applied_weights": {key: value for key, value in solution.weights_used.model_dump().items() if value > 0}
-                if solution.weights_used else {},
+                "applied_weights": analysis.get("diagnostics", {}).get("applied_weights", {}),
             },
             "frontier": [{"alpha": p.alpha, "efficiency_metric": p.efficiency_metric,
                           "equity_metric": p.equity_metric,
@@ -1656,7 +1655,7 @@ class Orchestrator:
             self.ctx.progress("Finalizing: packaging result", 1, 2, unit="stages")
         diagnostic_handles = ["constraint_validation", "minimum_facilities", "minimum_threshold", "coverage_alternative", "hypothetical_coverage",
                               "reachability_analysis", "scenario_comparison", "sensitivity_results",
-                              "vulnerability_analysis", "built_environment", "result_query_answers"]
+                              "vulnerability_analysis", "built_environment", "socioeconomic", "result_query_answers"]
         diagnostics = {name: json.loads(json.dumps(self.ctx.get(name), default=lambda value: value.model_dump(mode="json")))
                        for name in diagnostic_handles if self.ctx.has(name)}
         thermal = self.ctx.get("quality", {}).get("heat", {})

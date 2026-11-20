@@ -266,6 +266,8 @@
 .workbench .prompt-input__row button[type="submit"] { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; }
 .workbench .prompt-input__row button[type="submit"] svg { width: 15px; height: 15px; }
 .workbench .prompt-input__row .composer-upload { color: var(--uploaded); border: 1px dashed var(--line); }
+.workbench .prompt-example-help { color: var(--muted); font-size: 11px; }
+.workbench .environment-coverage-warning { padding: 8px 10px; border-left: 3px solid var(--warning); border-radius: var(--radius); color: var(--warning); background: var(--warning-soft); }
 .workbench-chat__activity { overflow-wrap: anywhere; }
 .workbench-chat__activity .notice { margin: 8px 0; padding: 8px; }
 .workbench .request-decision { margin: 8px 0; }

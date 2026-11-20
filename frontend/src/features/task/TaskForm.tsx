@@ -18,6 +18,7 @@ export interface ValueProfile { name: string; label: string; weights: Weights }
 interface TaskFormProps {
   task: TaskSpec; mode: RoutingMode; ready: boolean; pending: boolean; uploadPending: boolean;
   uploadedName: string | null; candidateUploadId?: string | null; profiles: ValueProfile[];
+  socioeconomicLabel?: string;
   onModeChange: (mode: RoutingMode) => void; onUpload: (file: File) => void; onRemoveUpload?: () => void;
   onResolveAmbiguity?: (index: number, candidate: string) => void;
   onSubmit: (values: TaskFormValues) => void;
@@ -70,7 +71,7 @@ const AMENITY_OPTIONS = [
 ] as const;
 const DEFAULT_AMENITIES = AMENITY_OPTIONS.map((option) => option.value);
 
-export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedName, candidateUploadId, profiles, onModeChange, onUpload, onRemoveUpload, onResolveAmbiguity, onSubmit }: TaskFormProps) {
+export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedName, candidateUploadId, profiles, socioeconomicLabel, onModeChange, onUpload, onRemoveUpload, onResolveAmbiguity, onSubmit }: TaskFormProps) {
   const { t } = useWorkspacePreferences();
   const { register, handleSubmit, reset, watch, control, setValue, formState: { errors } } = useForm<TaskFormValues>({
     resolver: zodResolver(taskFormSchema), defaultValues: toTaskFormValues(task),
@@ -179,7 +180,7 @@ export function TaskForm({ task, mode, ready, pending, uploadPending, uploadedNa
         return <div className="comparison-profile-picker field field--wide"><InfoLabel label="Value profiles to compare">Each selected profile supplies a different audited weighting scheme. Every profile is solved against the same candidate facilities and travel matrix.</InfoLabel><CheckboxDropdown ariaLabel="Value profiles to compare" options={options} selected={field.value} onChange={field.onChange} summary={`${field.value.length} profiles selected`} detail={labels.length ? labels.join(", ") : "Select at least two profiles"} actions={<><button type="button" className="button--secondary" onClick={() => field.onChange(options.map((option) => option.value))}>Select all</button><button type="button" className="button--secondary" onClick={() => field.onChange(["efficiency_first", "equity_first"].filter((name) => options.some((option) => option.value === name)))}>Efficiency vs equity</button></>} emptyMessage="No registered profiles are available." defaultOpen />{errors.comparison_profiles && <small className="error">{errors.comparison_profiles.message}</small>}</div>;
       }} />}
       <fieldset className={`weights ${routeFocused ? "weights--secondary" : ""}`}><legend><InfoLabel label="Value profile">Sets how strongly population, older adults, poverty, heat exposure, and passive built-environment burden influence site selection.</InfoLabel></legend><label className="field compact-field"><InfoLabel label="Apply a registered profile">Loads a saved combination of value weights; choose Custom weights to edit them manually.</InfoLabel><select aria-label="Apply a registered profile" value={appliedProfile?.name ?? ""} onChange={(event) => applyProfile(allProfiles.find((profile) => profile.name === event.target.value))}><option value="">Custom weights</option>{allProfiles.map((profile) => <option key={profile.name} value={profile.name}>{profile.label}</option>)}</select></label><div className="form-grid form-grid--weights">
-        <WeightField name="population_density" label="Population" weights={weights} control={control} /><WeightField name="elderly_ratio" label="Older adults" weights={weights} control={control} /><WeightField name="poverty_rate" label="Poverty" weights={weights} control={control} /><WeightField name="heat_exposure" label="Heat exposure" weights={weights} control={control} /><WeightField name="environment_burden" label="Passive environment burden" weights={weights} control={control} />
+        <WeightField name="population_density" label="Population" weights={weights} control={control} /><WeightField name="elderly_ratio" label="Older adults" weights={weights} control={control} /><WeightField name="poverty_rate" label={socioeconomicLabel ?? "Poverty"} weights={weights} control={control} /><WeightField name="heat_exposure" label="Heat exposure" weights={weights} control={control} /><WeightField name="environment_burden" label="Passive environment burden" weights={weights} control={control} />
       </div><div className={`weight-total ${Math.abs(weightTotal - 1) < .0001 ? "weight-total--ready" : "weight-total--warning"}`}><strong>Total: {weightTotal.toFixed(2)}</strong><span>{weightTotal < .9999 ? `Add ${(1 - weightTotal).toFixed(2)} before running.` : "Weights are ready."}</span></div>{errors.weights?.root && <small className="error">{errors.weights.root.message}</small>}</fieldset>
     </>}
 

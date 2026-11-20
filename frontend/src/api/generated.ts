@@ -902,6 +902,8 @@ export interface components {
             label: string;
             /** Query */
             query: string;
+            /** Socioeconomic Indicator */
+            socioeconomic_indicator?: "low_income_household_share" | "deprivation_index" | null;
         };
         /**
          * PlaceRequest
@@ -925,6 +927,7 @@ export interface components {
             /** Candidates */
             candidates: components["schemas"]["PlaceCandidate"][];
             selected?: components["schemas"]["PlaceCandidate"] | null;
+            preview_boundary?: { [key: string]: unknown } | null;
         };
         /**
          * PlaceRouteRequest

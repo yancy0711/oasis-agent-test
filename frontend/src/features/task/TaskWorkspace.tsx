@@ -90,7 +90,7 @@ export function TaskWorkspace() {
   );
   const configQuery = useQuery({ queryKey: configKeys.detail, queryFn: getConfig, staleTime: Infinity });
   const selectedDemand = demandUpload?.upload_id === task?.demand_upload_id ? demandUpload : null;
-  const regionalPlace = confirmedPlace && /^(hk|sz):/.test(confirmedPlace.candidate_id) ? confirmedPlace.canonical_name : null;
+  const regionalPlace = confirmedPlace && /^(hk|sz|worldpop):/.test(confirmedPlace.candidate_id) ? confirmedPlace.canonical_name : null;
   const regionalQuery = useQuery({
     queryKey: ["regional-census", regionalPlace],
     queryFn: ({ signal }) => getRegionalCensus(regionalPlace!, signal),
@@ -99,10 +99,16 @@ export function TaskWorkspace() {
     staleTime: Infinity,
   });
   const regionalData = selectedDemand ?? regionalQuery.data;
+  const socioeconomic = regionalQuery.data?.socioeconomic;
+  const socioeconomicIndicator = confirmedPlace?.socioeconomic_indicator ?? socioeconomic?.indicator;
+  const socioeconomicLabel = socioeconomicIndicator === "low_income_household_share" ? "Low-income households"
+    : socioeconomicIndicator === "deprivation_index" ? "Relative deprivation (GRDI)"
+    : regionalPlace ? "Socioeconomic data unavailable" : undefined;
+  const waitingForPopulation = Boolean(regionalPlace && !regionalData && !regionalQuery.isError);
   const boundaryQuery = useQuery({
     queryKey: ["regional-boundary", regionalPlace],
     queryFn: ({ signal }) => getStudyBoundary(regionalPlace!, signal),
-    enabled: Boolean(regionalPlace && !selectedDemand),
+    enabled: Boolean(regionalPlace && !selectedDemand && !confirmedPlace?.boundary),
     retry: false,
     staleTime: Infinity,
   });
@@ -141,13 +147,15 @@ export function TaskWorkspace() {
       const value = await resolveMutation.mutateAsync(name);
       if (signal?.aborted) return null;
       setResolution(value);
+      setDecision((current) => current?.disposition === "needs_clarification"
+        && current.alternative === t(regionalDataHelp) ? null : current);
       return value;
-    } catch {
+    } catch (failure) {
       if (signal?.aborted) return null;
       setResolution(null);
       setDecision({
         disposition: "needs_clarification",
-        reason: `An automatic study boundary is unavailable for ${name}.`,
+        reason: failure instanceof Error ? failure.message : `Automatic boundary search failed for ${name}.`,
         alternative: t(regionalDataHelp),
       });
       return null;
@@ -537,7 +545,6 @@ export function TaskWorkspace() {
   function run(values: TaskFormValues) {
     if (!task || !confirmedPlace || interpreting) return;
     if (regionalPlace && !selectedDemand && !regionalQuery.data) {
-      setIntentError(t(regionalDataHelp));
       setTab("Data");
       return;
     }
@@ -624,7 +631,8 @@ export function TaskWorkspace() {
     connection={configQuery.isError ? "unavailable" : configQuery.isSuccess ? "connected" : "connecting"}
     utciConfigured={configQuery.data?.utci_configured ?? configQuery.data?.sf_utci_configured}
     inputLayers={{
-      boundary: (matchingArea ? liveInputs.data?.boundary : undefined) ?? selectedDemand?.boundary ?? confirmedPlace?.boundary ?? boundaryQuery.data,
+      boundary: (matchingArea ? liveInputs.data?.boundary : undefined) ?? selectedDemand?.boundary ?? confirmedPlace?.boundary ?? boundaryQuery.data
+        ?? resolution?.preview_boundary ?? undefined,
       tract: (matchingArea ? liveInputs.data?.tract : undefined) ?? regionalData?.geometry,
       candidate: matchingRun ? liveInputs.data?.candidate : undefined,
     }}
@@ -633,6 +641,7 @@ export function TaskWorkspace() {
     populationLayer={regionalData ? <div>
       {selectedDemand ? <span>{selectedDemand.filename}</span> : regionalQuery.data && <>
         <a href={regionalQuery.data.source_url} target="_blank" rel="noreferrer">{regionalQuery.data.source}</a>
+        <small>{t("Automatic population layer ready. This layer will be used for the run.")}</small>
         <small>{regionalQuery.data.notes}</small>
         <a href={`/api/v1/regional-data/download?place_name=${encodeURIComponent(regionalQuery.data.place_name)}`} download>{t("Download demand GeoJSON")}</a>
         <br />
@@ -640,10 +649,20 @@ export function TaskWorkspace() {
       </>}
       <small>{regionalData.units} {t("demand zones")}{regionalData.year ? ` · ${regionalData.year}` : ""}</small>
       <small>{(selectedDemand ? selectedDemand.fields.older : regionalQuery.data?.older_units) ? t("Total population and age 65+") : t("Total population only")}</small>
-      <small>{t("Poverty and household vehicle availability are unavailable for this layer.")}</small>
+      {socioeconomicIndicator === "low_income_household_share" && <small>
+        {selectedDemand ? t("Hong Kong census income shares require matching small TPU group polygons.")
+          : socioeconomic?.status === "ready"
+            ? <>{t("Low-income households")} · {socioeconomic.observed_zones}/{regionalData.units} {t("demand zones")}
+              {" · "}<a href={socioeconomic.source_url} target="_blank" rel="noreferrer">{t("2021 census")}</a></>
+            : t("Hong Kong census income shares are unavailable.")}
+      </small>}
+      {socioeconomicIndicator === "deprivation_index" && <small>
+        {t("GRDI v1 (0–100) is calculated for these demand zones during the run.")}
+      </small>}
+      <small>{t("Household vehicle availability is unavailable for this layer.")}</small>
     </div> : regionalPlace ? <div>
-      <small>{t(regionalQuery.isFetching ? "Checking regional population and boundaries…" : regionalDataHelp)}</small>
-      <a href={`/api/v1/regional-data/download?layer=boundary&place_name=${encodeURIComponent(regionalPlace)}`} download>{t("Download study boundary")}</a>
+      <small>{t(waitingForPopulation ? "Checking regional population and boundaries…" : regionalDataHelp)}</small>
+      {(confirmedPlace?.boundary || boundaryQuery.data) && <a href={`/api/v1/regional-data/download?layer=boundary&place_name=${encodeURIComponent(regionalPlace)}`} download>{t("Download study boundary")}</a>}
       {regionalQuery.error && <><small role="alert">{regionalQuery.error.message}</small>
         <button type="button" className="button--secondary" onClick={() => void regionalQuery.refetch()}>{t("Retry data check")}</button></>}
     </div> : undefined}
@@ -763,26 +782,30 @@ export function TaskWorkspace() {
       {task?.place_name && !confirmedPlace && resolveMutation.isError && (
         <div className="panel">
           <p>{t("If an automatic study layer is unavailable, confirm your own boundary and population with a demand GeoJSON.")}</p>
+          <button type="button" className="button--secondary" onClick={() => void resolve(task.place_name)}>{t("Resolve place")}</button>
           <button type="button" className="button--secondary" onClick={() => setTab("Data")}>{t("Upload demand data")}</button>
         </div>
       )}
       {regionalPlace && !selectedDemand && regionalQuery.isError && (
         <div className="notice">
           <p>{t(regionalDataHelp)}</p>
+          <button type="button" className="button--secondary" onClick={() => void regionalQuery.refetch()}>{t("Retry data check")}</button>
           <button type="button" className="button--secondary" onClick={() => setTab("Data")}>{t("Upload demand data")}</button>
         </div>
       )}
+      {waitingForPopulation && <p role="status">{t("Checking regional population and boundaries…")}</p>}
 
       {task && (
         <TaskForm
           task={task}
           mode={mode}
-          ready={Boolean(confirmedPlace)}
+          ready={Boolean(confirmedPlace && (!regionalPlace || regionalData))}
           pending={startMutation.isPending || interpreting}
           uploadPending={uploadMutation.isPending}
           uploadedName={uploadedName}
           candidateUploadId={uploadedPointCount > 0 ? candidateUploadId : null}
           profiles={profiles}
+          socioeconomicLabel={socioeconomicLabel ? t(socioeconomicLabel) : undefined}
           onResolveAmbiguity={resolveAmbiguity}
           onModeChange={setMode}
           onUpload={(file) => void upload(file, candidateSourceCrs)}

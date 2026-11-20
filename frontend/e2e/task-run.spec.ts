@@ -86,6 +86,8 @@ test("regional workflow fits the narrow workspace, accepts map drops, and keeps 
   const geometry = JSON.parse(uploadText);
   let studyArea = hongKong;
   let hkChecks = 0;
+  let releasePopulation!: () => void;
+  const populationReady = new Promise<void>((resolve) => { releasePopulation = resolve; });
   const pageErrors: string[] = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
   await page.setViewportSize({ width: 860, height: 950 });
@@ -106,12 +108,17 @@ test("regional workflow fits the narrow workspace, accepts map drops, and keeps 
         missing_place: false, reason: "Regional siting", alternative: "" });
       case "/api/v1/places/resolve":
         return send({ resolution_id: "district", query: studyArea, ambiguous: false, candidates: [resolved()], selected: resolved() });
-      case "/api/v1/places/confirm": return send(resolved());
+      case "/api/v1/places/confirm": return send({ ...resolved(), socioeconomic_indicator:
+        studyArea === hongKong ? "low_income_household_share" : "deprivation_index" });
       case "/api/v1/regional-data":
         if (new URL(request.url()).searchParams.get("place_name") === shenzhen) return send({ detail: "Provider unavailable" }, 503);
         hkChecks += 1;
+        await populationReady;
         return send({ place_name: hongKong, year: 2021, units: 18, older_units: 18, source: "HK Census",
-          source_url: "https://example.com", geometry });
+          source_url: "https://example.com", geometry, socioeconomic: {
+            indicator: "low_income_household_share", status: "ready", observed_zones: 18,
+            source: "HK Census", source_url: "https://example.com",
+          } });
       case "/api/v1/regional-data/download":
         return send({ ...geometry, features: geometry.features.slice(0, 1) });
       case "/api/v1/uploads/demand":
@@ -123,6 +130,9 @@ test("regional workflow fits the narrow workspace, accepts map drops, and keeps 
   });
   await page.goto("/");
   const composer = page.getByRole("textbox", { name: "Describe the cooling-access question" });
+  await composer.focus();
+  await composer.press("Tab");
+  await expect(composer).toHaveValue(await composer.getAttribute("placeholder") ?? "");
   const analyze = async (prompt: string) => {
     await composer.fill(prompt);
     await page.getByRole("button", { name: "Analyze request" }).click();
@@ -137,6 +147,15 @@ test("regional workflow fits the narrow workspace, accepts map drops, and keeps 
   ]);
   expect(buttonBox!.x + buttonBox!.width).toBeLessThanOrEqual(leftBox!.x + leftBox!.width);
   await expect.poll(() => hkChecks).toBe(1);
+  const run = page.getByRole("button", { name: "Run confirmed agent" });
+  await expect(run).toBeDisabled();
+  await expect(page.getByRole("tabpanel", { name: "Setup" }).getByText("Checking regional population and boundaries…")).toBeVisible();
+  releasePopulation();
+  await expect(run).toBeEnabled();
+  await page.getByRole("tab", { name: "Data", exact: true }).click();
+  await expect(page.getByText("Automatic population layer ready. This layer will be used for the run.")).toBeVisible();
+  await expect(page.getByText(/Low-income households.*18\/18/)).toBeVisible();
+  await expect(page.getByText("Check the regional population layer in Data or upload demand polygons.")).toHaveCount(0);
 
   const drag = await page.evaluateHandle((content) => {
     const payload = new DataTransfer();

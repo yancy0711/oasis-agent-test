@@ -152,6 +152,7 @@ class PlaceResolveResponse(BaseModel):
     ambiguous: bool
     candidates: list[PlaceCandidate]
     selected: PlaceCandidate | None = None
+    preview_boundary: dict[str, Any] | None = None
 
 
 class PlaceConfirmResponse(PlaceCandidate):
@@ -159,6 +160,7 @@ class PlaceConfirmResponse(PlaceCandidate):
 
     query: str
     boundary: dict[str, Any] | None = None
+    socioeconomic_indicator: Literal["low_income_household_share", "deprivation_index"] | None = None
 
 
 class UploadResponse(BaseModel):

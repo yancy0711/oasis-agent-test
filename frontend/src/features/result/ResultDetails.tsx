@@ -11,6 +11,7 @@ const display = (value: unknown) => value == null ? "—" : typeof value === "nu
 function CorrelationHeatmap({ data }: { data: Row }) {
   const indicators = Array.isArray(data.indicators) ? data.indicators.map(String) : [];
   const matrix = Array.isArray(data.matrix) ? data.matrix as unknown[][] : [];
+  const pairCounts = Array.isArray(data.paired_tract_counts) ? data.paired_tract_counts as unknown[][] : [];
   if (!indicators.length || matrix.length !== indicators.length) return null;
   const color = (value: number) => value >= 0
     ? `rgba(25, 77, 58, ${0.08 + Math.abs(value) * 0.78})`
@@ -21,8 +22,9 @@ function CorrelationHeatmap({ data }: { data: Row }) {
       <strong key={`row-${name}`}>{name.replaceAll("_", " ")}</strong>,
       ...indicators.map((column, columnIndex) => {
         const raw = matrix[rowIndex]?.[columnIndex];
+        const pairCount = pairCounts[rowIndex]?.[columnIndex];
         const value = raw == null ? Number.NaN : Number(raw);
-        return <span key={`${name}-${column}`} title={`${name} vs ${column}: ${Number.isFinite(value) ? value.toFixed(3) : "unavailable"}`} style={{ background: Number.isFinite(value) ? color(value) : "#eef1ee", color: Math.abs(value) > .62 ? "white" : "var(--ink)" }}>{Number.isFinite(value) ? value.toFixed(2) : "—"}</span>;
+        return <span key={`${name}-${column}`} title={`${name} vs ${column}: ${Number.isFinite(value) ? value.toFixed(3) : "unavailable"}${typeof pairCount === "number" ? ` (${pairCount} observed pairs)` : ""}`} style={{ background: Number.isFinite(value) ? color(value) : "#eef1ee", color: Math.abs(value) > .62 ? "white" : "var(--ink)" }}>{Number.isFinite(value) ? value.toFixed(2) : "—"}</span>;
       }),
     ])}
   </div><p className="heatmap-key"><span>negative</span><i /><span>0</span><i /><span>positive</span></p></div>;
@@ -82,21 +84,44 @@ export function AnalysisView({ result, onShowTract }: { result: RunResult; onSho
   const optimizationResult = (result.results ?? []).find((item) => item.tool === "optimize_sites");
   const routingResult = (result.results ?? []).find((item) => item.tool === "build_travel_matrix");
   const optimization = record(optimizationResult?.summary);
+  const socioeconomic = record(diagnostics.socioeconomic ?? optimization.socioeconomic);
+  const socioeconomicLabel = socioeconomic.indicator === "low_income_household_share"
+    ? "Low-income households" : "Relative deprivation (GRDI)";
   const routing = record(routingResult?.summary);
   const failures = (result.results ?? []).filter((item) => item.error || item.ok === false);
   const metrics = result.metrics ?? {};
   const missingTotal = rows(vulnerability.missingness).reduce((sum, item) => sum + Number(item.missing_count ?? 0), 0);
   const metricPercent = (value: unknown) => typeof value === "number" ? `${(value * 100).toFixed(1)}%` : "—";
   const heatUrl = publicApiUrl(result.artifacts?.heat_analysis);
-  const hasAny = experiments.length || topTracts.length || rankedTracts.length || Object.keys(facilities).length || Object.keys(threshold).length || Object.keys(extension).length || Object.keys(approximateThreshold).length || Object.keys(reachability).length || Object.keys(scenario).length || Object.keys(vulnerability).length || Object.keys(environment).length || showValidation || Object.keys(optimization).length || Object.keys(routing).length || failures.length || heatUrl;
+  const hasAny = experiments.length || topTracts.length || rankedTracts.length || Object.keys(facilities).length || Object.keys(threshold).length || Object.keys(extension).length || Object.keys(approximateThreshold).length || Object.keys(reachability).length || Object.keys(scenario).length || Object.keys(vulnerability).length || Object.keys(environment).length || Object.keys(socioeconomic).length || showValidation || Object.keys(optimization).length || Object.keys(routing).length || failures.length || heatUrl;
   if (!hasAny) return <p className="empty-tab">No additional diagnostics were produced for this run.</p>;
   return <div className="detail-stack">
     <section className="analysis-overview"><h3>Decision summary</h3><p className="muted">Current outcome first; open the diagnostic sections only when you need methodological detail.</p>
       {(topTracts.length > 0 || rankedTracts.length > 0 || Object.keys(extension).length > 0 || Object.keys(reachability).length > 0 || Object.keys(facilities).length > 0 || Object.keys(threshold).length > 0 || Object.keys(approximateThreshold).length > 0) && <p className="diagnostic-answer">{result.message}</p>}
       <div className="diagnostic-summary"><div><span>Population coverage</span><strong>{metricPercent(metrics.coverage)}</strong></div><div><span>Gradual access</span><strong>{metricPercent(metrics.gradual_coverage)}</strong></div><div><span>Access Gini</span><strong>{display(metrics.population_weighted_access_gini)}</strong></div><div><span>Missing values</span><strong>{Object.keys(vulnerability).length ? missingTotal : "not audited"}</strong></div></div>
     </section>
+    {Object.keys(socioeconomic).length > 0 && <section>
+      <h3>{socioeconomicLabel}</h3>
+      <p className="muted">{socioeconomic.status === "unavailable"
+        ? `Unavailable. ${socioeconomic.message ?? "No demand zones had valid observations."}`
+        : `${socioeconomic.observed_zones} of ${socioeconomic.demand_zones} demand zones observed. ${socioeconomic.method}`}</p>
+      {Number(socioeconomic.observed_zones) / Number(socioeconomic.demand_zones) < .5
+        && socioeconomic.status === "ready" && <p className="status status--warning">Observations cover fewer than half of the demand zones.</p>}
+      {optimizationResult?.ok === true && <p>{`Applied siting coefficient: ${display(record(optimization.applied_weights)[String(socioeconomic.indicator)] ?? 0)}`}
+        {Number(record(optimization.applied_weights)[String(socioeconomic.indicator)]) > 0
+          && Number(socioeconomic.objective_median_filled_zones) > 0
+          && ` · Median filled in ${socioeconomic.objective_median_filled_zones} demand zones`}</p>}
+    </section>}
     {Object.keys(environment).length > 0 && <section><h3>Built-environment data</h3>
       {environmentCoverage.length > 0 ? <DataTable data={environmentCoverage} /> : <p className="muted">No environment measurements for this run. {environment.reason ? display(environment.reason) : ""}</p>}
+      {typeof environment.burden_observed_share === "number" &&
+        <p className={environment.burden_low_coverage === true ? "environment-coverage-warning" : "muted"}>
+          {environment.burden_low_coverage === true && <strong>Low environmental coverage. </strong>}
+          {display(environment.burden_observed_zones)} of {display(environment.demand_zones)} zones
+          had an observed burden score ({(100 * environment.burden_observed_share).toFixed(1)}%).
+          {typeof environment.burden_imputed_zones === "number" && environment.burden_imputed_zones > 0 &&
+            ` ${environment.burden_imputed_zones} missing scores used the observed median. Correlations use observed scores.`}
+        </p>}
     </section>}
     {excluded.length > 0 && <details className="analysis-disclosure"><summary>Indicators excluded from vulnerability</summary><DataTable data={excluded} /></details>}
     {Object.keys(vulnerability).length > 0 && vulnerability.status !== "unavailable" && <section className="vulnerability-analysis"><h3>Vulnerability data quality and robustness</h3><p className="muted">{display(vulnerability.priority_definition)} · active weighting: {display(vulnerability.active_scheme)} · normalization: {display(vulnerability.normalization)}. Indicator directions and missing-value policies come from the audited configuration.</p>
