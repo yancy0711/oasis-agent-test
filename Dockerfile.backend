@@ -4,7 +4,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
     && printf 'Acquire::Retries "4";\nAcquire::https::Timeout "45";\n' > /etc/apt/apt.conf.d/80-oasis-downloads \
     && apt-get update \
-    && apt-get install -y --no-install-recommends coinor-cbc \
+    && apt-get install -y --no-install-recommends coinor-cbc libexpat1 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
@@ -12,7 +12,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --retries 4 --timeout 60 -r requirements.txt
 COPY . .
 RUN mkdir -p data/cache outputs_run tmp/uploads
-# Verify that the installed native CBC actually runs on the build platform.
-RUN python -c "from time import monotonic; import pulp; from oasis.core.optimization.cbc import solve_bounded_cbc; p=pulp.LpProblem('smoke'); x=pulp.LpVariable('x', cat='Binary'); p+=x; p+=x>=1; assert solve_bounded_cbc(p, monotonic()+10)=='Optimal'; assert x.value()==1"
+# Verify the native CBC solver and geospatial wheel imports on the build platform.
+RUN python -c "from time import monotonic; import pulp, pyogrio, rasterio; from oasis.core.optimization.cbc import solve_bounded_cbc; p=pulp.LpProblem('smoke'); x=pulp.LpVariable('x', cat='Binary'); p+=x; p+=x>=1; assert solve_bounded_cbc(p, monotonic()+10)=='Optimal'; assert x.value()==1"
 EXPOSE 8000
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

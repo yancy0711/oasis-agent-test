@@ -65,7 +65,7 @@ Open **http://127.0.0.1:5173**. The first build downloads base images, Linux pac
 
 The frontend image builds React and serves it through Nginx. `/api/` is proxied to FastAPI on the Compose network. The backend uses one Uvicorn worker so its in-memory cancellation controls and resident sessions stay consistent. Successful data and outputs persist in the mounted host directories; uploaded CSVs persist in `tmp/uploads/`.
 
-Docker builds for the local platform. The Python geospatial wheels supply their runtime libraries, and Debian supplies native `coinor-cbc`. Both Debian package index updates and package downloads use HTTPS with retries. The backend build includes a small CBC solve and fails if that binary cannot execute. See [Docker multi-platform builds](https://docs.docker.com/build/building/multi-platform/) and [PuLP solver configuration](https://github.com/coin-or/pulp/blob/master/doc/source/guides/how_to_configure_solvers.rst).
+Docker builds for the local platform. Geospatial support comes from Python wheels and the Debian `libexpat1` runtime library. Debian also supplies native `coinor-cbc`. Both Debian package index updates and package downloads use HTTPS with retries. The backend build includes a small CBC solve and fails if that binary cannot execute. See [Docker multi-platform builds](https://docs.docker.com/build/building/multi-platform/) and [PuLP solver configuration](https://github.com/coin-or/pulp/blob/master/doc/source/guides/how_to_configure_solvers.rst).
 
 Different CBC versions can choose different tied optima or make different progress within a time limit. Check feasibility, objective values, metrics, and reported solver status on the Mac; identical facility IDs across platforms are not guaranteed.
 
